@@ -1,0 +1,8 @@
+# The celld engine is a cargo workspace: `crates/celld` is the engine (a lib +
+# a thin bin), `crates/logic` is the pure, zero-dependency decision core.
+# Keeping `logic` a separate zero-dependency crate is deliberate: it can be
+# depended on without pulling in the engine (v8/tokio), and a stray I/O
+# dependency fails to compile — enforcing the sans-IO contract at the boundary.
+[workspace]
+resolver = "2"
+members = ["crates/*"]
