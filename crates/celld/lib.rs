@@ -1,0 +1,137 @@
+//! Effect adapters for the clean-sheet core.
+//!
+//! The executable owns one serial actor which is the only caller of
+//! `celld_logic::on_event`. Adapter futures never borrow core state; they send
+//! versioned completion events back through its mailbox.
+
+/// Test-only SQLite fault injection, ported from celld unchanged.
+///
+/// Gated to an external conformance build rather than merely `#[cfg(test)]`:
+/// celld reaches it only from `open_with_fault_vfs_for_test`, which carries
+/// the same gate, so an ordinary build compiles none of it and offers no seam
+/// for it.
+#[cfg(all(test, celld_internal_tests))]
+mod fault;
+pub mod assets;
+pub mod asyncrt;
+pub mod control_plane;
+pub mod dead_node_gc;
+pub mod deploy;
+pub mod fleet;
+pub mod js;
+pub mod ltx_repl;
+pub mod ownership_store;
+pub mod peer_auth;
+pub mod peer_probe;
+pub mod protocol;
+pub mod replication;
+pub mod runtime;
+pub mod startup;
+pub mod storage;
+pub mod wake;
+
+#[cfg(all(test, celld_internal_tests))]
+mod conformance_main_tests {
+    include!(env!("CELLD_CONFORMANCE_MAIN_TESTS"));
+}
+
+/// Completion token for a resident-isolate reservation made by the decision
+/// core. Dropping the queued/running job reports that the cell is idle again;
+/// the token contains no selection or lifecycle policy of its own.
+pub struct CellActivityGuard {
+    finish: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl CellActivityGuard {
+    pub fn new(finish: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            finish: Some(Box::new(finish)),
+        }
+    }
+}
+
+impl Drop for CellActivityGuard {
+    fn drop(&mut self) {
+        if let Some(finish) = self.finish.take() {
+            finish();
+        }
+    }
+}
+
+pub enum WorkerJob {
+    Fetch {
+        queued_at: std::time::Instant,
+        url: String,
+        method: String,
+        body: Vec<u8>,
+        headers: Vec<(String, String)>,
+        request_id: Option<js::RequestId>,
+        reply: tokio::sync::oneshot::Sender<anyhow::Result<js::HttpResponse>>,
+    },
+    Rpc {
+        entrypoint: String,
+        method: String,
+        args: Vec<u8>,
+        reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<u8>>>,
+    },
+}
+
+/// Temporary host seam required by the verbatim JS adapter. The runtime
+/// adapter will construct the real shared Worker queue; lifecycle policy does
+/// not move into this type.
+pub struct WorkerPool {
+    tx: std::sync::mpsc::Sender<WorkerJob>,
+}
+
+pub struct WorkerPoolStopped;
+
+impl WorkerPool {
+    pub(crate) fn new(tx: std::sync::mpsc::Sender<WorkerJob>) -> Self {
+        Self { tx }
+    }
+
+    pub fn send(&self, job: WorkerJob) -> Result<(), WorkerPoolStopped> {
+        self.tx.send(job).map_err(|_| WorkerPoolStopped)
+    }
+}
+
+/// Compatibility switches copied with the JS adapter. These are runtime
+/// semantics, not lifecycle decisions.
+pub fn worker_compat(metadata: &serde_json::Value) -> js::Compat {
+    let flags = metadata
+        .get("compatibility_flags")
+        .and_then(serde_json::Value::as_array);
+    let has_flag = |name: &str| {
+        flags.is_some_and(|flags| {
+            flags
+                .iter()
+                .any(|flag| flag.as_str().is_some_and(|flag| flag == name))
+        })
+    };
+    let date = metadata
+        .get("compatibility_date")
+        .and_then(serde_json::Value::as_str);
+    let switch = |enable: &str, disable: &str, since: &str| {
+        if has_flag(enable) {
+            return true;
+        }
+        if has_flag(disable) {
+            return false;
+        }
+        date.is_some_and(|date| date >= since)
+    };
+    js::Compat {
+        delete_all_deletes_alarm: switch(
+            "delete_all_deletes_alarm",
+            "delete_all_preserves_alarm",
+            "2026-02-24",
+        ),
+        js_rpc: has_flag("js_rpc"),
+        fetcher_get_put_delete: !switch(
+            "fetcher_no_get_put_delete",
+            "fetcher_has_get_put_delete",
+            "2024-03-26",
+        ),
+        websocket_standard_binary_type: has_flag("websocket_standard_binary_type"),
+    }
+}

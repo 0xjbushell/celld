@@ -1,11 +1,12 @@
 # celld documentation
 
-celld is a self-hosted distributed system that you program like a database.
+celld runs Cloudflare Workers and Durable Objects on your own machines.
 Each Durable Object is its own SQLite database with a single writer, addressed
-by name and continuously replicated to an S3-compatible bucket you own. A fleet
-of celld nodes coordinates through that bucket alone — no control plane, no
-membership service, no consensus — running Cloudflare Workers and Durable
-Objects on your own machines.
+by name and replicated to an S3-compatible bucket you own. Writes are durable
+before they are acknowledged (RPO=0, like Durable Objects): a synchronous output
+gate holds a write's response until it is replicated, so losing a node cannot
+lose an acknowledged write. A fleet of celld nodes coordinates through that
+bucket alone — no control plane, no membership service, no consensus.
 
 Because state is partitioned into one small database per object from the first
 line of code, applications shard by construction. The contention, hot spots,
@@ -21,17 +22,19 @@ than managed: a runaway object can only affect its own cell.
 - [Add nodes](#add-nodes)
 - [Diagnose a fleet](#diagnose-a-fleet)
 - [Environment variables](#environment-variables)
-- [Cloudflare service compatibility](cloudflare-compat.md)
+- [Cloudflare compatibility](cloudflare-compat.md)
 - [Support matrix](support.md)
-- [v0.0.1 limitations](limitations.md)
+- [limitations](limitations.md)
 - [Security](security.md)
+- [Simulations](simulations.md)
 
 ## Install
 
-The installer downloads the `celld` binary. Running a node also needs
-[Litestream](https://litestream.io) on `PATH` (or `LITESTREAM_BIN`), and
-Worker projects deployed with `celld deploy` need esbuild. Asset-only
-projects do not:
+The installer downloads the `celld` binary. Replication is in-process, so a node
+needs no external replicator by default; the optional Litestream backend
+(`CELLD_REPLICATOR=litestream`) needs [Litestream](https://litestream.io) on
+`PATH` (or `LITESTREAM_BIN`). Worker projects deployed with `celld deploy` need
+esbuild; asset-only projects do not:
 
 ```sh
 curl -fsSL https://celld.dev/install.sh | sh
@@ -79,7 +82,7 @@ celld deploy . \
 co-deployed or asset-only static assets. The asset subset includes the assets
 binding, HTML and not-found handling, worker-first routes, `_headers`, and
 `_redirects`. It refuses unknown Wrangler configuration rather than silently
-dropping it. See the [v0.0.1 limitations](limitations.md) for the current
+dropping it. See the [limitations](limitations.md) for the current
 deployment boundary.
 
 ## Start a node
@@ -113,7 +116,7 @@ is no join command and no fixed membership list.
 
 The bucket provides discovery and authority, not network reachability.
 Peer HTTP is versioned, body-bound, HMAC-authenticated, clock-bounded, and
-replay-protected, but v0.0.1 does not terminate TLS. Put advertised addresses
+replay-protected, but celld does not terminate TLS. Put advertised addresses
 on a trusted private network or an encrypted overlay such as WireGuard or
 Tailscale. Do not expose the peer port directly to the public internet.
 
@@ -147,8 +150,10 @@ unreachable peers, authentication failures, and protocol incompatibility.
 | `CELLD_ADVERTISE` | Peer-reachable address, equivalent to `--advertise` |
 | `CELLD_UNSAFE_PUBLIC_ADVERTISE` | Permit a literal public peer IP when set to `on` |
 | `CELLD_NODE` | Explicit node-session ID |
-| `CELLD_WATCH` | Local SQLite/Litestream working directory |
-| `LITESTREAM_BIN` | Litestream executable path |
+| `CELLD_WATCH` | Local SQLite and replication working directory |
+| `CELLD_OUTPUT_GATE` | `0` disables the synchronous durability gate (RPO=0), trading it for lower write latency; on by default |
+| `CELLD_REPLICATOR` | `litestream` selects the external Litestream backend; in-process replication otherwise |
+| `LITESTREAM_BIN` | Litestream executable path (Litestream backend only) |
 | `CELLD_ESBUILD` | esbuild executable path |
 | `CELLD_WORKERS` | Stateless Worker pool size (default: 16) |
 | `CELLD_ACTIVATIONS` | Concurrent cold-cell activation limit (default: the smaller of Worker count and 128) |

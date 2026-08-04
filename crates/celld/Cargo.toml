@@ -1,6 +1,6 @@
 [package]
 name = "celld"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 rust-version = "1.94.1"
 license = "MIT"
@@ -8,63 +8,64 @@ license = "MIT"
 [package.metadata.release]
 litestream-version = "v0.5.15"
 litestream-commit = "5a2624418478f358cf85ed7d4606eb55029194ec"
-litestream-upstream-pr = 1328
+
+[lib]
+path = "lib.rs"
+
+[[bin]]
+name = "celld"
+path = "main.rs"
 
 [lints.rust.unexpected_cfgs]
 level = "warn"
-check-cfg = ["cfg(celld_internal_tests)"]
+check-cfg = ["cfg(celld_internal_tests)", "cfg(celld_proxy_internals)"]
 
 [dependencies]
-celld-logic = { path = "../logic" }
-tokio = { version = "1", features = ["full"] }
-tokio-stream = "0.1"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+aes-gcm = "0.10"
 anyhow = "1"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 aws-config = { version = "1", features = ["behavior-version-latest"] }
-aws-sdk-s3 = "1"
 aws-credential-types = "1"
+aws-sdk-s3 = "1"
 aws-smithy-http-client = "1"
 axum = { version = "0.7", features = ["multipart"] }
-hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
-http-body-util = "0.1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
-v8 = "150"
-rusqlite = { version = "0.31", features = ["backup", "bundled", "hooks"] }
-url = "2"
-percent-encoding = "2"
-tokio-util = { version = "0.7", features = ["io"] }
-filetime = "0.2"
-# URLPattern parsing (same crate Deno uses); its icu_properties/regex/url
-# deps are already in the graph via idna and the crypto stack.
-urlpattern = "=0.4.2"
 base64 = "0.22"
-fastwebsockets = { version = "0.8", default-features = false, features = ["upgrade", "with_axum"] }
+celld-logic = { path = "../logic" }
+celld-ltx = { path = "../ltx", features = ["s3"] }
 deno_core_icudata = "0.77"
-# WHATWG Encoding Standard legacy decoders (windows-1252, Big5, GBK, …);
-# already in the graph transitively via reqwest/multer.
 encoding_rs = "0.8"
-regex = "1"
-getrandom = "0.3"
-md-5 = "0.10"
-sha1 = "0.10"
-sha2 = "0.10"
-flate2 = "1"
-hmac = "0.12"
-aes-gcm = "0.10"
 ed25519-dalek = { version = "2", features = ["pkcs8"] }
-p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
-rsa = { version = "0.9", features = ["sha2"] }
-rand = "0.8"
+fastwebsockets = { version = "0.8", default-features = false, features = ["upgrade", "with_axum"] }
+filetime = "0.2"
+flate2 = "1"
 fs2 = "0.4"
 futures-util = "0.3"
-tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
-# process-level TLS provider selection: two providers exist in the graph
-# (aws-lc-rs via the AWS SDK, ring via reqwest), so main() must install one
+getrandom = "0.3"
+hmac = "0.12"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+md-5 = "0.10"
+percent-encoding = "2"
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+rand = "0.8"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+rusqlite = { version = "0.31", features = ["backup", "bundled", "hooks"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
+rsa = { version = "0.9", features = ["sha2"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+sha2 = "0.10"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+tokio-util = { version = "0.7", features = ["io", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+urlpattern = "=0.4.2"
+v8 = "152"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

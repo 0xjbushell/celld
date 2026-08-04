@@ -1,6 +1,6 @@
-# v0.0.1 limitations
+# Limitations
 
-celld v0.0.1 is an alpha of the standalone engine, not a drop-in replacement
+celld is an alpha of the standalone engine, not a drop-in replacement
 for the entire Cloudflare Workers platform.
 
 - A fleet runs one application deployment. There is no public multi-tenant
@@ -13,14 +13,13 @@ for the entire Cloudflare Workers platform.
   `wrangler.json` or `wrangler.jsonc`, and deliberately rejects unsupported
   configuration instead of silently ignoring it. Static assets are supported,
   including asset-only projects; symlinks and special files are refused, and
-  `.assetsignore` still requires Wrangler. `wrangler.toml`, routes, and vars
-  remain outside the native deploy path.
+  `.assetsignore` still requires Wrangler. `wrangler.toml` and routes remain
+  outside the native deploy path.
 - The implemented Worker surface focuses on modules, Durable Objects, SQLite
   storage, alarms, service bindings, fetch, and hibernatable WebSockets. It
   does not promise every Web API, Node API, Cloudflare binding, compatibility
-  flag, or arbitrary untrusted tenant program. Which Cloudflare services are
-  supported, planned, or out of scope is
-  [cloudflare-compat](cloudflare-compat.md).
+  flag, or arbitrary untrusted tenant program. The definitive API-by-API
+  reference is [Cloudflare compatibility](cloudflare-compat.md).
 - WebSocket upgrades and messages route across nodes through the signed
   peer tunnel, so any node can serve as ingress for any cell. Close-code
   propagation and reconnect edge cases across nodes have thinner coverage

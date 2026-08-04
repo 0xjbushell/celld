@@ -1,11 +1,10 @@
 [package]
 name = "celld-logic"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 rust-version = "1.94.1"
 license = "MIT"
 
-# The sans-IO decision core: a pure state machine (no async, no I/O, no
-# clock, no rng, no locks). Zero dependencies by design — the celld binary and
-# the deterministic simulator both drive it.
+# Pure decision core: no async, I/O, clocks, randomness, locks, or dependencies.
 [lib]
+path = "lib.rs"

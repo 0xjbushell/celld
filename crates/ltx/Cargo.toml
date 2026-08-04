@@ -1,0 +1,47 @@
+# celld-ltx: in-process SQLite→object-store replication for celld.
+#
+# Vendored 2026-08-03 from rustyriver (github.com/mikenomitch/rustyriver,
+# Apache-2.0), itself a Rust reimplementation of Litestream v0.5
+# (github.com/benbjohnson/litestream, Apache-2.0) and the LTX format
+# (github.com/superfly/ltx, Apache-2.0). See README.md. celld owns and evolves
+# this snapshot; it does not track an upstream branch. It serves celld's RPO=0
+# durability goal for every cell write.
+[package]
+name = "celld-ltx"
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "In-process SQLite WAL replication to object storage (LTX format) for celld."
+readme = "README.md"
+publish = false
+
+[features]
+default = ["s3"]
+# `s3` enables object_store's AWS backend. reqwest rides object_store/aws's own
+# feature set so it unifies with the already-compiled copy.
+s3 = ["object_store/aws", "dep:reqwest"]
+gcs = ["object_store/gcp"]
+azure = ["object_store/azure"]
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time"] }
+# Aligned to celld's rusqlite (crates/celld pins 0.31); libsqlite3-sys carries
+# links="sqlite3", so the workspace cannot hold two versions.
+rusqlite = { version = "0.31", features = ["bundled"] }
+object_store = { version = "0.11", default-features = false }
+bytes = "1"
+thiserror = "2"
+tracing = "0.1"
+async-trait = "0.1"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "http2"], optional = true }
+lz4_flex = { version = "0.11", features = ["frame"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"
+proptest = "1"
+sha2 = "0.10"
+hex = "0.4"

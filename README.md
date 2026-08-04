@@ -2,9 +2,9 @@
 
 Self-hosted, distributed **Durable Objects**.
 
-celld is an open-source daemon that runs Cloudflare Workers and Durable Objects
-on your own machines — a distributed system you program like a database. Each
-object is its own SQLite database, addressed by name and replicated to an
+celld is an open-source daemon that runs Cloudflare Workers and Durable
+Objects on your own machines. Each object is its own SQLite database,
+addressed by name and replicated to an
 S3-compatible bucket you own; nodes coordinate through that bucket alone, with
 no control plane or consensus. Because every object is its own small database,
 applications shard by construction — the contention and blast-radius failures
@@ -55,8 +55,8 @@ The release image includes `celld`, the pinned Litestream binary, and esbuild
 for `celld deploy`. It is published for Linux x86-64 and ARM64:
 
 ```sh
-docker pull ghcr.io/denoland/celld:0.0.1
-docker run --rm ghcr.io/denoland/celld:0.0.1 --version
+docker pull ghcr.io/denoland/celld:latest
+docker run --rm ghcr.io/denoland/celld:latest --version
 ```
 
 `latest` and the Cargo version are convenient mutable tags. Use
@@ -72,7 +72,7 @@ docker run --rm --network host \
   -e AWS_SESSION_TOKEN \
   -e CELLD_WATCH=/var/lib/celld/state \
   -v celld-state:/var/lib/celld \
-  ghcr.io/denoland/celld:0.0.1 \
+  ghcr.io/denoland/celld:latest \
   --bucket s3://my-cells-bucket \
   --endpoint https://ACCOUNT.r2.cloudflarestorage.com \
   --region auto \
@@ -102,7 +102,7 @@ Use `--endpoint` for another S3-compatible service and `--region` when it
 cannot be inferred. A fleet runs one application, and every node loads its
 latest successfully committed deployment from `deploy/current.json`. Run
 `celld --help` for the complete command line.
-Deployment objects use the documented types in `src/protocol.rs`. `celld
+Deployment objects use the documented types in `crates/celld/protocol.rs`. `celld
 deploy` invokes `esbuild` from `PATH` for Worker code, accepts the supported
 Wrangler config subset—including co-deployed or asset-only static
 assets—and writes those objects directly. Every node discovers owners and
@@ -158,8 +158,8 @@ cargo test --locked
 cargo clippy --all-targets --locked -- -D warnings
 ```
 
-The root package builds the `celld` runtime. Its versioned object-storage
-protocol lives in `src/protocol.rs`. Small Wrangler projects under `examples/`
+The workspace builds the `celld` runtime. Its versioned object-storage
+protocol lives in `crates/celld/protocol.rs`. Small Wrangler projects under `examples/`
 exercise the supported Worker and Durable Object surface.
 
 The runtime and compatibility surface are still evolving. Public tests cover
@@ -176,9 +176,10 @@ and respect the review time you are asking for.
 
 Send a `git format-patch` attachment to [ry@deno.com](mailto:ry@deno.com).
 
-By emailing a patch, you certify that you have the right to submit it and assign
-to Deno Land Inc. all rights in the patch that you can assign. Where a right
-cannot be assigned, you grant Deno Land Inc.  a perpetual, irrevocable,
+Contributor License Agreement: By emailing a patch, you certify that you have
+the right to submit it and assign to Deno Land Inc. all rights in the patch
+that you can assign. Where a right cannot be assigned, you grant Deno Land
+Inc. a perpetual, irrevocable,
 worldwide, royalty-free, transferable, sublicensable license to use, modify,
 combine, relicense, redistribute, or publish the patch, in whole or in part,
 with or without attribution.
@@ -187,5 +188,5 @@ with or without attribution.
 
 [MIT](LICENSE)
 
-See the [support matrix](docs/support.md), [v0.0.1 limitations](docs/limitations.md),
+See the [support matrix](docs/support.md), [limitations](docs/limitations.md),
 and [security](docs/security.md) before operating a public fleet.

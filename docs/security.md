@@ -1,6 +1,6 @@
 # Security
 
-celld v0.0.1 is an alpha. It is not hardened for hostile multi-tenant use, and
+celld is an alpha. It is not hardened for hostile multi-tenant use, and
 security fixes land on the latest release line only — older alpha builds do not
 receive backports.
 
