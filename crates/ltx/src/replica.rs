@@ -54,6 +54,24 @@ use std::path::{Path, PathBuf};
 /// port that works the moment compaction is added.
 pub const SNAPSHOT_LEVEL: i32 = 9;
 
+/// Whether a sync error means the cached replica position can no longer be
+/// trusted and must be re-derived from the store on the next sync.
+///
+/// True only for errors that say the local/replica state itself diverged. A
+/// transient store or IO error is not one of these: a fenced single writer's
+/// position is still valid, and its re-upload is an idempotent overwrite. See
+/// [`Replica::sync`] for why celld narrows Litestream's clear-on-any-error.
+fn pos_untrustworthy(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::NoSnapshots
+            | Error::ChecksumMismatch
+            | Error::LTXCorrupted
+            | Error::LTXMissing
+            | Error::TxNotAvailable
+    )
+}
+
 /// Connects a database to a replication destination via a [`ReplicaClient`].
 ///
 /// Ported from `Replica` (replica.go:30-59). The Go type also owns the
@@ -73,6 +91,13 @@ pub struct Replica<C: ReplicaClient> {
     /// Current replicated position (`replica.go:33-34` `pos`).
     pos: Pos,
 
+    /// Whether `pos` is known and needs no `calc_pos` listing to re-derive.
+    /// Seeded true at activation (see [`Self::seed_pos`]); reset false only when
+    /// a divergence error says the position can no longer be trusted. Upstream
+    /// has no equivalent -- it lists whenever `pos` is zero -- which is the
+    /// listing celld's fencing lets it skip.
+    pos_known: bool,
+
     /// If true, automatically reset local state when LTX errors are detected
     /// (`replica.go:54-58` `AutoRecoverEnabled`). Consulted by the deferred
     /// monitor loop; the field is kept so the public surface matches upstream.
@@ -88,6 +113,7 @@ impl<C: ReplicaClient> Replica<C> {
             db: Some(db),
             client,
             pos: Pos::ZERO,
+            pos_known: false,
             auto_recover_enabled: false,
         }
     }
@@ -99,6 +125,7 @@ impl<C: ReplicaClient> Replica<C> {
             db: None,
             client,
             pos: Pos::ZERO,
+            pos_known: false,
             auto_recover_enabled: false,
         }
     }
@@ -136,6 +163,17 @@ impl<C: ReplicaClient> Replica<C> {
         self.pos = pos;
     }
 
+    /// Seed the replicated position from the caller's known-durable state and
+    /// mark it known, so the next sync skips the `calc_pos` listing. A fresh
+    /// cell seeds 0; a just-restored cell seeds its restored max. celld always
+    /// knows this at activation -- local equals remote under epoch fencing --
+    /// so the listing that only existed to re-discover the position, and that
+    /// storms a rate-limiting store, is not issued on the activation path.
+    pub fn seed_pos(&mut self, pos: Pos) {
+        self.pos = pos;
+        self.pos_known = true;
+    }
+
     /// Copies new L0 LTX files from the local capture directory to the replica.
     ///
     /// Ported from `Replica.Sync` (replica.go:132-180). On any error the cached
@@ -145,22 +183,38 @@ impl<C: ReplicaClient> Replica<C> {
         match self.sync_inner().await {
             Ok(()) => Ok(()),
             Err(e) => {
-                // Clear last position if an error occurs during sync
-                // (replica.go:137-143).
-                self.pos = Pos::ZERO;
+                // Litestream clears the cached position on *any* error so the
+                // next sync re-derives it with a `calc_pos` listing
+                // (replica.go:137-143) -- safe there only because it is single-
+                // node with no fencing. celld fences one writer per epoch
+                // through the store, so within an epoch a transient store/IO
+                // error does not invalidate our own position; re-uploads are
+                // idempotent overwrites. Forget the position only when the
+                // error says the state itself diverged, else a rate-limiting or
+                // slow store turns every write into a listing.
+                if pos_untrustworthy(&e) {
+                    self.pos = Pos::ZERO;
+                    self.pos_known = false;
+                }
                 Err(e)
             }
         }
     }
 
     async fn sync_inner(&mut self) -> Result<()> {
-        // Calculate current replica position, if unknown (replica.go:146-152).
-        if self.pos().is_zero() {
+        // Re-derive the replica position with a listing only when it is not
+        // already known (replica.go:146-152). celld seeds it at activation from
+        // local state that equals the remote under epoch fencing, so a listing
+        // -- which only ever re-discovered a position the owner already knows --
+        // never runs on the hot path, and a fresh cell's pointless list of an
+        // empty prefix is skipped entirely.
+        if !self.pos_known {
             let pos = self
                 .calc_pos()
                 .await
                 .map_err(|e| Error::Other(format!("calc pos: {e}").into()))?;
             self.set_pos(pos);
+            self.pos_known = true;
         }
 
         // Find current position of the database (replica.go:155-160).
@@ -1102,5 +1156,133 @@ mod tests {
             image[page_size as usize], 0x44,
             "page 2 reflects the newest incremental"
         );
+    }
+
+    // A client that fails the first `write_ltx_file` with a preloaded error and
+    // then delegates, so a single sync's upload can be made to fail on demand.
+    // `poison_list` makes every `ltx_files` (the `calc_pos` listing) fail, so a
+    // test can prove a seeded sync never lists.
+    struct FaultyClient {
+        inner: FileReplicaClient,
+        fail_first_write: std::sync::Mutex<Option<Error>>,
+        poison_list: bool,
+    }
+
+    impl FaultyClient {
+        fn new(inner: FileReplicaClient, err: Error) -> Self {
+            Self {
+                inner,
+                fail_first_write: std::sync::Mutex::new(Some(err)),
+                poison_list: false,
+            }
+        }
+        fn poisoning_list(inner: FileReplicaClient) -> Self {
+            Self {
+                inner,
+                fail_first_write: std::sync::Mutex::new(None),
+                poison_list: true,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ReplicaClient for FaultyClient {
+        fn type_name(&self) -> &str {
+            "faulty"
+        }
+        async fn ltx_files(&self, l: i32, s: TXID, m: bool) -> Result<Vec<FileInfo>> {
+            if self.poison_list {
+                return Err(Error::Other("list poisoned".into()));
+            }
+            self.inner.ltx_files(l, s, m).await
+        }
+        async fn open_ltx_file(
+            &self,
+            l: i32,
+            mn: TXID,
+            mx: TXID,
+            o: i64,
+            s: i64,
+        ) -> Result<Vec<u8>> {
+            self.inner.open_ltx_file(l, mn, mx, o, s).await
+        }
+        async fn write_ltx_file(&self, l: i32, mn: TXID, mx: TXID, d: &[u8]) -> Result<FileInfo> {
+            if let Some(e) = self.fail_first_write.lock().unwrap().take() {
+                return Err(e);
+            }
+            self.inner.write_ltx_file(l, mn, mx, d).await
+        }
+        async fn delete_ltx_files(&self, f: &[FileInfo]) -> Result<()> {
+            self.inner.delete_ltx_files(f).await
+        }
+        async fn delete_all(&self) -> Result<()> {
+            self.inner.delete_all().await
+        }
+    }
+
+    // The classifier that decides whether a sync error invalidates the cached
+    // position: only state-divergence errors do; transient store/IO ones do not.
+    #[test]
+    fn pos_untrustworthy_splits_divergence_from_transient() {
+        assert!(pos_untrustworthy(&Error::ChecksumMismatch));
+        assert!(pos_untrustworthy(&Error::LTXCorrupted));
+        assert!(pos_untrustworthy(&Error::LTXMissing));
+        assert!(pos_untrustworthy(&Error::TxNotAvailable));
+        assert!(pos_untrustworthy(&Error::NoSnapshots));
+        assert!(!pos_untrustworthy(&Error::Other("429 slow down".into())));
+        assert!(!pos_untrustworthy(&Error::Io(std::io::Error::from(
+            std::io::ErrorKind::TimedOut
+        ))));
+    }
+
+    // A failed upload must NOT discard the cached position: a fenced single
+    // writer keeps it and retries (an idempotent overwrite) rather than re-
+    // deriving it with a `calc_pos` listing. `sync_inner` wraps every store
+    // error as `Error::Other`, so this is the shape every real upload/list
+    // failure takes -- the exact case the old clear-on-any-error turned into a
+    // listing storm on a rate-limiting store.
+    #[tokio::test]
+    async fn transient_upload_error_keeps_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path().join("test.db")).unwrap();
+        let inner =
+            FileReplicaClient::new(dir.path().join("replica").to_string_lossy().into_owned());
+        let mut r = Replica::new(db, FaultyClient::new(inner, Error::Other("s3: 503".into())));
+        // One decodable L0 file at TXID 2 makes db.pos()==2 and is the local
+        // file the upload reads before the client write is rigged to fail.
+        let l0 = r.db().unwrap().ltx_path(0, TXID(2), TXID(2));
+        std::fs::create_dir_all(Path::new(&l0).parent().unwrap()).unwrap();
+        std::fs::write(&l0, build_incremental_ltx(TXID(2), TXID(2), 512, 2, 0x22)).unwrap();
+        // Seed TXID 1 as known-replicated, so sync tries to upload TXID 2.
+        r.seed_pos(Pos::new(TXID(1), 0));
+        r.sync().await.expect_err("upload was rigged to fail");
+        assert_eq!(
+            r.pos().txid,
+            TXID(1),
+            "a transient error keeps the position"
+        );
+    }
+
+    // A seeded position skips the `calc_pos` listing entirely: with listing
+    // poisoned, an unseeded replica's first sync would fail there, but a seeded
+    // one uploads without ever listing. This is the fix for the activation
+    // listing that storms a rate-limiting store on every fresh cell.
+    #[tokio::test]
+    async fn seeded_position_skips_calc_pos_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path().join("test.db")).unwrap();
+        let inner =
+            FileReplicaClient::new(dir.path().join("replica").to_string_lossy().into_owned());
+        let mut r = Replica::new(db, FaultyClient::poisoning_list(inner));
+        // Local L0 snapshot at TXID 1: db.pos()==1 and a file to upload.
+        let l0 = r.db().unwrap().ltx_path(0, TXID(1), TXID(1));
+        std::fs::create_dir_all(Path::new(&l0).parent().unwrap()).unwrap();
+        std::fs::write(&l0, build_snapshot_ltx(TXID(1), 512, 2)).unwrap();
+        // Seed as a fresh cell (known 0); the first sync must not list.
+        r.seed_pos(Pos::ZERO);
+        r.sync()
+            .await
+            .expect("a seeded sync must not list, so the poisoned list is never hit");
+        assert_eq!(r.pos().txid, TXID(1), "uploaded TXID 1 with no listing");
     }
 }

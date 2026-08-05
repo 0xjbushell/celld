@@ -380,8 +380,8 @@ fn adversarial_ltx_corpus() -> Vec<Vec<u8>> {
 /// headers, and an otherwise-valid-looking header with a bogus checksum.
 fn adversarial_wal_corpus() -> Vec<Vec<u8>> {
     let mut v: Vec<Vec<u8>> = vec![
-        vec![],                                  // empty
-        vec![0x00; 10],                          // partial header
+        vec![],                                 // empty
+        vec![0x00; 10],                         // partial header
         vec![0x00; celld_ltx::WAL_HEADER_SIZE], // zero header (bad magic)
     ];
 

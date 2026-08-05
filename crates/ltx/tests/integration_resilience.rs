@@ -21,12 +21,12 @@
 //! Each test self-skips (never fails) when `sqlite3` is not on PATH, since the
 //! Oracle needs it; the capture/replicate/restore code is exercised regardless.
 
-use rusqlite::Connection;
 use celld_ltx::client::file::FileReplicaClient;
 use celld_ltx::client::ReplicaClient;
 use celld_ltx::db::{CheckpointMode, Db};
 use celld_ltx::replica::{self, Replica};
 use celld_ltx::TXID;
+use rusqlite::Connection;
 use std::path::Path;
 use std::process::Command;
 

@@ -1,3 +1,5 @@
+// Copyright 2026 Deno Land Inc. Apache-2.0 license.
+
 //! V8 runtime materialization behind core-authorized lifecycle effects.
 //!
 //! The manager owns handles and filesystem paths, never lifecycle policy.
@@ -9,11 +11,10 @@ use crate::js::{
     self, CellJob, FetchRequest, HttpResponse, Worker, WorkerConfig, WorkerConfigOptions,
 };
 use crate::ltx_repl::LtxRepl;
-use crate::replication::{ActivationOptions, NodeRepl, StorageCredentials, SyncWait};
+use crate::replication::{ActivationOptions, StorageCredentials, SyncWait};
 use crate::storage;
 use crate::wake::WakeFlusher;
 use anyhow::{anyhow, Context};
-use aws_sdk_s3::Client;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -96,73 +97,29 @@ pub struct RuntimeFetch {
     pub request_id: Option<js::RequestId>,
 }
 
-/// The replication engine: the external Litestream process, or the in-process
-/// `celld-ltx` replicator. Selected once at start by `CELLD_REPLICATOR` and
-/// hidden behind the `Replication` wrapper so nothing else branches on it.
-#[derive(Clone)]
-enum Backend {
-    Litestream(Arc<NodeRepl>),
-    Ltx(Arc<LtxRepl>),
-}
-
+/// The node's replication engine: the in-process `celld-ltx` replicator,
+/// hidden behind this wrapper so nothing else touches the backend directly.
 #[derive(Clone)]
 pub struct Replication {
-    backend: Backend,
-    client: Client,
-    litestream: Arc<str>,
-    bucket: Arc<str>,
-    endpoint: Option<Arc<str>>,
-    region: Arc<str>,
-    credentials: Option<StorageCredentials>,
+    ltx: Arc<LtxRepl>,
 }
 
 impl Replication {
     pub fn start(
-        client: Client,
+        bucket: crate::bucket::Bucket,
         watch: &Path,
-        bucket: String,
         endpoint: Option<String>,
         region: String,
         credentials: Option<StorageCredentials>,
     ) -> anyhow::Result<Self> {
-        let litestream = std::env::var("LITESTREAM_BIN").unwrap_or_else(|_| "litestream".into());
-        // The in-process `celld-ltx` replicator is the default (RPO=0 proved on
-        // the fleet, no cold-start window). `CELLD_REPLICATOR=litestream` keeps
-        // the external process reachable for comparison and fallback.
-        let use_litestream =
-            std::env::var("CELLD_REPLICATOR").as_deref() == Ok("litestream");
-        let backend = if use_litestream {
-            let version = std::process::Command::new(&litestream)
-                .arg("version")
-                .output()
-                .with_context(|| format!("litestream not found at {litestream:?}"))?;
-            let _version = String::from_utf8_lossy(&version.stdout);
-            let watch_str = watch.to_str().context("replication watch path is not UTF-8")?;
-            Backend::Litestream(Arc::new(NodeRepl::start(
-                &litestream,
-                watch_str,
-                &bucket,
-                endpoint.as_deref(),
-                &region,
-                credentials.as_ref(),
-            )?))
-        } else {
-            Backend::Ltx(Arc::new(LtxRepl::start(
-                watch,
-                bucket.clone(),
-                endpoint.clone(),
-                region.clone(),
-                credentials.clone(),
-            )?))
-        };
         Ok(Self {
-            backend,
-            client,
-            litestream: Arc::from(litestream),
-            bucket: Arc::from(bucket),
-            endpoint: endpoint.map(Arc::from),
-            region: Arc::from(region),
-            credentials,
+            ltx: Arc::new(LtxRepl::start(
+                watch,
+                bucket.name,
+                endpoint,
+                region,
+                credentials,
+            )?),
         })
     }
 
@@ -172,32 +129,21 @@ impl Replication {
         spec: &celld_logic::RestoreSpec,
     ) -> anyhow::Result<(PathBuf, bool)> {
         let options = ActivationOptions {
-            client: &self.client,
-            litestream: &self.litestream,
-            bucket: &self.bucket,
             cell,
             epoch: spec.epoch,
             fresh: spec.fresh,
             took_over: spec.took_over,
-            endpoint: self.endpoint.as_deref(),
-            region: &self.region,
-            credentials: self.credentials.as_ref(),
         };
-        let activated = match &self.backend {
-            Backend::Litestream(node) => node.activate(options).await?,
-            Backend::Ltx(ltx) => ltx.activate(options).await?,
-        };
+        let activated = self.ltx.activate(options).await?;
         Ok((activated.path, activated.restored))
     }
 
     /// Drive/observe this cell's durability, the primitive shared by the two
     /// durability gates and the refusal check.
     async fn sync_wait(&self, cell: &str, epoch: u64) -> SyncWait {
-        let timeout = Duration::from_secs(10);
-        match &self.backend {
-            Backend::Litestream(node) => node.sync_wait(cell, epoch, timeout).await,
-            Backend::Ltx(ltx) => ltx.sync_wait(cell, epoch, timeout).await,
-        }
+        self.ltx
+            .sync_wait(cell, epoch, Duration::from_secs(10))
+            .await
     }
 
     /// True when the replicator actively refused to prove durability (as opposed
@@ -207,10 +153,7 @@ impl Replication {
     }
 
     pub fn process_status(&self) -> std::io::Result<Option<std::process::ExitStatus>> {
-        match &self.backend {
-            Backend::Litestream(node) => node.process_status(),
-            Backend::Ltx(ltx) => ltx.process_status(),
-        }
+        self.ltx.process_status()
     }
 
     /// Enforce the byte ceiling on preserved hibernation snapshots.
@@ -218,10 +161,7 @@ impl Replication {
     /// The directory walk is synchronous, so callers must run this on a
     /// blocking executor rather than the runtime's serving thread.
     pub fn prune_local_cache(&self, max_bytes: u64) -> (usize, usize, u64) {
-        match &self.backend {
-            Backend::Litestream(node) => node.prune_local_cache(max_bytes),
-            Backend::Ltx(ltx) => ltx.prune_local_cache(max_bytes),
-        }
+        self.ltx.prune_local_cache(max_bytes)
     }
 
     /// Copy the exact published epoch into a private read-only snapshot.
@@ -230,10 +170,7 @@ impl Replication {
         cell: &str,
         epoch: u64,
     ) -> anyhow::Result<Option<crate::replication::RestoredSnapshot>> {
-        match &self.backend {
-            Backend::Litestream(node) => node.snapshot_active(cell, epoch),
-            Backend::Ltx(ltx) => ltx.snapshot_active(cell, epoch),
-        }
+        self.ltx.snapshot_active(cell, epoch)
     }
 
     /// Restore the newest completed replica without claiming or activating it.
@@ -241,21 +178,7 @@ impl Replication {
         &self,
         cell: &str,
     ) -> anyhow::Result<Option<crate::replication::RestoredSnapshot>> {
-        match &self.backend {
-            Backend::Litestream(_) => {
-                crate::replication::restore_snapshot(
-                    &self.client,
-                    &self.litestream,
-                    &self.bucket,
-                    cell,
-                    self.endpoint.as_deref(),
-                    &self.region,
-                    self.credentials.as_ref(),
-                )
-                .await
-            }
-            Backend::Ltx(ltx) => ltx.restore_snapshot(cell).await,
-        }
+        self.ltx.restore_snapshot(cell).await
     }
 
     async fn ensure_durable(&self, cell: &str, epoch: u64) -> anyhow::Result<()> {
@@ -272,12 +195,7 @@ impl Replication {
         // registration is not guaranteed to cover every published cell.
         // Hibernation deletes the only local copy, so the last thing checked
         // before it goes has to be the artifact itself rather than a report.
-        let replicated = match &self.backend {
-            Backend::Litestream(_) => {
-                crate::replication::epoch_replicated(&self.client, &self.bucket, cell, epoch).await
-            }
-            Backend::Ltx(ltx) => ltx.epoch_replicated(cell, epoch).await,
-        };
+        let replicated = self.ltx.epoch_replicated(cell, epoch).await;
         if !replicated {
             return Err(anyhow!(
                 "no replica objects for {cell} epoch {epoch}; refusing to \
@@ -288,29 +206,15 @@ impl Replication {
     }
 
     /// The output-gate durability wait: return the committed-write position the
-    /// replica has proved durable, at least covering `position`. The ltx backend
-    /// batches concurrent writes to one cell behind a background sync and reports
-    /// the real durable position; Litestream drives a synchronous sync and, on
-    /// success, echoes `position` (its control socket exposes no finer point).
+    /// replica has proved durable, at least covering `position`. The replicator
+    /// batches concurrent writes to one cell behind a background sync and
+    /// reports the real durable position.
     async fn await_durable(&self, cell: &str, epoch: u64, position: u64) -> anyhow::Result<u64> {
-        match &self.backend {
-            Backend::Ltx(ltx) => ltx.await_durable(cell, epoch, position).await,
-            Backend::Litestream(node) => {
-                match node.sync_wait(cell, epoch, Duration::from_secs(10)).await {
-                    SyncWait::Durable => Ok(position),
-                    SyncWait::Unsupported | SyncWait::Failed => Err(anyhow!(
-                        "output-gate durability could not be proved for {cell} epoch {epoch}"
-                    )),
-                }
-            }
-        }
+        self.ltx.await_durable(cell, epoch, position).await
     }
 
     async fn hibernate(&self, cell: &str, epoch: u64, preserve_local: bool) {
-        match &self.backend {
-            Backend::Litestream(node) => node.hibernate(cell, epoch, preserve_local).await,
-            Backend::Ltx(ltx) => ltx.hibernate(cell, epoch, preserve_local).await,
-        }
+        self.ltx.hibernate(cell, epoch, preserve_local).await
     }
 }
 
@@ -321,6 +225,13 @@ impl RuntimeManager {
 
     pub fn region(&self) -> &str {
         &self.region
+    }
+
+    /// A deployment with no Durable Object classes can never land a Worker fetch
+    /// on a cell, so the core's round-robin routing always returns `None`. Lets
+    /// the request path skip the core round-trip entirely for stateless workers.
+    pub fn has_cell_classes(&self) -> bool {
+        !self.cell_configs.is_empty()
     }
 
     pub fn start(options: RuntimeOptions) -> anyhow::Result<Self> {
@@ -560,7 +471,11 @@ impl RuntimeManager {
     /// The alarm the restored database already had armed, read directly by
     /// path. Read-only, and the connection is dropped here -- the isolate
     /// opens the same file moments later through `spawn_cell`.
-    fn restored_alarm(&self, cell: &str, path: &std::path::Path) -> Option<celld_logic::RestoredAlarm> {
+    fn restored_alarm(
+        &self,
+        cell: &str,
+        path: &std::path::Path,
+    ) -> Option<celld_logic::RestoredAlarm> {
         let (at_ms, ..) = crate::storage::persisted_alarm(&path.to_string_lossy(), cell)?;
         // The entry this alarm already has in the bucket was written by
         // whoever armed it, which is not this process once the cell has
@@ -583,7 +498,6 @@ impl RuntimeManager {
         }
     }
 
-
     /// Did the replicator refuse to prove this commit durable? Distinct from
     /// `ensure_durable`: an absent control socket is not a refusal here, it is
     /// the historical ungated behaviour.
@@ -604,7 +518,12 @@ impl RuntimeManager {
     /// The output-gate durability wait (see `Replication::await_durable`).
     /// Returns the proved durable position; with no replicator every position is
     /// trivially durable.
-    pub async fn await_durable(&self, cell: &str, epoch: u64, position: u64) -> anyhow::Result<u64> {
+    pub async fn await_durable(
+        &self,
+        cell: &str,
+        epoch: u64,
+        position: u64,
+    ) -> anyhow::Result<u64> {
         match &self.replication {
             Some(replication) => replication.await_durable(cell, epoch, position).await,
             None => Ok(position),
@@ -1083,7 +1002,6 @@ impl StatelessRuntime {
                                 request_id,
                                 reply,
                             } => {
-                                let queue_wait_us = queued_at.elapsed().as_micros() as u64;
                                 let execution_started = Instant::now();
                                 let result = worker.fetch_and_reply_id(
                                     &url,
@@ -1093,9 +1011,20 @@ impl StatelessRuntime {
                                     request_id,
                                     reply,
                                 );
-                                let execution_us = execution_started.elapsed().as_micros() as u64;
-                                if let Some(request_id) = request_id {
-                                    tracing::info!(
+                                // Per-request timing rides the off-by-default
+                                // `timing` target: an info!-per-request costs real
+                                // throughput on the hot path, and the `enabled!`
+                                // guard skips the elapsed math and formatting when
+                                // the target is off. The lab turns it on with
+                                // RUST_LOG=info,timing=debug.
+                                if let Some(request_id) = request_id.filter(|_| {
+                                    tracing::enabled!(target: "timing", tracing::Level::DEBUG)
+                                }) {
+                                    let queue_wait_us = queued_at.elapsed().as_micros() as u64;
+                                    let execution_us =
+                                        execution_started.elapsed().as_micros() as u64;
+                                    tracing::debug!(
+                                        target: "timing",
                                         event = "worker_fetch_timing",
                                         outcome = if result.is_ok() {
                                             "completed"

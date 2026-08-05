@@ -20,7 +20,7 @@ records. Object-storage compare-and-swap ensures that exactly one node owns a
 cell at a time, without a membership protocol, failure detector, or consensus
 service.
 
-Litestream continuously replicates each cell's SQLite database to the bucket.
+celld continuously replicates each cell's SQLite database to the bucket.
 When a cell moves or wakes up, its new owner restores that database and resumes
 execution. The bucket is the durable source of truth; nodes are replaceable.
 
@@ -35,11 +35,8 @@ curl -fsSL https://celld.dev/install.sh | sh
 
 Put `~/.local/bin` on your `PATH` if the installer asks you to.
 
-celld follows the Unix convention of using ordinary external tools from
-`PATH`: running a node needs [Litestream](https://litestream.io) (or set
-`LITESTREAM_BIN`), and Worker projects deployed with `celld deploy` need
-[esbuild](https://esbuild.github.io). Asset-only projects do not. The daemon
-verifies Litestream at startup and exits immediately if it is missing.
+Worker projects deployed with `celld deploy` need
+[esbuild](https://esbuild.github.io) on `PATH`; asset-only projects do not.
 
 The installer keeps verified releases under `~/.local/lib/celld/releases` and
 atomically switches one `current` pointer. To remove celld, use the guarded
@@ -51,16 +48,13 @@ curl -fsSL https://celld.dev/uninstall.sh | sh
 
 ## Container
 
-The release image includes `celld`, the pinned Litestream binary, and esbuild
-for `celld deploy`. It is published for Linux x86-64 and ARM64:
+The release image contains the `celld` binary and is published for Linux
+x86-64 and ARM64:
 
 ```sh
-docker pull ghcr.io/denoland/celld:latest
-docker run --rm ghcr.io/denoland/celld:latest --version
+docker run --rm ghcr.io/denoland/celld --version
 ```
 
-`latest` and the Cargo version are convenient mutable tags. Use
-`sha-<40-character-public-commit>` when the exact image must be immutable.
 Persist the runtime's local state and pass the standard AWS credential
 environment through:
 
@@ -72,7 +66,7 @@ docker run --rm --network host \
   -e AWS_SESSION_TOKEN \
   -e CELLD_WATCH=/var/lib/celld/state \
   -v celld-state:/var/lib/celld \
-  ghcr.io/denoland/celld:latest \
+  ghcr.io/denoland/celld \
   --bucket s3://my-cells-bucket \
   --endpoint https://ACCOUNT.r2.cloudflarestorage.com \
   --region auto \
@@ -186,7 +180,7 @@ with or without attribution.
 
 ## License
 
-[MIT](LICENSE)
+[Apache-2.0](LICENSE)
 
-See the [support matrix](docs/support.md), [limitations](docs/limitations.md),
-and [security](docs/security.md) before operating a public fleet.
+See the [limitations](docs/limitations.md) and
+[security](docs/security.md) pages before operating a public fleet.

@@ -1,7 +1,7 @@
+// Copyright 2026 Deno Land Inc. Apache-2.0 license.
+
+use crate::bucket::Bucket;
 use anyhow::{anyhow, Context};
-use aws_sdk_s3::error::SdkError;
-use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::Client;
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -256,8 +256,8 @@ impl PeerAuth {
     }
 }
 
-pub async fn load_or_create(c: &Client, bucket: &str) -> anyhow::Result<[u8; 32]> {
-    if let Some(key) = load(c, bucket).await? {
+pub async fn load_or_create(bucket: &Bucket) -> anyhow::Result<[u8; 32]> {
+    if let Some(key) = load(bucket).await? {
         return Ok(key);
     }
     let mut key = [0_u8; 32];
@@ -266,43 +266,32 @@ pub async fn load_or_create(c: &Client, bucket: &str) -> anyhow::Result<[u8; 32]
         version: SECRET_VERSION,
         key: encode_hex(&key),
     };
-    match c
-        .put_object()
-        .bucket(bucket)
-        .key(SECRET_KEY)
-        .if_none_match("*")
-        .body(ByteStream::from(serde_json::to_vec(&stored)?))
-        .send()
+    match bucket
+        .put_cas(SECRET_KEY, serde_json::to_vec(&stored)?, None)
         .await
     {
-        Ok(_) => Ok(key),
-        Err(SdkError::ServiceError(error)) if error.raw().status().as_u16() == 412 => {
-            load(c, bucket)
-                .await?
-                .context("peer authentication secret disappeared after create race")
-        }
-        Err(error) => Err(anyhow!("create fleet peer authentication secret: {error}")),
+        Ok(Some(_)) => Ok(key),
+        Ok(None) => load(bucket)
+            .await?
+            .context("peer authentication secret disappeared after create race"),
+        Err(error) => Err(error.context("create fleet peer authentication secret")),
     }
 }
 
-pub async fn load_existing(c: &Client, bucket: &str) -> anyhow::Result<[u8; 32]> {
-    load(c, bucket)
+pub async fn load_existing(bucket: &Bucket) -> anyhow::Result<[u8; 32]> {
+    load(bucket)
         .await?
         .context("fleet has no peer authentication secret; start a current celld node first")
 }
 
-async fn load(c: &Client, bucket: &str) -> anyhow::Result<Option<[u8; 32]>> {
-    let response = match c.get_object().bucket(bucket).key(SECRET_KEY).send().await {
-        Ok(response) => response,
-        Err(SdkError::ServiceError(error)) if error.err().is_no_such_key() => return Ok(None),
-        Err(error) => return Err(anyhow!("read fleet peer authentication secret: {error}")),
-    };
-    let bytes = response
-        .body
-        .collect()
+async fn load(bucket: &Bucket) -> anyhow::Result<Option<[u8; 32]>> {
+    let Some((bytes, _)) = bucket
+        .get(SECRET_KEY)
         .await
-        .context("read fleet peer authentication secret body")?
-        .into_bytes();
+        .context("read fleet peer authentication secret")?
+    else {
+        return Ok(None);
+    };
     let stored: StoredSecret =
         serde_json::from_slice(&bytes).context("decode fleet peer authentication secret")?;
     if stored.version != SECRET_VERSION {

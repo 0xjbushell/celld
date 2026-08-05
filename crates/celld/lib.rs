@@ -1,9 +1,17 @@
+// Copyright 2026 Deno Land Inc. Apache-2.0 license.
+
 //! Effect adapters for the clean-sheet core.
 //!
 //! The executable owns one serial actor which is the only caller of
 //! `celld_logic::on_event`. Adapter futures never borrow core state; they send
 //! versioned completion events back through its mailbox.
 
+pub mod assets;
+pub mod asyncrt;
+pub mod bucket;
+pub mod control_plane;
+pub mod dead_node_gc;
+pub mod deploy;
 /// Test-only SQLite fault injection, ported from celld unchanged.
 ///
 /// Gated to an external conformance build rather than merely `#[cfg(test)]`:
@@ -12,11 +20,6 @@
 /// for it.
 #[cfg(all(test, celld_internal_tests))]
 mod fault;
-pub mod assets;
-pub mod asyncrt;
-pub mod control_plane;
-pub mod dead_node_gc;
-pub mod deploy;
 pub mod fleet;
 pub mod js;
 pub mod ltx_repl;
@@ -29,6 +32,7 @@ pub mod runtime;
 pub mod startup;
 pub mod storage;
 pub mod wake;
+pub mod ws_client;
 
 #[cfg(all(test, celld_internal_tests))]
 mod conformance_main_tests {

@@ -1,3 +1,5 @@
+// Copyright 2026 Deno Land Inc. Apache-2.0 license.
+
 //! Durable types on the bucket contract between deployment tools and celld.
 //! These objects are the interface; nothing else is exchanged.
 use serde::{Deserialize, Serialize};

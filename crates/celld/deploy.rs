@@ -1,16 +1,17 @@
+// Copyright 2026 Deno Land Inc. Apache-2.0 license.
+
 //! `celld deploy` — build a Wrangler project and write it to the fleet bucket.
 //!
 //! Bundling is esbuild's job; this module does config, identity, and durable
 //! bucket publication. Nothing here shells out to wrangler or speaks a
 //! Cloudflare-shaped API. Config keys are an allowlist: anything we do not
 //! model is refused, never silently dropped.
+use crate::bucket::Bucket;
 use crate::protocol::{
     asset_blob_key, AssetConfig, AssetEntry, AssetIndex, AssetManifestRef, DeployPointer, Manifest,
     ModuleRef, Rollout, RunWorkerFirst,
 };
 use anyhow::{anyhow, bail, Context};
-use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::Client;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use futures_util::{stream, StreamExt, TryStreamExt};
@@ -329,42 +330,36 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
     })
 }
 
-pub async fn write(client: &Client, bucket: &str, built: &Built) -> anyhow::Result<()> {
+pub async fn write(bucket: &Bucket, built: &Built) -> anyhow::Result<()> {
     // Asset bodies are fleet-wide and content-addressed. Finish every body
     // before publishing the deployment-local index or manifest so a reader
     // can never observe a pointer whose assets are incomplete.
     if let Some(assets) = &built.assets {
         stream::iter(&assets.blobs)
-            .map(|(sha256, body)| ensure_asset_blob(client, bucket, sha256, body))
+            .map(|(sha256, body)| ensure_asset_blob(bucket, sha256, body))
             .buffer_unordered(ASSET_UPLOAD_CONCURRENCY)
             .try_collect::<Vec<_>>()
             .await?;
     }
     for (name, bytes) in &built.modules {
-        put(
-            client,
-            bucket,
-            &format!("{}/{name}", built.prefix),
-            bytes.clone(),
-        )
-        .await?;
+        bucket
+            .put(&format!("{}/{name}", built.prefix), bytes.clone())
+            .await?;
     }
     if let Some(assets) = &built.assets {
-        put(
-            client,
-            bucket,
-            &format!("{}/assets.json", built.prefix),
-            assets.index.clone(),
+        bucket
+            .put(
+                &format!("{}/assets.json", built.prefix),
+                assets.index.clone(),
+            )
+            .await?;
+    }
+    bucket
+        .put(
+            &format!("{}/manifest.json", built.prefix),
+            serde_json::to_vec_pretty(&built.manifest)?,
         )
         .await?;
-    }
-    put(
-        client,
-        bucket,
-        &format!("{}/manifest.json", built.prefix),
-        serde_json::to_vec_pretty(&built.manifest)?,
-    )
-    .await?;
     let pointer = DeployPointer {
         script_name: Some(built.script_name.clone()),
         version: built.version.clone(),
@@ -376,88 +371,42 @@ pub async fn write(client: &Client, bucket: &str, built: &Built) -> anyhow::Resu
     // one is the sole application selector, so it moves last. A concurrent
     // deploy must produce a loser, not a lost write.
     put_pointer(
-        client,
         bucket,
         &format!("deploy/{}/current.json", built.script_name),
         encoded.clone(),
     )
     .await?;
-    put_pointer(client, bucket, "deploy/current.json", encoded).await?;
+    put_pointer(bucket, "deploy/current.json", encoded).await?;
     Ok(())
 }
 
-async fn ensure_asset_blob(
-    client: &Client,
-    bucket: &str,
-    sha256: &str,
-    body: &[u8],
-) -> anyhow::Result<()> {
+async fn ensure_asset_blob(bucket: &Bucket, sha256: &str, body: &[u8]) -> anyhow::Result<()> {
     let key = asset_blob_key(sha256).expect("built asset digest is valid");
-    if let Ok(existing) = client.head_object().bucket(bucket).key(&key).send().await {
-        if existing.content_length().unwrap_or(-1) == body.len() as i64
-            && existing
-                .metadata()
-                .and_then(|metadata| metadata.get("sha256"))
-                .is_some_and(|value| value == sha256)
-        {
+    if let Ok(Some((size, meta))) = bucket.head_with_meta(&key, "sha256").await {
+        if size == body.len() as u64 && meta.as_deref() == Some(sha256) {
             return Ok(());
         }
     }
-    client
-        .put_object()
-        .bucket(bucket)
-        .key(&key)
-        .metadata("sha256", sha256)
-        .body(ByteStream::from(body.to_vec()))
-        .send()
+    bucket
+        .put_with_meta(&key, body.to_vec(), &[("sha256", sha256)])
         .await
-        .with_context(|| format!("write s3://{bucket}/{key}"))?;
-    Ok(())
 }
 
 /// Compare-and-swap on a pointer: create it if absent, otherwise replace
 /// exactly the value we read.
-async fn put_pointer(
-    client: &Client,
-    bucket: &str,
-    key: &str,
-    body: Vec<u8>,
-) -> anyhow::Result<()> {
-    let existing = client
-        .head_object()
-        .bucket(bucket)
-        .key(key)
-        .send()
-        .await
-        .ok();
-    let request = client.put_object().bucket(bucket).key(key);
-    let request = match existing.as_ref().and_then(|head| head.e_tag()) {
-        Some(etag) => request.if_match(etag),
-        None => request.if_none_match("*"),
-    };
-    request
-        .body(ByteStream::from(body))
-        .send()
-        .await
-        .map_err(|error| {
-            anyhow!(
-                "write s3://{bucket}/{key}: {error}\n\
-                 Another deploy may have landed first; re-run `celld deploy`."
-            )
-        })?;
-    Ok(())
-}
-
-async fn put(client: &Client, bucket: &str, key: &str, body: Vec<u8>) -> anyhow::Result<()> {
-    client
-        .put_object()
-        .bucket(bucket)
-        .key(key)
-        .body(ByteStream::from(body))
-        .send()
-        .await
-        .with_context(|| format!("write s3://{bucket}/{key}"))?;
-    Ok(())
+async fn put_pointer(bucket: &Bucket, key: &str, body: Vec<u8>) -> anyhow::Result<()> {
+    let etag = bucket.head(key).await.ok().flatten().map(|(_, etag)| etag);
+    match bucket.put_cas(key, body, etag.as_deref()).await {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(anyhow!(
+            "write s3://{}/{key} lost a race\n\
+             Another deploy may have landed first; re-run `celld deploy`.",
+            bucket.name
+        )),
+        Err(error) => {
+            Err(error.context("Another deploy may have landed first; re-run `celld deploy`."))
+        }
+    }
 }
 
 /// A path may name the config itself or the directory holding it; with no

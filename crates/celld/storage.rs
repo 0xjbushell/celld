@@ -1,3 +1,5 @@
+// Copyright 2026 Deno Land Inc. Apache-2.0 license.
+
 //! Cell storage: SQLite backing for the Durable Object storage API.
 //!
 //! DO's `ctx.storage` is async in JS but synchronous underneath (local SQLite).
@@ -115,8 +117,8 @@ fn schema(c: &Connection) -> anyhow::Result<()> {
     // disks; the fsync was the entire single-cell write budget).
     // Process crashes lose nothing. An OS/power crash may lose the
     // last commits locally — celld's durability boundary for node
-    // loss is Litestream replication either way, and Litestream's own
-    // documentation recommends NORMAL under replication.
+    // loss is LTX replication either way, and replicated-WAL setups
+    // conventionally run NORMAL.
     c.pragma_update(None, "synchronous", "NORMAL")?;
     c.execute(
         "CREATE TABLE IF NOT EXISTS kv \
@@ -386,7 +388,8 @@ fn finish_open(scope: &str, c: Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Drop `scope`'s connection (hibernate) so litestream can release the file.
+/// Drop `scope`'s connection (hibernate) so the replicator can release the
+/// file.
 pub fn close(scope: &str) {
     close_sync_list_cursors(scope);
     close_sql_cursors(scope);

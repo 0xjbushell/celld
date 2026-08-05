@@ -34,11 +34,11 @@
 //! cleanest, hermetic way to put both tools on the *same* bytes. The S3/MinIO
 //! transport is separately proven end-to-end by T7 (`integration_minio.rs`).
 
-use rusqlite::Connection;
 use celld_ltx::client::file::FileReplicaClient;
 use celld_ltx::db::Db;
 use celld_ltx::replica::{self, Replica};
 use celld_ltx::TXID;
+use rusqlite::Connection;
 use std::path::Path;
 use std::process::Command;
 

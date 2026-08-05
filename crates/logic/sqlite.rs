@@ -1,3 +1,5 @@
+// Copyright 2026 Deno Land Inc. Apache-2.0 license.
+
 //! SQLite failure classification, reified sans-IO. When a storage operation
 //! fails, does it POISON the actor — the engine destroyed an active transaction,
 //! so every later operation on this scope must fail closed — or is it merely

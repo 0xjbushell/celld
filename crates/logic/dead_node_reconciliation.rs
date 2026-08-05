@@ -1,3 +1,5 @@
+// Copyright 2026 Deno Land Inc. Apache-2.0 license.
+
 //! Sans-I/O decisions for retiring compatibility ownership-index debris.
 //!
 //! celld does not create `node-cells/` markers, but it shares fleet buckets

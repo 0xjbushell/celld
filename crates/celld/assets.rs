@@ -1,7 +1,9 @@
+// Copyright 2026 Deno Land Inc. Apache-2.0 license.
+
+use crate::bucket::Bucket;
 use crate::js;
 use crate::protocol::{asset_blob_key, AssetEntry, AssetIndex, AssetManifestRef, RunWorkerFirst};
 use anyhow::{anyhow, Context};
-use aws_sdk_s3::Client;
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
@@ -24,8 +26,7 @@ pub struct AssetResolver {
 }
 
 struct AssetResolverInner {
-    client: Client,
-    bucket: String,
+    bucket: Bucket,
     index: AssetIndex,
     asset_only: bool,
     cache_root: PathBuf,
@@ -79,8 +80,7 @@ struct RedirectRule {
 
 impl AssetResolver {
     pub async fn load(
-        client: &Client,
-        bucket: &str,
+        bucket: &Bucket,
         prefix: &str,
         reference: &AssetManifestRef,
         asset_only: bool,
@@ -89,19 +89,10 @@ impl AssetResolver {
             return Err(anyhow!("unsupported asset index name: {}", reference.index));
         }
         let key = format!("{prefix}/{}", reference.index);
-        let object = client
-            .get_object()
-            .bucket(bucket)
-            .key(&key)
-            .send()
-            .await
-            .with_context(|| format!("read s3://{bucket}/{key}"))?;
-        let bytes = object
-            .body
-            .collect()
-            .await
-            .context("read asset index body")?
-            .into_bytes();
+        let (bytes, _) = bucket
+            .get(&key)
+            .await?
+            .with_context(|| format!("read s3://{}/{key}: no such key", bucket.name))?;
         let sha256 = format!("{:x}", Sha256::digest(&bytes));
         if sha256 != reference.sha256 {
             return Err(anyhow!("asset index checksum mismatch"));
@@ -121,8 +112,7 @@ impl AssetResolver {
             .unwrap_or(DEFAULT_ASSET_CACHE_BYTES);
         Ok(Self {
             inner: Arc::new(AssetResolverInner {
-                client: client.clone(),
-                bucket: bucket.to_string(),
+                bucket: bucket.clone(),
                 index,
                 asset_only,
                 cache_root,
@@ -496,21 +486,19 @@ impl AssetResolver {
         let temporary = parent.join(format!(".{}.{}.tmp", std::process::id(), random.next_u64()));
         let key = asset_blob_key(&entry.sha256)
             .ok_or_else(|| anyhow!("invalid asset digest for {resolved_path}"))?;
-        let object = self
+        let (body, _) = self
             .inner
-            .client
-            .get_object()
-            .bucket(&self.inner.bucket)
-            .key(&key)
-            .send()
+            .bucket
+            .get(&key)
             .await
+            .with_context(|| format!("read asset {resolved_path}"))?
             .with_context(|| {
                 format!(
-                    "read asset {resolved_path} from s3://{}/{key}",
-                    self.inner.bucket
+                    "asset {resolved_path} missing from s3://{}/{key}",
+                    self.inner.bucket.name
                 )
             })?;
-        if object.content_length().unwrap_or(-1) != entry.bytes as i64 {
+        if body.len() as u64 != entry.bytes {
             return Err(anyhow!("asset {resolved_path} has the wrong bucket size"));
         }
         let mut file = tokio::fs::OpenOptions::new()
@@ -519,33 +507,20 @@ impl AssetResolver {
             .open(&temporary)
             .await
             .with_context(|| format!("create asset cache file {}", temporary.display()))?;
-        let mut body = object.body;
-        let mut hasher = Sha256::new();
-        let mut bytes = 0_u64;
-        let download = async {
-            while let Some(chunk) = body.next().await {
-                let chunk = chunk.with_context(|| format!("read asset body {resolved_path}"))?;
-                bytes = bytes
-                    .checked_add(chunk.len() as u64)
-                    .context("asset body size overflow")?;
-                if bytes > entry.bytes {
-                    return Err(anyhow!("asset {resolved_path} exceeds its declared size"));
-                }
-                hasher.update(&chunk);
-                file.write_all(&chunk).await?;
-            }
+        let write = async {
+            file.write_all(&body).await?;
             file.sync_all().await?;
             anyhow::Ok(())
         }
         .await;
-        if let Err(error) = download {
+        if let Err(error) = write {
             drop(file);
             let _ = tokio::fs::remove_file(&temporary).await;
             return Err(error);
         }
         drop(file);
-        let actual = format!("{:x}", hasher.finalize());
-        if bytes != entry.bytes || actual != entry.sha256 {
+        let actual = format!("{:x}", Sha256::digest(&body));
+        if actual != entry.sha256 {
             let _ = tokio::fs::remove_file(&temporary).await;
             return Err(anyhow!(
                 "asset {resolved_path} checksum mismatch: expected {}, got {actual}",
@@ -1069,7 +1044,11 @@ async fn valid_cached_file(
 
 fn touch_cache_file(path: PathBuf) {
     tokio::task::spawn_blocking(move || {
-        let _ = filetime::set_file_mtime(path, filetime::FileTime::now());
+        let times = std::fs::FileTimes::new().set_modified(std::time::SystemTime::now());
+        let _ = std::fs::File::options()
+            .write(true)
+            .open(path)
+            .and_then(|file| file.set_times(times));
     });
 }
 

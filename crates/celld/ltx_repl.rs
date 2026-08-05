@@ -1,17 +1,15 @@
+// Copyright 2026 Deno Land Inc. Apache-2.0 license.
+
 //! In-process replication backend built on `celld-ltx`.
 //!
-//! The Litestream backend ([`crate::replication::NodeRepl`]) runs an external
-//! process that watches a directory and answers durability over a control
-//! socket. `LtxRepl` does the same job inside celld: one shared `object_store`
-//! client for the whole node, and a managed `celld_ltx::Db` per resident cell
-//! that captures the cell's committed WAL and uploads it on demand. No process,
-//! no directory-watch lag — a just-written cell is registered the instant it
-//! activates, so the output gate can prove a fresh cell durable with no
-//! cold-start window. Litestream stays reachable behind `CELLD_REPLICATOR`.
+//! One shared `object_store` client for the whole node, and a managed
+//! `celld_ltx::Db` per resident cell that captures the cell's committed WAL
+//! and uploads it on demand. No external process, no directory-watch lag — a
+//! just-written cell is registered the instant it activates, so the output
+//! gate can prove a fresh cell durable with no cold-start window.
 //!
-//! The object layout mirrors the Litestream tree (`cells/<cell>/ltx/e<epoch>/`)
-//! but the files are LTX, not Litestream generations — the two are not
-//! interoperable, so a bucket is written by one backend or the other.
+//! The object layout is `cells/<cell>/ltx/e<epoch>/` in the bucket, mirroring
+//! the local `<watch>/<cell>/ltx/e<epoch>/db.sqlite` tree.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -24,8 +22,6 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::anyhow;
-use tokio::sync::Notify;
-use tokio::sync::Semaphore;
 use celld_ltx::object_store::ObjectStore;
 use celld_ltx::replica;
 use celld_ltx::Db;
@@ -33,6 +29,8 @@ use celld_ltx::ObjectStoreClient;
 use celld_ltx::ObjectStoreConfig;
 use celld_ltx::Replica;
 use celld_ltx::TXID;
+use tokio::sync::Notify;
+use tokio::sync::Semaphore;
 use tracing::info;
 use tracing::warn;
 
@@ -70,8 +68,7 @@ struct Cell {
 type CellHandle = Arc<Cell>;
 
 pub struct LtxRepl {
-    /// Local root: cell dbs live at `watch/<cell>/ltx/e<epoch>/db.sqlite`, the
-    /// same layout the Litestream backend uses.
+    /// Local root: cell dbs live at `watch/<cell>/ltx/e<epoch>/db.sqlite`.
     watch: PathBuf,
     bucket: String,
     endpoint: Option<String>,
@@ -137,8 +134,7 @@ impl LtxRepl {
     }
 
     /// Highest epoch under `cells/<cell>/ltx/` that holds any LTX — the newest
-    /// durable copy to restore on takeover. Mirrors the Litestream backend's
-    /// `highest_nonempty_epoch`.
+    /// durable copy to restore on takeover.
     async fn highest_nonempty_epoch(&self, cell: &str) -> anyhow::Result<Option<u64>> {
         use celld_ltx::object_store::path::Path as ObjPath;
         let base = ObjPath::from(format!("cells/{cell}/ltx"));
@@ -176,14 +172,13 @@ impl LtxRepl {
             epoch,
             fresh,
             took_over,
-            ..
         } = options;
         let dst = self.db_path(cell, epoch);
         std::fs::create_dir_all(dst.parent().unwrap())?;
 
         // Reuse a preserved local hibernation snapshot when it is safe to: the
         // same epoch always, the previous epoch only when we did not take the
-        // cell from another node. Mirrors the Litestream backend.
+        // cell from another node.
         let same_epoch = dst.with_extension("hibernated");
         let previous = celld_logic::restore::previous_epoch_reusable(epoch, took_over)
             .then(|| self.db_path(cell, epoch - 1).with_extension("hibernated"));
@@ -218,12 +213,24 @@ impl LtxRepl {
 
         // Open the managed Db (creates a fresh WAL db when nothing was restored)
         // and pair it with this epoch's client. Registration is immediate: the
-        // cell can be proved durable on its very first write.
+        // cell can be proved durable on its very first write. The just-opened
+        // db's position is the replica's seed -- 0 for a fresh cell, the
+        // restored max otherwise, and equal to the remote under epoch fencing --
+        // so the first sync skips the `calc_pos` listing that otherwise storms a
+        // rate-limiting store. On the rare decode error we leave it unseeded and
+        // fall back to that listing.
         let dst_ = dst.clone();
-        let db = tokio::task::spawn_blocking(move || Db::open(&dst_))
-            .await?
-            .map_err(|error| anyhow!("open managed db {}: {error}", dst.display()))?;
-        let replica = Replica::new(db, self.client_for(cell, epoch));
+        let (db, seed) = tokio::task::spawn_blocking(move || {
+            let mut db = Db::open(&dst_)?;
+            let seed = db.pos().ok();
+            anyhow::Ok((db, seed))
+        })
+        .await?
+        .map_err(|error| anyhow!("open managed db {}: {error}", dst.display()))?;
+        let mut replica = Replica::new(db, self.client_for(cell, epoch));
+        if let Some(pos) = seed {
+            replica.seed_pos(pos);
+        }
         self.cells.lock().unwrap().insert(
             (cell.to_string(), epoch),
             Arc::new(Cell {
@@ -238,8 +245,6 @@ impl LtxRepl {
         Ok(ActivationResult {
             path: dst,
             restored,
-            replica_discovery_us: 0,
-            restore_us: 0,
         })
     }
 
@@ -257,7 +262,12 @@ impl LtxRepl {
         epoch: u64,
         position: u64,
     ) -> anyhow::Result<u64> {
-        let Some(handle) = self.cells.lock().unwrap().get(&(cell.to_string(), epoch)).cloned()
+        let Some(handle) = self
+            .cells
+            .lock()
+            .unwrap()
+            .get(&(cell.to_string(), epoch))
+            .cloned()
         else {
             anyhow::bail!("ltx cell not resident: {cell} epoch {epoch}");
         };
@@ -281,7 +291,12 @@ impl LtxRepl {
     /// gates (not the hot write path). Also advances the cell's durable position
     /// so any output-gate waiters ride it.
     pub async fn sync_wait(&self, cell: &str, epoch: u64, _timeout: Duration) -> SyncWait {
-        let Some(handle) = self.cells.lock().unwrap().get(&(cell.to_string(), epoch)).cloned()
+        let Some(handle) = self
+            .cells
+            .lock()
+            .unwrap()
+            .get(&(cell.to_string(), epoch))
+            .cloned()
         else {
             return SyncWait::Unsupported;
         };
@@ -296,7 +311,10 @@ impl LtxRepl {
         // A final durability pass so no acknowledged write is stranded, then
         // drop the managed Db (releasing the WAL) before touching the file.
         let _ = self.sync_wait(cell, epoch, Duration::from_secs(10)).await;
-        self.cells.lock().unwrap().remove(&(cell.to_string(), epoch));
+        self.cells
+            .lock()
+            .unwrap()
+            .remove(&(cell.to_string(), epoch));
         let db = self.db_path(cell, epoch);
         if preserve_local {
             let preserved = db.with_extension("hibernated");
@@ -476,11 +494,11 @@ fn node_config(
     credentials: Option<&StorageCredentials>,
 ) -> ObjectStoreConfig {
     let endpoint = endpoint.unwrap_or_default().to_string();
-    // Static credentials come from the managed control plane when present, else
-    // the `AWS_*` env the node already carries for Litestream. Without this,
-    // `build_store` sees empty keys and object_store falls back to the instance
-    // credential provider, which off-EC2 sends unsigned requests (R2 answers
-    // "404 page not found").
+    // Static credentials come from the managed control plane when present,
+    // else the `AWS_*` env the node already carries. Without this,
+    // `build_store` sees empty keys and object_store falls back to the
+    // instance credential provider, which off-EC2 sends unsigned requests (R2
+    // answers "404 page not found").
     let env = |key: &str| std::env::var(key).ok().filter(|value| !value.is_empty());
     let access_key_id = credentials
         .map(|c| c.access_key_id.clone())

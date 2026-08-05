@@ -1,13 +1,13 @@
+// Copyright 2026 Deno Land Inc. Apache-2.0 license.
+
 //! S3-compatible ownership effect adapter.
 //!
 //! This module deliberately contains serialization, wall-clock sampling, SDK
 //! configuration and error classification only. Ownership decisions remain in
 //! `celld-logic`.
 
+use crate::bucket::Bucket;
 use anyhow::Context;
-use aws_sdk_s3::error::SdkError;
-use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::Client;
 use celld_logic::{
     CapacityPeer, CasGuard, CasOutcome, LeaseCasOutcome, NodeLeaseRecord, OwnerRecord,
 };
@@ -15,7 +15,7 @@ use futures_util::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Serialize)]
 struct OwnerWire<'a> {
@@ -81,9 +81,8 @@ pub fn now_ms() -> u64 {
 /// effects. A failed write is always reported to the core as ambiguous unless
 /// S3 definitively returned HTTP 412.
 pub struct S3Ownership {
-    client: Client,
-    lease_client: Client,
-    bucket: String,
+    bucket: Bucket,
+    lease_bucket: Bucket,
     node: String,
     probe_public_key: String,
     live: Arc<LiveLoad>,
@@ -105,10 +104,9 @@ pub struct LiveLoad {
 }
 
 impl S3Ownership {
-    pub fn new(client: Client, bucket: String, node: String) -> Self {
+    pub fn new(bucket: Bucket, node: String) -> Self {
         Self {
-            lease_client: client.clone(),
-            client,
+            lease_bucket: bucket.clone(),
             bucket,
             node,
             probe_public_key: String::new(),
@@ -121,16 +119,14 @@ impl S3Ownership {
     /// probes. Read-only ownership adapters deliberately use [`Self::new`]
     /// and cannot accidentally publish a lease.
     pub fn with_probe_public_key(
-        client: Client,
-        lease_client: Client,
-        bucket: String,
+        bucket: Bucket,
+        lease_bucket: Bucket,
         node: String,
         probe_public_key: String,
     ) -> Self {
         Self {
-            client,
-            lease_client,
             bucket,
+            lease_bucket,
             node,
             probe_public_key,
             live: Arc::new(LiveLoad::default()),
@@ -144,27 +140,10 @@ impl S3Ownership {
             .ok()
             .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
             .unwrap_or_else(|| "us-east-1".into());
-
-        // These bounds are a correctness condition for the node self-fence,
-        // not merely tuning. Keep them aligned with celld while that lease
-        // path is moved into the new core.
-        let timeouts = aws_config::timeout::TimeoutConfig::builder()
-            .connect_timeout(Duration::from_secs(3))
-            .read_timeout(Duration::from_secs(10))
-            .operation_attempt_timeout(Duration::from_secs(15))
-            .operation_timeout(Duration::from_secs(30))
-            .build();
-        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .timeout_config(timeouts)
-            .region(aws_config::Region::new(region));
-        if let Some(endpoint) = endpoint.as_deref() {
-            loader = loader.endpoint_url(endpoint);
-        }
-        let shared = loader.load().await;
-        let config = aws_sdk_s3::config::Builder::from(&shared)
-            .force_path_style(endpoint.is_some())
-            .build();
-        Ok(Self::new(Client::from_conf(config), bucket, node))
+        Ok(Self::new(
+            Bucket::open(&bucket, endpoint.as_deref(), &region, None, None)?,
+            node,
+        ))
     }
 
     /// The lease lifetime this fleet renews on, used to decide which node
@@ -197,7 +176,7 @@ impl S3Ownership {
     }
 
     pub async fn read_node_lease(&self, owner: &str) -> anyhow::Result<Option<NodeLeaseRecord>> {
-        self.read_node_lease_with(&self.client, owner).await
+        self.read_node_lease_with(&self.bucket, owner).await
     }
 
     /// Read this process's authority record through the isolated lease pool.
@@ -205,17 +184,17 @@ impl S3Ownership {
         &self,
         owner: &str,
     ) -> anyhow::Result<Option<NodeLeaseRecord>> {
-        self.read_node_lease_with(&self.lease_client, owner).await
+        self.read_node_lease_with(&self.lease_bucket, owner).await
     }
 
     async fn read_node_lease_with(
         &self,
-        client: &Client,
+        bucket: &Bucket,
         owner: &str,
     ) -> anyhow::Result<Option<NodeLeaseRecord>> {
         let key = format!("nodes/{owner}.json");
         Ok(self
-            .read_json_with::<NodeLeaseWire>(client, &key)
+            .read_json_with::<NodeLeaseWire>(bucket, &key)
             .await?
             .map(|(lease, etag)| NodeLeaseRecord {
                 node: lease.node,
@@ -234,39 +213,30 @@ impl S3Ownership {
         const READ_CONCURRENCY: usize = 16;
         let current_ms = now_ms();
         let mut nodes = Vec::new();
-        let mut continuation = None;
-        loop {
-            let mut request = self.client.list_objects_v2().bucket(&self.bucket).prefix("nodes/");
-            if let Some(token) = &continuation {
-                request = request.continuation_token(token);
+        for object in self.bucket.list("nodes/").await? {
+            // A record nothing has rewritten in several lease lifetimes
+            // belongs to a node that is not coming back. Skipping it here
+            // is the difference between reading the live fleet and
+            // reading every node that has ever run: the listing is what
+            // the placement decision costs, and it is paid on every
+            // unowned cell.
+            if !capacity_record_is_recent(
+                object.last_modified.timestamp(),
+                current_ms,
+                self.lease_ttl_ms,
+            ) {
+                continue;
             }
-            let page = request.send().await?;
-            for object in page.contents() {
-                // A record nothing has rewritten in several lease lifetimes
-                // belongs to a node that is not coming back. Skipping it here
-                // is the difference between reading the live fleet and
-                // reading every node that has ever run: the listing is what
-                // the placement decision costs, and it is paid on every
-                // unowned cell.
-                if object.last_modified().is_some_and(|modified| {
-                    !capacity_record_is_recent(modified.secs(), current_ms, self.lease_ttl_ms)
-                }) {
-                    continue;
-                }
-                let Some(node) = object
-                    .key()
-                    .and_then(|key| key.strip_prefix("nodes/"))
-                    .and_then(|key| key.strip_suffix(".json"))
-                else {
-                    continue;
-                };
-                if !node.is_empty() {
-                    nodes.push(node.to_string());
-                }
-            }
-            match page.next_continuation_token() {
-                Some(token) => continuation = Some(token.to_string()),
-                None => break,
+            let Some(node) = object
+                .location
+                .as_ref()
+                .strip_prefix("nodes/")
+                .and_then(|key| key.strip_suffix(".json"))
+            else {
+                continue;
+            };
+            if !node.is_empty() {
+                nodes.push(node.to_string());
             }
         }
         nodes.sort();
@@ -274,10 +244,8 @@ impl S3Ownership {
 
         let mut reads = stream::iter(nodes.into_iter().map(|node| async move {
             let key = format!("nodes/{node}.json");
-            Ok::<_, anyhow::Error>(self
-                .read_json::<NodeLeaseWire>(&key)
-                .await?
-                .map(|(lease, _)| CapacityPeer {
+            Ok::<_, anyhow::Error>(self.read_json::<NodeLeaseWire>(&key).await?.map(
+                |(lease, _)| CapacityPeer {
                     node: lease.node,
                     addr: lease.addr,
                     expires_ms: lease.expires_ms,
@@ -287,7 +255,8 @@ impl S3Ownership {
                     host_websockets: lease.load.host_websockets,
                     rss_bytes: lease.load.rss_bytes,
                     pressured: lease.load.pressured,
-                }))
+                },
+            ))
         }))
         .buffer_unordered(READ_CONCURRENCY);
         let mut peers = Vec::new();
@@ -314,25 +283,10 @@ impl S3Ownership {
             return Ok(CasOutcome::Rejected);
         }
         let key = format!("cells/{cell}/own.json");
-        let body = ByteStream::from(serde_json::to_vec(&OwnerWire { node: "", epoch })?);
-        match self
-            .client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(&key)
-            .body(body)
-            .if_match(current.etag)
-            .send()
-            .await
-        {
-            Ok(_) => Ok(CasOutcome::Applied),
-            Err(SdkError::ServiceError(error)) if error.raw().status().as_u16() == 412 => {
-                Ok(CasOutcome::Rejected)
-            }
-            Err(error) => Err(anyhow::anyhow!(error).context(format!(
-                "conditional write s3://{}/{key} may have committed",
-                self.bucket
-            ))),
+        let body = serde_json::to_vec(&OwnerWire { node: "", epoch })?;
+        match self.bucket.put_cas(&key, body, Some(&current.etag)).await? {
+            Some(_) => Ok(CasOutcome::Applied),
+            None => Ok(CasOutcome::Rejected),
         }
     }
 
@@ -343,29 +297,17 @@ impl S3Ownership {
         epoch: u64,
     ) -> anyhow::Result<CasOutcome> {
         let key = format!("cells/{cell}/own.json");
-        let body = ByteStream::from(serde_json::to_vec(&OwnerWire {
+        let body = serde_json::to_vec(&OwnerWire {
             node: &self.node,
             epoch,
-        })?);
-        let request = self
-            .client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(&key)
-            .body(body);
-        let request = match guard {
-            CasGuard::Absent => request.if_none_match("*"),
-            CasGuard::Match(etag) => request.if_match(etag),
+        })?;
+        let etag = match &guard {
+            CasGuard::Absent => None,
+            CasGuard::Match(etag) => Some(etag.as_str()),
         };
-        match request.send().await {
-            Ok(_) => Ok(CasOutcome::Applied),
-            Err(SdkError::ServiceError(error)) if error.raw().status().as_u16() == 412 => {
-                Ok(CasOutcome::Rejected)
-            }
-            Err(error) => Err(anyhow::anyhow!(error).context(format!(
-                "conditional write s3://{}/{key} may have committed",
-                self.bucket
-            ))),
+        match self.bucket.put_cas(&key, body, etag).await? {
+            Some(_) => Ok(CasOutcome::Applied),
+            None => Ok(CasOutcome::Rejected),
         }
     }
 
@@ -380,7 +322,7 @@ impl S3Ownership {
             ));
         }
         let key = format!("nodes/{}.json", self.node);
-        let body = ByteStream::from(serde_json::to_vec(&NodeLeaseWire {
+        let body = serde_json::to_vec(&NodeLeaseWire {
             node: record.node.clone(),
             expires_ms: record.expires_ms,
             addr: record.addr.clone(),
@@ -388,28 +330,14 @@ impl S3Ownership {
             peer_protocol: record.peer_protocol,
             generation: record.generation.clone(),
             load: process_load(&self.live),
-        })?);
-        let request = self
-            .lease_client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(&key)
-            .body(body);
-        let request = match guard {
-            CasGuard::Absent => request.if_none_match("*"),
-            CasGuard::Match(etag) => request.if_match(etag),
+        })?;
+        let etag = match &guard {
+            CasGuard::Absent => None,
+            CasGuard::Match(etag) => Some(etag.as_str()),
         };
-        match request.send().await {
-            Ok(output) => Ok(LeaseCasOutcome::Applied {
-                etag: output.e_tag().unwrap_or_default().to_string(),
-            }),
-            Err(SdkError::ServiceError(error)) if error.raw().status().as_u16() == 412 => {
-                Ok(LeaseCasOutcome::Rejected)
-            }
-            Err(error) => Err(anyhow::anyhow!(error).context(format!(
-                "conditional write s3://{}/{key} may have committed",
-                self.bucket
-            ))),
+        match self.lease_bucket.put_cas(&key, body, etag).await? {
+            Some(etag) => Ok(LeaseCasOutcome::Applied { etag }),
+            None => Ok(LeaseCasOutcome::Rejected),
         }
     }
 
@@ -417,38 +345,20 @@ impl S3Ownership {
         &self,
         key: &str,
     ) -> anyhow::Result<Option<(T, String)>> {
-        self.read_json_with(&self.client, key).await
+        self.read_json_with(&self.bucket, key).await
     }
 
     async fn read_json_with<T: for<'de> Deserialize<'de>>(
         &self,
-        client: &Client,
+        bucket: &Bucket,
         key: &str,
     ) -> anyhow::Result<Option<(T, String)>> {
-        match client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-        {
-            Ok(output) => {
-                let etag = output.e_tag().unwrap_or_default().to_string();
-                let bytes = output
-                    .body
-                    .collect()
-                    .await
-                    .with_context(|| format!("read body s3://{}/{key}", self.bucket))?
-                    .into_bytes();
-                let value = serde_json::from_slice(&bytes)
-                    .with_context(|| format!("decode s3://{}/{key}", self.bucket))?;
-                Ok(Some((value, etag)))
-            }
-            Err(SdkError::ServiceError(error)) if error.err().is_no_such_key() => Ok(None),
-            Err(error) => {
-                Err(anyhow::anyhow!(error).context(format!("read s3://{}/{key}", self.bucket)))
-            }
-        }
+        let Some((bytes, etag)) = bucket.get(key).await? else {
+            return Ok(None);
+        };
+        let value = serde_json::from_slice(&bytes)
+            .with_context(|| format!("decode s3://{}/{key}", bucket.name))?;
+        Ok(Some((value, etag)))
     }
 }
 

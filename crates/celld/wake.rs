@@ -1,3 +1,5 @@
+// Copyright 2026 Deno Land Inc. Apache-2.0 license.
+
 //! Alarm wake for hibernated cells (on by default).
 //!
 //! Committed alarm state is mirrored into the bucket as
@@ -12,8 +14,7 @@
 //!   stale entry costs one spurious wake, a missing entry costs a lost wake;
 //! - the flusher never touches the request path: it reads the lock-free
 //!   `next_alarm_ms` mirror on the existing 5 s sweep tick.
-use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::Client;
+use crate::bucket::Bucket;
 use celld_logic::wake::parse_entry_key;
 use celld_logic::wake::Op;
 use celld_logic::wake::Step;
@@ -35,38 +36,26 @@ pub fn resident_ms() -> i64 {
 }
 
 /// Scan the due wake buckets: used by the boot-time orphan scan and the
-/// Phase 3 waker tick. Keys sort by due minute, so paging stops at the first
-/// future bucket — the scan is O(due entries), never O(all entries).
+/// Phase 3 waker tick. The whole `wake/` prefix is listed and filtered
+/// locally; entries are deleted as their alarms are consumed, so the listing
+/// stays O(armed entries).
 /// Due entries as (cell, minute_ms). The minute is carried out so a reviving
 /// node can adopt the entry it acted on: without it, a cell whose restored
 /// truth has no alarm leaves the entry that woke it in the bucket forever.
-pub async fn due_scan(c: &Client, bucket: &str, now_ms: i64) -> Vec<(String, i64)> {
+pub async fn due_scan(bucket: &Bucket, now_ms: i64) -> Vec<(String, i64)> {
     let mut due = Vec::new();
-    let mut token: Option<String> = None;
-    'pages: loop {
-        let mut req = c.list_objects_v2().bucket(bucket).prefix("wake/");
-        if let Some(t) = &token {
-            req = req.continuation_token(t);
+    let objects = match bucket.list("wake/").await {
+        Ok(objects) => objects,
+        Err(e) => {
+            warn!(error = %e, "wake due scan list failed");
+            return due;
         }
-        let page = match req.send().await {
-            Ok(page) => page,
-            Err(e) => {
-                warn!(error = %e, "wake due scan list failed");
-                break;
-            }
-        };
-        for object in page.contents() {
-            let Some(key) = object.key() else { continue };
-            if let Some((minute_ms, cell)) = parse_entry_key(key) {
-                if minute_ms > now_ms {
-                    break 'pages;
-                } // sorted: all later
+    };
+    for object in objects {
+        if let Some((minute_ms, cell)) = parse_entry_key(object.location.as_ref()) {
+            if minute_ms <= now_ms {
                 due.push((cell, minute_ms));
             }
-        }
-        match page.next_continuation_token() {
-            Some(t) => token = Some(t.to_string()),
-            None => break,
         }
     }
     due.sort();
@@ -77,36 +66,17 @@ pub async fn due_scan(c: &Client, bucket: &str, now_ms: i64) -> Vec<(String, i64
 /// Advisory waker-role lease: one holder per fleet to avoid N nodes polling.
 /// Correctness never depends on it — concurrent wakers race activation CAS
 /// harmlessly — so every failure path just returns false and skips a tick.
-pub async fn try_hold_waker(
-    c: &Client,
-    bucket: &str,
-    node: &str,
-    now_ms: i64,
-    ttl_ms: i64,
-) -> bool {
+pub async fn try_hold_waker(bucket: &Bucket, node: &str, now_ms: i64, ttl_ms: i64) -> bool {
     const KEY: &str = "wake/waker.json";
-    let body = |expires: i64| {
-        ByteStream::from(format!("{{\"node\":{node:?},\"expires_ms\":{expires}}}").into_bytes())
-    };
-    let current = c.get_object().bucket(bucket).key(KEY).send().await;
-    match current {
-        Err(_) => {
-            // absent (or unreadable): claim if absent
-            c.put_object()
-                .bucket(bucket)
-                .key(KEY)
-                .if_none_match("*")
-                .body(body(now_ms + ttl_ms))
-                .send()
-                .await
-                .is_ok()
-        }
-        Ok(resp) => {
-            let etag = resp.e_tag().unwrap_or_default().to_string();
-            let bytes = match resp.body.collect().await {
-                Ok(b) => b.into_bytes(),
-                Err(_) => return false,
-            };
+    let body =
+        |expires: i64| format!("{{\"node\":{node:?},\"expires_ms\":{expires}}}").into_bytes();
+    match bucket.get(KEY).await {
+        // absent (or unreadable): claim if absent
+        Ok(None) | Err(_) => matches!(
+            bucket.put_cas(KEY, body(now_ms + ttl_ms), None).await,
+            Ok(Some(_))
+        ),
+        Ok(Some((bytes, etag))) => {
             let text = String::from_utf8_lossy(&bytes);
             let held_by_us = text.contains(&format!("\"node\":{node:?}"));
             let expires = text
@@ -115,14 +85,12 @@ pub async fn try_hold_waker(
                 .and_then(|t| t.trim_end_matches('}').trim().parse::<i64>().ok())
                 .unwrap_or(0);
             if celld_logic::wake::waker_may_claim(held_by_us, expires, now_ms) {
-                c.put_object()
-                    .bucket(bucket)
-                    .key(KEY)
-                    .if_match(etag)
-                    .body(body(now_ms + ttl_ms))
-                    .send()
-                    .await
-                    .is_ok()
+                matches!(
+                    bucket
+                        .put_cas(KEY, body(now_ms + ttl_ms), Some(&etag))
+                        .await,
+                    Ok(Some(_))
+                )
             } else {
                 false
             }
@@ -183,8 +151,7 @@ impl WakeFlusher {
     /// final delete of a consumed alarm on the consuming commit's replication.
     pub async fn reconcile(
         &self,
-        c: &Client,
-        bucket: &str,
+        bucket: &Bucket,
         cell: &str,
         next_alarm_ms: i64,
         consume_durable: bool,
@@ -214,15 +181,8 @@ impl WakeFlusher {
             let Some(step) = step else { break };
             match step {
                 Step::Put { key, due_ms, body } => {
-                    match c
-                        .put_object()
-                        .bucket(bucket)
-                        .key(&key)
-                        .body(ByteStream::from(body.into_bytes()))
-                        .send()
-                        .await
-                    {
-                        Ok(_) => plan.put_done(&mut self.core.lock().unwrap(), key, due_ms),
+                    match bucket.put(&key, body.into_bytes()).await {
+                        Ok(()) => plan.put_done(&mut self.core.lock().unwrap(), key, due_ms),
                         Err(e) => {
                             warn!(%cell, %key, error = %e, "wake entry put failed");
                             plan.put_failed();
@@ -233,7 +193,7 @@ impl WakeFlusher {
                     // A failed delete still drops the state: a stale entry is
                     // one spurious wake, and keeping it would block the arm
                     // that replaces it.
-                    if let Err(e) = c.delete_object().bucket(bucket).key(&key).send().await {
+                    if let Err(e) = bucket.delete(&key).await {
                         warn!(%cell, %key, error = %e, "wake entry delete failed");
                     }
                     plan.delete_done(&mut self.core.lock().unwrap(), &key);
@@ -284,5 +244,4 @@ impl WakeFlusher {
     pub fn forget(&self, cell: &str) {
         self.core.lock().unwrap().forget(cell);
     }
-
 }

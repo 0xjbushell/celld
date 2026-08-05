@@ -1,3 +1,5 @@
+// Copyright 2026 Deno Land Inc. Apache-2.0 license.
+
 //! Test-only SQLite fault injection: a wrapper VFS that delegates to the
 //! process default VFS but fails writes with `SQLITE_IOERR` while the current
 //! thread has armed the fault. Compiled only into test builds —
@@ -76,34 +78,19 @@ unsafe extern "C" fn shim_write(
     }
     file_delegate!(file, xWrite, buf, amt, offset)
 }
-unsafe extern "C" fn shim_truncate(
-    file: *mut ffi::sqlite3_file,
-    size: i64,
-) -> c_int {
+unsafe extern "C" fn shim_truncate(file: *mut ffi::sqlite3_file, size: i64) -> c_int {
     file_delegate!(file, xTruncate, size)
 }
-unsafe extern "C" fn shim_sync(
-    file: *mut ffi::sqlite3_file,
-    flags: c_int,
-) -> c_int {
+unsafe extern "C" fn shim_sync(file: *mut ffi::sqlite3_file, flags: c_int) -> c_int {
     file_delegate!(file, xSync, flags)
 }
-unsafe extern "C" fn shim_file_size(
-    file: *mut ffi::sqlite3_file,
-    size: *mut i64,
-) -> c_int {
+unsafe extern "C" fn shim_file_size(file: *mut ffi::sqlite3_file, size: *mut i64) -> c_int {
     file_delegate!(file, xFileSize, size)
 }
-unsafe extern "C" fn shim_lock(
-    file: *mut ffi::sqlite3_file,
-    level: c_int,
-) -> c_int {
+unsafe extern "C" fn shim_lock(file: *mut ffi::sqlite3_file, level: c_int) -> c_int {
     file_delegate!(file, xLock, level)
 }
-unsafe extern "C" fn shim_unlock(
-    file: *mut ffi::sqlite3_file,
-    level: c_int,
-) -> c_int {
+unsafe extern "C" fn shim_unlock(file: *mut ffi::sqlite3_file, level: c_int) -> c_int {
     file_delegate!(file, xUnlock, level)
 }
 unsafe extern "C" fn shim_check_reserved_lock(
@@ -122,9 +109,7 @@ unsafe extern "C" fn shim_file_control(
 unsafe extern "C" fn shim_sector_size(file: *mut ffi::sqlite3_file) -> c_int {
     file_delegate!(file, xSectorSize)
 }
-unsafe extern "C" fn shim_device_characteristics(
-    file: *mut ffi::sqlite3_file,
-) -> c_int {
+unsafe extern "C" fn shim_device_characteristics(file: *mut ffi::sqlite3_file) -> c_int {
     file_delegate!(file, xDeviceCharacteristics)
 }
 unsafe extern "C" fn shim_shm_map(
@@ -147,10 +132,7 @@ unsafe extern "C" fn shim_shm_lock(
 unsafe extern "C" fn shim_shm_barrier(file: *mut ffi::sqlite3_file) {
     file_delegate!(file, xShmBarrier)
 }
-unsafe extern "C" fn shim_shm_unmap(
-    file: *mut ffi::sqlite3_file,
-    delete_flag: c_int,
-) -> c_int {
+unsafe extern "C" fn shim_shm_unmap(file: *mut ffi::sqlite3_file, delete_flag: c_int) -> c_int {
     file_delegate!(file, xShmUnmap, delete_flag)
 }
 unsafe extern "C" fn shim_fetch(
@@ -240,16 +222,10 @@ unsafe extern "C" fn shim_randomness(
 ) -> c_int {
     vfs_delegate!(vfs, xRandomness, length, out)
 }
-unsafe extern "C" fn shim_sleep(
-    vfs: *mut ffi::sqlite3_vfs,
-    microseconds: c_int,
-) -> c_int {
+unsafe extern "C" fn shim_sleep(vfs: *mut ffi::sqlite3_vfs, microseconds: c_int) -> c_int {
     vfs_delegate!(vfs, xSleep, microseconds)
 }
-unsafe extern "C" fn shim_current_time(
-    vfs: *mut ffi::sqlite3_vfs,
-    out: *mut f64,
-) -> c_int {
+unsafe extern "C" fn shim_current_time(vfs: *mut ffi::sqlite3_vfs, out: *mut f64) -> c_int {
     vfs_delegate!(vfs, xCurrentTime, out)
 }
 unsafe extern "C" fn shim_get_last_error(
@@ -259,10 +235,7 @@ unsafe extern "C" fn shim_get_last_error(
 ) -> c_int {
     vfs_delegate!(vfs, xGetLastError, length, out)
 }
-unsafe extern "C" fn shim_current_time_int64(
-    vfs: *mut ffi::sqlite3_vfs,
-    out: *mut i64,
-) -> c_int {
+unsafe extern "C" fn shim_current_time_int64(vfs: *mut ffi::sqlite3_vfs, out: *mut i64) -> c_int {
     vfs_delegate!(vfs, xCurrentTimeInt64, out)
 }
 

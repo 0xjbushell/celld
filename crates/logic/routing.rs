@@ -1,3 +1,5 @@
+// Copyright 2026 Deno Land Inc. Apache-2.0 license.
+
 //! Whether a failed peer dispatch may be re-sent.
 //!
 //! A cell runs on exactly one node, so every other node forwards to the

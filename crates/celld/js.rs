@@ -1,3 +1,5 @@
+// Copyright 2026 Deno Land Inc. Apache-2.0 license.
+
 //! The JS engine: rusty_v8 directly. One isolate per cell.
 //!
 //! This slice runs actual Durable Objects: the worker's default-export `fetch`
@@ -128,8 +130,7 @@ pub fn submit_do_call(call: DoCallReq) -> bool {
 /// has landed. Invariant: an arm the caller has OBSERVED acknowledged
 /// (received the response) is covered by a durable entry.
 pub struct ArmGate {
-    pub c: aws_sdk_s3::Client,
-    pub bucket: String,
+    pub bucket: crate::bucket::Bucket,
     pub flusher: Arc<crate::wake::WakeFlusher>,
 }
 static ARM_GATE: OnceLock<ArmGate> = OnceLock::new();
@@ -139,9 +140,7 @@ pub fn set_arm_gate(gate: ArmGate) {
 
 /// Whether this node still holds a wake entry for `cell`.
 pub fn wake_entry_tracked(cell: &str) -> bool {
-    ARM_GATE
-        .get()
-        .is_some_and(|gate| gate.flusher.tracks(cell))
+    ARM_GATE.get().is_some_and(|gate| gate.flusher.tracks(cell))
 }
 
 /// Adopt the wake entry a restored alarm implies, so consuming that alarm
@@ -165,7 +164,7 @@ pub async fn reconcile_wake_entry(cell: &str, next_alarm_ms: i64, consume_durabl
         return;
     };
     gate.flusher
-        .reconcile(&gate.c, &gate.bucket, cell, next_alarm_ms, consume_durable)
+        .reconcile(&gate.bucket, cell, next_alarm_ms, consume_durable)
         .await;
 }
 
@@ -207,12 +206,8 @@ fn spawn_arm_gate(cell: &str, at_ms: i64) {
         gate.flusher.await_no_inflight_delete(&cell_).await;
         let body = format!("{{\"cell\":{cell_:?},\"due_ms\":{due_ms}}}");
         let result = gate
-            .c
-            .put_object()
-            .bucket(&gate.bucket)
-            .key(&key)
-            .body(aws_sdk_s3::primitives::ByteStream::from(body.into_bytes()))
-            .send()
+            .bucket
+            .put(&key, body.into_bytes())
             .await
             .map(|_| gate.flusher.confirm_arm(&cell_, due_ms, key))
             .map_err(|e| format!("setAlarm wake entry: {e}"));
@@ -801,7 +796,10 @@ fn ws_capture_take() -> Vec<(u64, WsOut)> {
 /// sockets go straight out, as they did before the gate existed.
 fn ws_gate_may_hold(id: u64) -> bool {
     let registry = ws_registry().lock().unwrap();
-    registry.metadata.get(&id).is_some_and(|meta| meta.hibernatable)
+    registry
+        .metadata
+        .get(&id)
+        .is_some_and(|meta| meta.hibernatable)
 }
 
 fn ws_emit(id: u64, out: WsOut) {
@@ -838,7 +836,6 @@ pub fn ws_close_scope(scope: &str, code: u16, reason: &str) {
         registry.emit(id, WsOut::Close(code, reason.to_string()));
     }
 }
-
 
 thread_local! {
     // JS promise resolvers awaiting an async op, keyed by the op's id.
@@ -1284,7 +1281,10 @@ fn complete_fetch_event<'s>(
                 // Gate on durability only if this handler advanced the cell's
                 // committed-write position past where it was before the handler
                 // ran -- a per-request write, not celld's activation writes.
-                response.write_position = match (writes_before, critical_scope.and_then(storage::write_position)) {
+                response.write_position = match (
+                    writes_before,
+                    critical_scope.and_then(storage::write_position),
+                ) {
                     (Some(before), Some(after)) if after > before => Some(after),
                     _ => None,
                 };
@@ -1840,17 +1840,14 @@ fn reject_reason(tc: &mut v8::PinScope, p: v8::Local<v8::Promise>) -> String {
 pub struct Engine;
 impl Engine {
     pub fn init() {
-        // Load FULL, 16-byte-aligned ICU data before V8 init — the rusty_v8
-        // prebuilt ships a reduced ICU that lacks regex property-of-strings
-        // tables (e.g. /\p{RGI_Emoji}/v) real bundles use.
-        //
-        // The symbol carries V8's internal ICU major, which went 77 -> 78 with
-        // v8 152. The data blob did not change: rusty_v8 152's
-        // `third_party/icu/common/icudtl.dat` is byte-identical to the one
-        // `deno_core_icudata` ships, so the crate stays.
-        if let Err(e) = v8::icu::set_common_data_78(deno_core_icudata::ICU_DATA) {
-            tracing::warn!(code = e, "ICU set_common_data_78 failed");
-        }
+        // No `v8::icu::set_common_data_78` call: the rusty_v8 152 prebuilt
+        // statically links the complete ICU data (full locale tables and
+        // regex property-of-strings, e.g. /\p{RGI_Emoji}/v — verified
+        // empirically), so overriding it with an embedded icudtl.dat only
+        // duplicated 10.8 MB in the binary. A test pins that coverage, so a
+        // future v8 bump that reduces the builtin data fails rather than
+        // silently narrowing it; the fix would be to re-embed rusty_v8's
+        // `third_party/icu/common/icudtl.dat`, 16-byte-aligned.
         let platform = v8::new_default_platform(0, false).make_shared();
         v8::V8::initialize_platform(platform);
         v8::V8::initialize();
@@ -3468,11 +3465,22 @@ fn op_gate_write(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
-    let position = args.get(1).to_integer(scope).map(|n| n.value() as u64).unwrap_or(0);
+    let position = args
+        .get(1)
+        .to_integer(scope)
+        .map(|n| n.value() as u64)
+        .unwrap_or(0);
     let (tx, receive) = tokio::sync::oneshot::channel();
     let sent = GATE_TX
         .get()
-        .map(|gate| gate.send(GateReq { scope: cell, position, reply: tx }).is_ok())
+        .map(|gate| {
+            gate.send(GateReq {
+                scope: cell,
+                position,
+                reply: tx,
+            })
+            .is_ok()
+        })
         .unwrap_or(false);
     let id = asyncrt::enqueue(async move {
         if !sent {

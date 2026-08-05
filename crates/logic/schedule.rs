@@ -1,3 +1,5 @@
+// Copyright 2026 Deno Land Inc. Apache-2.0 license.
+
 //! Cell-isolate dispatch decisions, reified sans-IO. A cell isolate runs one
 //! event at a time. A top-level Worker fetch takes the resident-isolate fast
 //! path only when the isolate is idle; if the isolate is already pumping an

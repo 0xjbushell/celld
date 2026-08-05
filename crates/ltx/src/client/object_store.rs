@@ -31,7 +31,7 @@
 
 use std::sync::Arc;
 
-use futures::stream::{FuturesUnordered, StreamExt, TryStreamExt};
+use futures_util::stream::{FuturesUnordered, StreamExt, TryStreamExt};
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as ObjPath;
 use object_store::{
@@ -821,7 +821,7 @@ async fn delete_batch(
         return Ok(());
     }
     let owned: Vec<ObjPath> = keys.to_vec();
-    let stream = futures::stream::iter(owned.into_iter().map(Ok));
+    let stream = futures_util::stream::iter(owned.into_iter().map(Ok));
     let mut results = store.delete_stream(stream.boxed());
     while let Some(res) = results.next().await {
         match res {

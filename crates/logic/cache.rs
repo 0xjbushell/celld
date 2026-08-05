@@ -1,3 +1,5 @@
+// Copyright 2026 Deno Land Inc. Apache-2.0 license.
+
 //! Local hibernation-cache eviction, sans-IO.
 //!
 //! Idle hibernation preserves each cell's SQLite file so a same-node wake is

@@ -1,3 +1,5 @@
+// Copyright 2026 Deno Land Inc. Apache-2.0 license.
+
 //! Process startup primitives shared by the standalone and eventual managed
 //! celld adapters.
 //!
@@ -108,7 +110,7 @@ const FDS_PER_CELL: u64 = 8;
 const MIN_RESIDENT_CELLS: u64 = 1_000;
 
 /// Raise the descriptor limit to its hard ceiling, and warn when even that
-/// bounds residency. Litestream inherits this limit as our child.
+/// bounds residency.
 #[cfg(unix)]
 pub fn raise_file_limit() {
     let mut limit = libc::rlimit {

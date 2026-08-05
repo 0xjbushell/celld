@@ -1,3 +1,5 @@
+// Copyright 2026 Deno Land Inc. Apache-2.0 license.
+
 //! Alarm retry policy, reified sans-IO. After a handler fails, `celld` persists
 //! a backoff in SQLite (`storage.rs`) and abandons the alarm once a bounded
 //! number of limit-counting failures accrue. That schedule is a pure function

@@ -1,9 +1,11 @@
+// Copyright 2026 Deno Land Inc. Apache-2.0 license.
+
+use crate::bucket::Bucket;
 use crate::protocol::{asset_blob_key, AssetIndex, DeployPointer, Manifest};
 use anyhow::{anyhow, Context};
-use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::Client as S3Client;
 use celld_logic::PresenceSnapshot;
-use futures_util::{SinkExt, StreamExt};
+use fastwebsockets::{FragmentCollector, Frame, OpCode};
+use hyper::header::HeaderMap;
 use rand::RngCore;
 use rusqlite::{types::ValueRef, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -21,7 +23,7 @@ const DEFAULT_CONTROL_URL: &str = "https://celld.dev";
 const DEFAULT_ENVIRONMENT: &str = "prod";
 const MAX_PRESENCE_CELLS: usize = 50;
 const MAX_PRESENCE_CELL_ID_BYTES: usize = 200;
-const MAX_EXPLORER_CELL_PAGE: i32 = 100;
+const MAX_EXPLORER_CELL_PAGE: usize = 100;
 const MAX_EXPLORER_TABLES: usize = 100;
 const MAX_EXPLORER_COLUMNS: usize = 32;
 const MAX_EXPLORER_ROWS: usize = 25;
@@ -757,13 +759,12 @@ pub type PresenceSnapshotSource = Arc<dyn Fn() -> PresenceSnapshotFuture + Send 
 /// celld-logic. The control-plane adapter cannot mutate lifecycle state or
 /// maintain its own resident inventory.
 pub struct PresenceRuntime {
-    pub s3: S3Client,
-    pub bucket: String,
+    pub s3: Bucket,
     pub replication: Option<crate::runtime::Replication>,
     pub node_session_id: String,
     pub advertise: String,
     pub listen: String,
-    /// Credential version used to construct S3, lease, Litestream, explorer,
+    /// Credential version used to construct S3, lease, replication, explorer,
     /// and deployment adapters. This intentionally comes from the same config
     /// snapshot as those credentials, not from a later presence-agent read.
     pub credential_version: u64,
@@ -840,7 +841,7 @@ fn restart_for_credential_rotation(previous_version: u64, credential_version: u6
 /// presence agent. `celld credentials refresh` persists the replacement before
 /// acknowledging its handoff; seeing that version is therefore enough to
 /// rebuild the complete adapter graph. Replacing only one S3 client here would
-/// leave the lease pool, Litestream, explorer, or deploy agent on revoked
+/// leave the lease pool, replication, explorer, or deploy agent on revoked
 /// credentials.
 async fn wait_for_credential_rotation(current_version: u64) -> u64 {
     let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -891,22 +892,22 @@ async fn presence_session(
     runtime: &PresenceRuntime,
     hostname: &str,
 ) -> anyhow::Result<()> {
-    let request = presence_request(
+    let (url, headers) = presence_request(
         config,
         &runtime.node_session_id,
         &runtime.advertise,
         &runtime.listen,
         hostname,
     )?;
-    let (mut socket, _) = match tokio_tungstenite::connect_async(request).await {
-        Ok(connected) => connected,
-        Err(tokio_tungstenite::tungstenite::Error::Http(response))
-            if matches!(response.status().as_u16(), 401 | 403) =>
+    let mut socket = match crate::ws_client::connect(&url, headers).await {
+        Ok(connection) => FragmentCollector::new(connection.socket),
+        Err(crate::ws_client::Error::Declined(declined))
+            if matches!(declined.status.as_u16(), 401 | 403) =>
         {
             return Err(ManagedControlCredentialRevoked.into());
         }
         Err(error) => {
-            return Err(error).context("connect Managed Control Plane presence");
+            return Err(anyhow!("{error}")).context("connect Managed Control Plane presence");
         }
     };
     report_managed_runtime_state(ManagedRuntimeState::Connected);
@@ -975,19 +976,15 @@ async fn presence_session(
                         lazy_lease_shadow_json(&snapshot.lazy_lease_shadow);
                 }
                 socket
-                    .send(tokio_tungstenite::tungstenite::Message::Text(
-                        message.to_string().into(),
-                    ))
+                    .write_frame(Frame::text(message.to_string().into_bytes().into()))
                     .await?;
             }
-            message = socket.next() => {
-                match message {
-                    Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(payload))) => {
-                        socket.send(
-                            tokio_tungstenite::tungstenite::Message::Pong(payload)
-                        ).await?;
-                    }
-                    Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
+            // Ping and Close are answered by the collector's auto-pong and
+            // auto-close; only Text carries anything to act on.
+            frame = socket.read_frame() => {
+                match frame {
+                    Ok(frame) if frame.opcode == OpCode::Text => {
+                        let text = String::from_utf8_lossy(&frame.payload);
                         let message = serde_json::from_str::<serde_json::Value>(&text).ok();
                         let message_type = message.as_ref()
                             .and_then(|value| value.get("type"))
@@ -1000,8 +997,8 @@ async fn presence_session(
                                     runtime,
                                 ).await;
                                 socket
-                                    .send(tokio_tungstenite::tungstenite::Message::Text(
-                                        response.to_string().into(),
+                                    .write_frame(Frame::text(
+                                        response.to_string().into_bytes().into(),
                                     ))
                                     .await?;
                             }
@@ -1013,7 +1010,6 @@ async fn presence_session(
                                     &client,
                                     config,
                                     &runtime.s3,
-                                    &runtime.bucket,
                                 ).await?.is_some() && restart_on_deployment_enabled() {
                                     restart_for_deployment();
                                 }
@@ -1024,20 +1020,19 @@ async fn presence_session(
                             _ => {}
                         }
                     }
-                    Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | None => {
+                    Ok(frame) if frame.opcode == OpCode::Close => {
                         return Err(anyhow!("Managed Control Plane closed presence"));
                     }
-                    Some(Ok(_)) => {}
-                    Some(Err(error)) => return Err(error.into()),
+                    Ok(_) => {}
+                    Err(error) => return Err(anyhow!("{error}"))
+                        .context("read Managed Control Plane presence"),
                 }
             }
         }
     }
 }
 
-fn lazy_lease_shadow_json(
-    batch: &celld_logic::LeaseLifecycleShadowBatch,
-) -> serde_json::Value {
+fn lazy_lease_shadow_json(batch: &celld_logic::LeaseLifecycleShadowBatch) -> serde_json::Value {
     let decisions = batch
         .decisions
         .iter()
@@ -1087,7 +1082,6 @@ async fn lease_shadow_observation(runtime: &PresenceRuntime) -> serde_json::Valu
     let checked_at_ms = crate::ownership_store::now_ms();
     let ownership = crate::ownership_store::S3Ownership::new(
         runtime.s3.clone(),
-        runtime.bucket.clone(),
         runtime.node_session_id.clone(),
     );
     match ownership.read_node_lease(&runtime.node_session_id).await {
@@ -1140,7 +1134,7 @@ async fn handle_explorer_request(
                 }
                 _ => return explorer_error(request_id, "invalid_request"),
             };
-            list_durable_cells(&runtime.s3, &runtime.bucket, cursor).await
+            list_durable_cells(&runtime.s3, cursor).await
         }
         Some("inspect_cell") => {
             let Some(cell) = message
@@ -1260,35 +1254,30 @@ fn valid_explorer_cell_id(cell: &str) -> bool {
 }
 
 async fn list_durable_cells(
-    s3: &S3Client,
-    bucket: &str,
+    bucket: &Bucket,
     cursor: Option<&str>,
 ) -> anyhow::Result<serde_json::Value> {
-    let mut request = s3
-        .list_objects_v2()
-        .bucket(bucket)
-        .prefix("cells/")
-        .delimiter("/")
-        .max_keys(MAX_EXPLORER_CELL_PAGE);
-    if let Some(cursor) = cursor {
-        request = request.continuation_token(cursor);
-    }
-    let page = request.send().await?;
-    let cells = page
-        .common_prefixes()
-        .iter()
-        .filter_map(|prefix| prefix.prefix())
-        .filter_map(|prefix| {
-            prefix
-                .strip_prefix("cells/")
-                .and_then(|cell| cell.strip_suffix('/'))
-        })
+    // object_store exposes no server-side cursor, so paging is client-side
+    // over the full delimiter listing (bounded by the fleet's cell count).
+    let mut cells = bucket
+        .common_prefixes("cells/")
+        .await?
+        .into_iter()
+        .filter_map(|prefix| prefix.strip_prefix("cells/").map(str::to_string))
         .filter(|cell| valid_explorer_cell_id(cell))
-        .map(str::to_string)
         .collect::<Vec<_>>();
+    cells.sort();
+    if let Some(cursor) = cursor {
+        cells.retain(|cell| cell.as_str() > cursor);
+    }
+    let mut next_cursor = None;
+    if cells.len() > MAX_EXPLORER_CELL_PAGE {
+        cells.truncate(MAX_EXPLORER_CELL_PAGE);
+        next_cursor = cells.last().cloned();
+    }
     Ok(serde_json::json!({
         "cells": cells,
-        "next_cursor": page.next_continuation_token(),
+        "next_cursor": next_cursor,
     }))
 }
 
@@ -1463,9 +1452,8 @@ fn presence_request(
     advertise: &str,
     listen: &str,
     hostname: &str,
-) -> anyhow::Result<tokio_tungstenite::tungstenite::http::Request<()>> {
-    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-    use tokio_tungstenite::tungstenite::http::header::{HeaderName, HeaderValue, AUTHORIZATION};
+) -> anyhow::Result<(String, HeaderMap)> {
+    use hyper::header::{HeaderName, HeaderValue, AUTHORIZATION};
 
     let token = config
         .installation_token
@@ -1479,35 +1467,35 @@ fn presence_request(
         .append_pair("node_session_id", node_session_id)
         .append_pair("advertise", advertise)
         .append_pair("listen", listen);
-    let mut request = url.as_str().into_client_request()?;
-    request.headers_mut().insert(
+    let mut headers = HeaderMap::new();
+    headers.insert(
         AUTHORIZATION,
         HeaderValue::from_str(&format!("Bearer {token}"))?,
     );
-    request.headers_mut().insert(
+    headers.insert(
         HeaderName::from_static("x-cells-version"),
         HeaderValue::from_static(env!("CARGO_PKG_VERSION")),
     );
-    request.headers_mut().insert(
+    headers.insert(
         HeaderName::from_static("x-cells-capabilities"),
         HeaderValue::from_static("assets-v1,sqlite-explorer-v1,sqlite-explorer-v2"),
     );
-    request.headers_mut().insert(
+    headers.insert(
         HeaderName::from_static("x-cells-hostname"),
         HeaderValue::from_str(hostname)?,
     );
-    request.headers_mut().insert(
+    headers.insert(
         HeaderName::from_static("x-cells-os"),
         HeaderValue::from_static(std::env::consts::OS),
     );
-    request.headers_mut().insert(
+    headers.insert(
         HeaderName::from_static("x-cells-arch"),
         HeaderValue::from_static(std::env::consts::ARCH),
     );
-    Ok(request)
+    Ok((url.into(), headers))
 }
 
-pub fn start_deploy_agent(s3: S3Client, bucket: String, runtime_ready: Arc<AtomicBool>) -> bool {
+pub fn start_deploy_agent(bucket: Bucket, runtime_ready: Arc<AtomicBool>) -> bool {
     let config = match connected_config() {
         Ok(Some(config)) => config,
         Ok(None) => return false,
@@ -1530,7 +1518,7 @@ pub fn start_deploy_agent(s3: S3Client, bucket: String, runtime_ready: Arc<Atomi
         let mut consecutive_failures = 0_u32;
         loop {
             let mut delay = Duration::from_secs(60);
-            match poll_and_apply(&client, &config, &s3, &bucket).await {
+            match poll_and_apply(&client, &config, &bucket).await {
                 Ok(Some(applied)) => {
                     if consecutive_failures > 0 {
                         info!(
@@ -1584,7 +1572,7 @@ pub fn start_deploy_agent(s3: S3Client, bucket: String, runtime_ready: Arc<Atomi
     true
 }
 
-pub async fn wait_for_initial_deployment(s3: &S3Client, bucket: &str) -> anyhow::Result<()> {
+pub async fn wait_for_initial_deployment(bucket: &Bucket) -> anyhow::Result<()> {
     let config = connected_config()?.context("managed installation is not connected")?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -1595,31 +1583,24 @@ pub async fn wait_for_initial_deployment(s3: &S3Client, bucket: &str) -> anyhow:
         config.control_url.trim_end_matches('/')
     );
     loop {
-        if deployment_exists(s3, bucket).await? {
+        if deployment_exists(bucket).await? {
             return Ok(());
         }
-        if poll_and_apply(&client, &config, s3, bucket)
-            .await?
-            .is_some()
-        {
+        if poll_and_apply(&client, &config, bucket).await?.is_some() {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
 
-async fn deployment_exists(s3: &S3Client, bucket: &str) -> anyhow::Result<bool> {
-    let response = s3
-        .list_objects_v2()
-        .bucket(bucket)
-        .prefix("deploy/")
-        .send()
+async fn deployment_exists(bucket: &Bucket) -> anyhow::Result<bool> {
+    let objects = bucket
+        .list("deploy/")
         .await
         .context("discover managed deployment")?;
-    Ok(response
-        .contents()
+    Ok(objects
         .iter()
-        .filter_map(|object| object.key())
+        .map(|object| object.location.as_ref())
         .any(|key| {
             key == "deploy/current.json"
                 || key
@@ -1655,8 +1636,7 @@ fn connected_config() -> anyhow::Result<Option<CloudConfig>> {
 async fn poll_and_apply(
     client: &reqwest::Client,
     config: &CloudConfig,
-    s3: &S3Client,
-    bucket: &str,
+    bucket: &Bucket,
 ) -> anyhow::Result<Option<AppliedDeployment>> {
     let token = config
         .installation_token
@@ -1690,7 +1670,7 @@ async fn poll_and_apply(
         ));
     }
 
-    let result = apply_deployment(client, token, s3, bucket, &command.deployment).await;
+    let result = apply_deployment(client, token, bucket, &command.deployment).await;
     let failure = result.as_ref().err().map(|error| format!("{error:#}"));
     let completion = client
         .post(format!(
@@ -1720,8 +1700,7 @@ async fn poll_and_apply(
 async fn apply_deployment(
     client: &reqwest::Client,
     token: &str,
-    s3: &S3Client,
-    bucket: &str,
+    bucket: &Bucket,
     deployment: &AgentDeployment,
 ) -> anyhow::Result<()> {
     if deployment.pointer.version != deployment.version
@@ -1794,20 +1773,14 @@ async fn apply_deployment(
         for (sha256, bytes) in &unique {
             let key =
                 asset_blob_key(sha256).ok_or_else(|| anyhow!("invalid asset digest: {sha256}"))?;
-            let existing = s3.head_object().bucket(bucket).key(&key).send().await;
-            if let Ok(existing) = existing {
-                if existing.content_length().unwrap_or(-1) == *bytes as i64
-                    && existing
-                        .metadata()
-                        .and_then(|metadata| metadata.get("sha256"))
-                        == Some(sha256)
-                {
+            if let Ok(Some((size, meta))) = bucket.head_with_meta(&key, "sha256").await {
+                if size == *bytes && meta.as_deref() == Some(sha256.as_str()) {
                     continue;
                 }
                 tracing::warn!(
                     event = "asset_blob_repair_required",
                     %sha256,
-                    "asset blob exists with invalid size or checksum metadata"
+                    "asset blob exists with an invalid size or checksum metadata"
                 );
             }
 
@@ -1835,15 +1808,16 @@ async fn apply_deployment(
             if hash != *sha256 {
                 return Err(anyhow!("asset blob {sha256} checksum mismatch"));
             }
-            put_asset_object(s3, bucket, &key, sha256, body.to_vec()).await?;
+            bucket
+                .put_with_meta(&key, body.to_vec(), &[("sha256", sha256)])
+                .await?;
         }
-        put_bucket_object(
-            s3,
-            bucket,
-            &format!("{}/assets.json", deployment.pointer.prefix),
-            index_bytes.to_vec(),
-        )
-        .await?;
+        bucket
+            .put(
+                &format!("{}/assets.json", deployment.pointer.prefix),
+                index_bytes.to_vec(),
+            )
+            .await?;
         asset_files = assets.file_count;
         asset_bytes = assets.total_bytes;
         asset_blobs = unique.len();
@@ -1882,38 +1856,34 @@ async fn apply_deployment(
         if hash != module.sha256 {
             return Err(anyhow!("module {} checksum mismatch", module.name));
         }
-        put_bucket_object(
-            s3,
-            bucket,
-            &format!("{}/{}", deployment.pointer.prefix, module.name),
-            bytes.to_vec(),
+        bucket
+            .put(
+                &format!("{}/{}", deployment.pointer.prefix, module.name),
+                bytes.to_vec(),
+            )
+            .await?;
+    }
+    bucket
+        .put(
+            &format!("{}/manifest.json", deployment.pointer.prefix),
+            serde_json::to_vec_pretty(&deployment.manifest)?,
         )
         .await?;
-    }
-    put_bucket_object(
-        s3,
-        bucket,
-        &format!("{}/manifest.json", deployment.pointer.prefix),
-        serde_json::to_vec_pretty(&deployment.manifest)?,
-    )
-    .await?;
-    put_bucket_object(
-        s3,
-        bucket,
-        &format!("deploy/{}/current.json", deployment.script_name),
-        serde_json::to_vec_pretty(&deployment.pointer)?,
-    )
-    .await?;
+    bucket
+        .put(
+            &format!("deploy/{}/current.json", deployment.script_name),
+            serde_json::to_vec_pretty(&deployment.pointer)?,
+        )
+        .await?;
     // This fleet-wide pointer is the sole application selector. The named
     // pointer above remains only for resolving service-binding components and
     // for migrating buckets written by older celld releases.
-    put_bucket_object(
-        s3,
-        bucket,
-        "deploy/current.json",
-        serde_json::to_vec_pretty(&deployment.pointer)?,
-    )
-    .await?;
+    bucket
+        .put(
+            "deploy/current.json",
+            serde_json::to_vec_pretty(&deployment.pointer)?,
+        )
+        .await?;
     info!(
         event = "control_plane_deployment_applied",
         script_name = %deployment.script_name,
@@ -1922,7 +1892,7 @@ async fn apply_deployment(
         asset_files,
         asset_bytes,
         asset_blobs,
-        bucket,
+        bucket = %bucket.name,
         "deployment artifacts written to fleet bucket"
     );
     Ok(())
@@ -2177,40 +2147,6 @@ fn validate_asset_index_entry(path: &str, sha256: &str, bytes: u64) -> anyhow::R
     if bytes > 25 * 1024 * 1024 {
         return Err(anyhow!("asset exceeds runtime size limit: {path:?}"));
     }
-    Ok(())
-}
-
-async fn put_asset_object(
-    s3: &S3Client,
-    bucket: &str,
-    key: &str,
-    sha256: &str,
-    body: Vec<u8>,
-) -> anyhow::Result<()> {
-    s3.put_object()
-        .bucket(bucket)
-        .key(key)
-        .metadata("sha256", sha256)
-        .body(ByteStream::from(body))
-        .send()
-        .await
-        .with_context(|| format!("write s3://{bucket}/{key}"))?;
-    Ok(())
-}
-
-async fn put_bucket_object(
-    s3: &S3Client,
-    bucket: &str,
-    key: &str,
-    body: Vec<u8>,
-) -> anyhow::Result<()> {
-    s3.put_object()
-        .bucket(bucket)
-        .key(key)
-        .body(ByteStream::from(body))
-        .send()
-        .await
-        .with_context(|| format!("write s3://{bucket}/{key}"))?;
     Ok(())
 }
 

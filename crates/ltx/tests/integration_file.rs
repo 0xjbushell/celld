@@ -16,12 +16,12 @@
 //! anchor for the reader, prefiguring G3/D2) — skipped only if the binary or
 //! `sqlite3` is absent from PATH.
 
-use rusqlite::Connection;
 use celld_ltx::client::file::FileReplicaClient;
 use celld_ltx::client::ReplicaClient;
 use celld_ltx::db::Db;
 use celld_ltx::replica::{self, Replica};
 use celld_ltx::TXID;
+use rusqlite::Connection;
 use std::path::Path;
 use std::process::Command;
 
@@ -50,7 +50,6 @@ fn db_equal(mode: &str, a: &Path, b: &Path) -> Result<(), String> {
         ))
     }
 }
-
 
 /// The real binary under test: `$LITESTREAM_BIN`, or `litestream` on PATH.
 /// The oracle is pinned to the v0.5 replica format (v0.5.11); a v0.3-era

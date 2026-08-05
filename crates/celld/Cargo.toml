@@ -1,13 +1,10 @@
 [package]
 name = "celld"
-version = "0.0.2"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.94.1"
-license = "MIT"
+license = "Apache-2.0"
 
-[package.metadata.release]
-litestream-version = "v0.5.15"
-litestream-commit = "5a2624418478f358cf85ed7d4606eb55029194ec"
 
 [lib]
 path = "lib.rs"
@@ -21,51 +18,48 @@ level = "warn"
 check-cfg = ["cfg(celld_internal_tests)", "cfg(celld_proxy_internals)"]
 
 [dependencies]
-aes-gcm = "0.10"
-anyhow = "1"
-aws-config = { version = "1", features = ["behavior-version-latest"] }
-aws-credential-types = "1"
-aws-sdk-s3 = "1"
-aws-smithy-http-client = "1"
-axum = { version = "0.7", features = ["multipart"] }
-base64 = "0.22"
-celld-logic = { path = "../logic" }
-celld-ltx = { path = "../ltx", features = ["s3"] }
-deno_core_icudata = "0.77"
-encoding_rs = "0.8"
-ed25519-dalek = { version = "2", features = ["pkcs8"] }
-fastwebsockets = { version = "0.8", default-features = false, features = ["upgrade", "with_axum"] }
-filetime = "0.2"
-flate2 = "1"
-fs2 = "0.4"
-futures-util = "0.3"
-getrandom = "0.3"
-hmac = "0.12"
-http-body-util = "0.1"
-hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
-md-5 = "0.10"
-percent-encoding = "2"
-p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
-rand = "0.8"
-regex = "1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
-rusqlite = { version = "0.31", features = ["backup", "bundled", "hooks"] }
-rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
-rsa = { version = "0.9", features = ["sha2"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha1 = "0.10"
-sha2 = "0.10"
-tokio = { version = "1", features = ["full"] }
-tokio-stream = "0.1"
-tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
-tokio-util = { version = "0.7", features = ["io", "time"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-url = "2"
-urlpattern = "=0.4.2"
-v8 = "152"
+aes-gcm.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+base64.workspace = true
+bytes.workspace = true
+celld-logic.workspace = true
+celld-ltx = { workspace = true, features = ["s3"] }
+encoding_rs.workspace = true
+ed25519-dalek.workspace = true
+fastwebsockets.workspace = true
+flate2.workspace = true
+fs2.workspace = true
+futures-util.workspace = true
+getrandom.workspace = true
+hmac.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+md-5.workspace = true
+object_store = { workspace = true, features = ["aws"] }
+percent-encoding.workspace = true
+p256.workspace = true
+rand.workspace = true
+regex.workspace = true
+reqwest = { workspace = true, features = ["rustls-tls", "stream", "json"] }
+rusqlite = { workspace = true, features = ["backup", "bundled", "hooks"] }
+rustls.workspace = true
+rsa.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["full"] }
+tokio-rustls.workspace = true
+tokio-stream.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+urlpattern.workspace = true
+v8.workspace = true
+webpki-roots.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc.workspace = true

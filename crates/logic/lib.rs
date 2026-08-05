@@ -1,3 +1,5 @@
+// Copyright 2026 Deno Land Inc. Apache-2.0 license.
+
 //! Clean-sheet celld decision core.
 //!
 //! [`on_event`] is the only way behavioral state advances. The production
@@ -1034,6 +1036,10 @@ pub struct State {
     /// last measured rather than aiming at a cell count that means nothing to
     /// it.
     shed_floor: usize,
+    /// RSS measured when the current shed floor was set. A later latched
+    /// sample compares against this: a completed cut that left RSS flat
+    /// makes another cut futile.
+    shed_cut_rss: Option<u64>,
     /// The shedding latch. celld kept this in the executor, which meant the
     /// hysteresis -- the part with actual behaviour -- was the one piece the
     /// simulation could not reach. It is carried here so a sample
@@ -1084,6 +1090,7 @@ impl State {
             now_ms: 0,
             now_mono_ms: 0,
             shed_floor: 0,
+            shed_cut_rss: None,
             shedding: false,
             shed_reason: None,
         }
@@ -1395,13 +1402,13 @@ impl State {
     }
 
     fn has_capacity(&self) -> bool {
-        self.occupied() < self.config.max_resident
-            && pressure::may_admit(
-                self.occupied(),
-                0,
-                self.config.pressure.resident_high,
-                self.shedding,
-            )
+        // Residency is a hard cap, known exactly and counted -- never sampled.
+        // A node at its cell cap is at capacity, not overloaded: it refuses
+        // more and holds what it has, rather than shedding a live cell it must
+        // then place again elsewhere. The only sampled fact that refuses
+        // admission is genuine resource pressure (RSS/CPU), which a cell count
+        // cannot see.
+        self.occupied() < self.config.max_resident && !self.shedding
     }
 
     pub fn is_active(&self, id: &str) -> bool {
@@ -1570,7 +1577,10 @@ impl State {
             self.active_requests.insert(request, route.cell.clone());
             if let Some(cell) = self.cells.get_mut(&route.cell) {
                 if matches!(cell.phase, Phase::EnsuringDurability { .. }) {
+                    // Same rescue as `request_authorized`: the permit taken
+                    // at nomination comes back with the cell.
                     cell.phase = Phase::Resident { epoch: route.epoch };
+                    self.hibernation_permits.remove(&route.cell);
                 }
                 cell.last_used_mono_ms = self.now_mono_ms;
             }
@@ -2059,6 +2069,7 @@ impl State {
             });
         }
     }
+
 
     /// An activation effect outlived its deadline.
     ///
@@ -2562,9 +2573,13 @@ impl State {
             Phase::EnsuringDurability { epoch, .. } => {
                 // The runtime is still published, so a new request wins the
                 // race with voluntary eviction. Retiring the operation makes
-                // its eventual durability completion harmless.
+                // its eventual durability completion harmless. The permit
+                // taken at nomination comes back with the rescue: leaked, it
+                // counts against `max_hibernations` forever and eventually
+                // stands every future eviction down.
                 let epoch = *epoch;
                 cell.phase = Phase::Resident { epoch };
+                self.hibernation_permits.remove(&id);
                 self.complete_request(&id, request, Ok(Route::Local), effects);
             }
             Phase::Remote {
@@ -2730,12 +2745,7 @@ impl State {
         for request in handoffs {
             cell.requests.remove(&request);
             self.request_cells.remove(&request);
-            self.complete_request(
-                id,
-                request,
-                Err(RequestError::CapacityExhausted),
-                effects,
-            );
+            self.complete_request(id, request, Err(RequestError::CapacityExhausted), effects);
         }
 
         if cell.requests.is_empty() || !self.config.require_node_lease {
@@ -3466,8 +3476,14 @@ impl State {
         // that cannot be admitted has no stopping condition, and every
         // completed eviction re-enters here through `pump_capacity` and starts
         // another. That empties the node.
+        //
+        // Count the evictions already in flight against the waiters: this is
+        // reachable from every activity finish and websocket close, and a
+        // waiter whose eviction is already under way must not turn each of
+        // those triggers into another victim. Spend the cut on commit, never
+        // on nomination.
         if self.shedding
-            || self.capacity_waiters.is_empty()
+            || self.capacity_waiters.len() <= self.hibernation_permits.len()
             || self.hibernation_permits.len() >= self.config.max_hibernations
         {
             return;
@@ -3548,21 +3564,35 @@ impl State {
             .or(state.trigger);
         if !state.shedding {
             // Relieved. Whatever was queued for capacity may proceed.
+            self.shed_cut_rss = None;
             self.pump_capacity(effects);
             self.evict_idle(now_mono_ms, effects);
             return;
         }
-        // How far this sample asks the node to come down. A residency trigger
-        // aims at the low watermark; a resource trigger takes a proportion of
-        // what was just measured, because the effect of an eviction on RSS or
-        // CPU is not visible until the next sample.
-        let Some(reason) = self.shed_reason else {
-            return;
-        };
-        self.shed_floor = self
-            .config
-            .pressure
-            .release_target(load.resident_cells, reason);
+        // Evicting only helps if it returns memory. When the last cut has
+        // fully landed and this sample's RSS sits within 5% of what that cut
+        // measured, another cut is futile: the latch holds -- the node
+        // genuinely is over its ceiling, so admission stays closed -- but the
+        // walk down stops spending the working set. Without this stopping
+        // condition an unsatisfiable ceiling (one below the process's memory
+        // floor) evicts a proportion of whatever remains on every sample and
+        // walks the node to zero -- a latched walk down with no stopping
+        // condition, the same shape as demand shedding for a waiter that can
+        // never be admitted. A
+        // sample that moves either way re-arms the walk down.
+        if let Some(cut_rss) = self.shed_cut_rss {
+            let cut_landed =
+                self.occupied() <= self.shed_floor && self.hibernation_permits.is_empty();
+            let flat = load.rss_bytes.abs_diff(cut_rss) <= cut_rss / 20;
+            if cut_landed && flat {
+                return;
+            }
+        }
+        // How far this resource sample asks the node to come down: a proportion
+        // of what was just measured, because the effect of an eviction on RSS
+        // or CPU is not visible until the next sample.
+        self.shed_floor = self.config.pressure.release_target(load.resident_cells);
+        self.shed_cut_rss = Some(load.rss_bytes);
         self.shed_toward_floor(effects);
     }
 
@@ -3608,7 +3638,11 @@ impl State {
         // A write still on the output gate keeps its request pinned, so the
         // cell cannot be evicted before the write is proven durable. The unpin
         // moves to whichever path drains the last gate for this request.
-        if self.gated_writes.values().any(|gate| gate.request == request) {
+        if self
+            .gated_writes
+            .values()
+            .any(|gate| gate.request == request)
+        {
             self.gate_pinned.insert(request);
             return;
         }
@@ -3737,7 +3771,7 @@ impl State {
                 || (!already_pinned
                     && !pressure::may_pin_outbound(
                         self.outbound_pinned(),
-                        self.config.pressure.resident_high,
+                        Some(self.config.max_resident),
                     )))
         {
             effects.push(Effect::CloseWebSocket {

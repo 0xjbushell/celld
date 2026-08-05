@@ -1,3 +1,5 @@
+// Copyright 2026 Deno Land Inc. Apache-2.0 license.
+
 //! Alarm-wake entry reconciliation, sans-IO — plus the wake key scheme.
 //!
 //! `WakeCore`'s `decide` is a pure transition; [`Reconcile`] holds the
@@ -225,9 +227,9 @@ impl WakeCore {
     /// Is this exact committed alarm durably covered by a proven entry? The
     /// fail-closed gate: eviction of an alarm-bearing cell requires it.
     pub fn covered(&self, cell: &str, next_alarm_ms: Ms) -> bool {
-        self.flushed.get(cell).is_some_and(|e| {
-            e.verified && !e.deleting && e.key == entry_key(next_alarm_ms, cell)
-        })
+        self.flushed
+            .get(cell)
+            .is_some_and(|e| e.verified && !e.deleting && e.key == entry_key(next_alarm_ms, cell))
     }
 
     /// Is a consume-delete for this cell's tracked entry on the wire? Any
@@ -312,8 +314,14 @@ impl WakeCore {
 /// here, rather than formatted independently by every executor.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Step {
-    Put { key: String, due_ms: Ms, body: String },
-    Delete { key: String },
+    Put {
+        key: String,
+        due_ms: Ms,
+        body: String,
+    },
+    Delete {
+        key: String,
+    },
 }
 
 /// A reconcile in progress: the ordering rules, without the I/O.

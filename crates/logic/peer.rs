@@ -1,3 +1,5 @@
+// Copyright 2026 Deno Land Inc. Apache-2.0 license.
+
 //! Peer-authentication predicates, reified sans-IO. The signed-request checks in
 //! `peer_auth::verify` — a well-formed identity, a timestamp within the clock
 //! window, and replay-cache retention — are pure predicates over scalars, and

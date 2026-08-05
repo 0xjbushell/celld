@@ -22,11 +22,11 @@
 //! The whole suite self-skips (never fails) if `sqlite3` is not on PATH, since
 //! the oracle requires it.
 
-use proptest::prelude::*;
-use rusqlite::Connection;
 use celld_ltx::client::file::FileReplicaClient;
 use celld_ltx::db::{CheckpointMode, Db};
 use celld_ltx::replica::Replica;
+use proptest::prelude::*;
+use rusqlite::Connection;
 use std::path::Path;
 use std::process::Command;
 

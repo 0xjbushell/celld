@@ -1,21 +1,23 @@
+// Copyright 2026 Deno Land Inc. Apache-2.0 license.
+
 //! Compatibility garbage collection for dead celld process generations.
 //!
 //! Wake entries and lazy ownership takeover provide serving correctness.
 //! This adapter retires the historical `node-cells/` index debris and expired
 //! node-session records left in fleet buckets shared with celld.
 
+use crate::bucket::Bucket;
 use anyhow::Context as _;
-use aws_sdk_s3::error::SdkError;
-use aws_sdk_s3::Client;
 use futures_util::stream::{self, StreamExt as _};
 use serde::Deserialize;
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 const MARKER_GC_CONCURRENCY: usize = 64;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct NodeWire {
     node: String,
     expires_ms: u64,
@@ -56,16 +58,9 @@ impl DeadNodeGc {
     /// Run one pass while renewing the advisory fleet-waker role. No task is
     /// spawned: the caller's existing wake-loop future polls both work and
     /// renewal, and dropping a lost-role pass cancels remaining I/O.
-    pub async fn run_elected_pass(
-        &mut self,
-        client: &Client,
-        bucket: &str,
-        node: &str,
-        tick_ms: u64,
-    ) {
+    pub async fn run_elected_pass(&mut self, bucket: &Bucket, node: &str, tick_ms: u64) {
         let lease_ttl_ms = tick_ms.saturating_mul(3).min(i64::MAX as u64);
         if !crate::wake::try_hold_waker(
-            client,
             bucket,
             node,
             crate::ownership_store::now_ms() as i64,
@@ -80,14 +75,13 @@ impl DeadNodeGc {
         let mut renewal = tokio::time::interval(Duration::from_millis(renew_ms));
         renewal.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         renewal.tick().await;
-        let pass = self.run_pass(client, bucket, tick_ms);
+        let pass = self.run_pass(bucket, tick_ms);
         tokio::pin!(pass);
         loop {
             tokio::select! {
                 _ = &mut pass => return,
                 _ = renewal.tick() => {
                     if !crate::wake::try_hold_waker(
-                        client,
                         bucket,
                         node,
                         crate::ownership_store::now_ms() as i64,
@@ -101,9 +95,9 @@ impl DeadNodeGc {
         }
     }
 
-    async fn run_pass(&mut self, client: &Client, bucket: &str, tick_ms: u64) {
+    async fn run_pass(&mut self, bucket: &Bucket, tick_ms: u64) {
         let observed_ms = crate::ownership_store::now_ms();
-        let dead = dead_nodes(client, bucket, observed_ms).await;
+        let dead = dead_nodes(bucket, observed_ms).await;
         let dead_names: HashSet<&str> = dead.iter().map(|record| record.node.as_str()).collect();
         self.swept.retain(|node| dead_names.contains(node.as_str()));
         self.retries
@@ -128,7 +122,7 @@ impl DeadNodeGc {
         let indexed = if indexed.is_empty() {
             Some(HashMap::new())
         } else {
-            match cells_indexed_by_nodes(client, bucket, &indexed).await {
+            match cells_indexed_by_nodes(bucket, &indexed).await {
                 Ok(indexed) => Some(indexed),
                 Err(error) => {
                     warn!(%error, nodes = indexed.len(), "dead-node marker scan failed");
@@ -137,7 +131,7 @@ impl DeadNodeGc {
             }
         };
         let mut summaries = match indexed {
-            Some(indexed) => gc_markers(client, bucket, indexed).await,
+            Some(indexed) => gc_markers(bucket, indexed).await,
             None => HashMap::new(),
         };
 
@@ -190,7 +184,7 @@ impl DeadNodeGc {
                 self.retries.remove(&node);
                 self.swept.insert(node.clone());
             }
-            match retire_dead_node(client, bucket, &node, observed_ms).await {
+            match retire_dead_node(bucket, &node, observed_ms).await {
                 Ok(_) => {
                     self.swept.remove(&node);
                 }
@@ -200,58 +194,46 @@ impl DeadNodeGc {
     }
 }
 
-async fn dead_nodes(client: &Client, bucket: &str, now_ms: u64) -> Vec<DeadNode> {
+async fn dead_nodes(bucket: &Bucket, now_ms: u64) -> Vec<DeadNode> {
     let mut dead = Vec::new();
-    let mut token = None;
-    loop {
-        let mut request = client.list_objects_v2().bucket(bucket).prefix("nodes/");
-        if let Some(token) = &token {
-            request = request.continuation_token(token);
+    let objects = match bucket.list("nodes/").await {
+        Ok(objects) => objects,
+        Err(error) => {
+            warn!(%error, "dead-node scan list failed");
+            return dead;
         }
-        let page = match request.send().await {
-            Ok(page) => page,
-            Err(error) => {
-                warn!(%error, "dead-node scan list failed");
-                break;
-            }
+    };
+    for object in objects {
+        let key = object.location.as_ref();
+        let Some(node) = key
+            .strip_prefix("nodes/")
+            .and_then(|value| value.strip_suffix(".json"))
+        else {
+            continue;
         };
-        for object in page.contents() {
-            let Some(key) = object.key() else { continue };
-            let Some(node) = key
-                .strip_prefix("nodes/")
-                .and_then(|value| value.strip_suffix(".json"))
-            else {
-                continue;
-            };
-            match read_node(client, bucket, key).await {
-                Ok(Some((record, _)))
-                    if celld_logic::dead_node_reconciliation::node_record_is_dead(
-                        node,
-                        &record.node,
-                        record.expires_ms,
-                        now_ms,
-                    ) =>
-                {
-                    dead.push(DeadNode {
-                        node: node.to_string(),
-                        generation: record.generation,
-                    });
-                }
-                Ok(_) => {}
-                Err(error) => warn!(%node, %error, "dead-node scan read failed"),
+        match read_node(bucket, key).await {
+            Ok(Some((record, _)))
+                if celld_logic::dead_node_reconciliation::node_record_is_dead(
+                    node,
+                    &record.node,
+                    record.expires_ms,
+                    now_ms,
+                ) =>
+            {
+                dead.push(DeadNode {
+                    node: node.to_string(),
+                    generation: record.generation,
+                });
             }
-        }
-        match page.next_continuation_token() {
-            Some(next) => token = Some(next.to_string()),
-            None => break,
+            Ok(_) => {}
+            Err(error) => warn!(%node, %error, "dead-node scan read failed"),
         }
     }
     dead
 }
 
 async fn cells_indexed_by_nodes(
-    client: &Client,
-    bucket: &str,
+    bucket: &Bucket,
     nodes: &HashMap<String, String>,
 ) -> anyhow::Result<HashMap<String, IndexedOwnership>> {
     let mut indexed: HashMap<String, IndexedOwnership> = nodes
@@ -259,37 +241,20 @@ async fn cells_indexed_by_nodes(
         .cloned()
         .map(|node| (node, IndexedOwnership::default()))
         .collect();
-    let mut token = None;
-    loop {
-        let mut request = client
-            .list_objects_v2()
-            .bucket(bucket)
-            .prefix("node-cells/");
-        if let Some(token) = &token {
-            request = request.continuation_token(token);
-        }
-        let page = request.send().await?;
-        for object in page.contents() {
-            let Some(key) = object.key() else { continue };
-            let Some((node, _)) = celld_logic::dead_node_reconciliation::parse_marker_key(key)
-            else {
-                continue;
-            };
-            if let Some(entry) = indexed.get_mut(node) {
-                entry.markers.push(key.to_string());
-            }
-        }
-        match page.next_continuation_token() {
-            Some(next) => token = Some(next.to_string()),
-            None => break,
+    for object in bucket.list("node-cells/").await? {
+        let key = object.location.as_ref();
+        let Some((node, _)) = celld_logic::dead_node_reconciliation::parse_marker_key(key) else {
+            continue;
+        };
+        if let Some(entry) = indexed.get_mut(node) {
+            entry.markers.push(key.to_string());
         }
     }
     Ok(indexed)
 }
 
 async fn gc_markers(
-    client: &Client,
-    bucket: &str,
+    bucket: &Bucket,
     indexed: HashMap<String, IndexedOwnership>,
 ) -> HashMap<String, MarkerGcSummary> {
     let mut summaries = HashMap::new();
@@ -307,12 +272,7 @@ async fn gc_markers(
     }
     let mut results = stream::iter(work)
         .map(|(node, marker)| async move {
-            let result = client
-                .delete_object()
-                .bucket(bucket)
-                .key(marker)
-                .send()
-                .await;
+            let result = bucket.delete(&marker).await;
             (node, result)
         })
         .buffer_unordered(MARKER_GC_CONCURRENCY);
@@ -331,14 +291,9 @@ async fn gc_markers(
     summaries
 }
 
-async fn retire_dead_node(
-    client: &Client,
-    bucket: &str,
-    node: &str,
-    now_ms: u64,
-) -> anyhow::Result<bool> {
+async fn retire_dead_node(bucket: &Bucket, node: &str, now_ms: u64) -> anyhow::Result<bool> {
     let key = format!("nodes/{node}.json");
-    let Some((record, etag)) = read_node(client, bucket, &key).await? else {
+    let Some((record, etag)) = read_node(bucket, &key).await? else {
         return Ok(true);
     };
     if !celld_logic::dead_node_reconciliation::node_record_is_dead(
@@ -349,39 +304,28 @@ async fn retire_dead_node(
     ) {
         return Ok(false);
     }
-    match client
-        .delete_object()
-        .bucket(bucket)
-        .key(key)
-        .if_match(etag)
-        .send()
-        .await
-    {
-        Ok(_) => Ok(true),
-        Err(SdkError::ServiceError(error)) if error.raw().status().as_u16() == 412 => Ok(false),
-        Err(error) => Err(error.into()),
+    // No conditional delete in object_store: fence with a CAS tombstone
+    // (`expires_ms: 0`, still a dead record), then delete. A crash between
+    // the two leaves a record that still reads as dead and retires on the
+    // next pass.
+    let tombstone = serde_json::to_vec(&NodeWire {
+        expires_ms: 0,
+        ..record
+    })?;
+    match bucket.put_cas(&key, tombstone, Some(&etag)).await? {
+        Some(_) => {
+            bucket.delete(&key).await?;
+            Ok(true)
+        }
+        None => Ok(false),
     }
 }
 
-async fn read_node(
-    client: &Client,
-    bucket: &str,
-    key: &str,
-) -> anyhow::Result<Option<(NodeWire, String)>> {
-    match client.get_object().bucket(bucket).key(key).send().await {
-        Ok(output) => {
-            let etag = output.e_tag().unwrap_or_default().to_string();
-            let bytes = output
-                .body
-                .collect()
-                .await
-                .with_context(|| format!("read body s3://{bucket}/{key}"))?
-                .into_bytes();
-            let record = serde_json::from_slice(&bytes)
-                .with_context(|| format!("decode s3://{bucket}/{key}"))?;
-            Ok(Some((record, etag)))
-        }
-        Err(SdkError::ServiceError(error)) if error.err().is_no_such_key() => Ok(None),
-        Err(error) => Err(error.into()),
-    }
+async fn read_node(bucket: &Bucket, key: &str) -> anyhow::Result<Option<(NodeWire, String)>> {
+    let Some((bytes, etag)) = bucket.get(key).await? else {
+        return Ok(None);
+    };
+    let record = serde_json::from_slice(&bytes)
+        .with_context(|| format!("decode s3://{}/{key}", bucket.name))?;
+    Ok(Some((record, etag)))
 }

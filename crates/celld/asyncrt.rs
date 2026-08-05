@@ -1,3 +1,5 @@
+// Copyright 2026 Deno Land Inc. Apache-2.0 license.
+
 //! Host async runtime for the JS thread, using structured concurrency. Ops
 //! never spawn detached: they ENQUEUE a future, and `js::run_loop` owns a
 //! per-request tokio `JoinSet` (the "region") that spawns, drives, and — on

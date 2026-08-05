@@ -1,106 +1,82 @@
+// Copyright 2026 Deno Land Inc. Apache-2.0 license.
+
 //! Production bucket deployment adapters reused by the clean-sheet host.
 
+use crate::bucket::Bucket;
 use crate::deploy;
 use crate::js::WorkerConfigOptions;
 use crate::protocol::{DeployPointer, Manifest};
 use anyhow::{bail, Context};
-use aws_sdk_s3::error::SdkError;
-use aws_sdk_s3::Client;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::time::Duration;
 use tracing::info;
 
-pub async fn s3_client(endpoint: Option<&str>, region: &str) -> Client {
-    s3_client_with_credentials(endpoint, region, None).await
+pub fn s3_client(bucket: &str, endpoint: Option<&str>, region: &str) -> anyhow::Result<Bucket> {
+    s3_client_with_credentials(bucket, endpoint, region, None)
 }
 
 /// Build the authority-heartbeat client on its own HTTP connection pool.
 ///
 /// Node lease traffic must not queue behind ordinary ownership, deployment,
-/// or replica requests. The distinct application name also makes the safety
-/// lane observable in black-box storage traces.
-pub async fn s3_lease_client_with_credentials(
+/// or replica requests. Every `Bucket::open` builds its own transport, so a
+/// dedicated instance keeps the safety lane isolated, and the `celld-lease`
+/// app tag labels it in black-box storage traces.
+pub fn s3_lease_client_with_credentials(
+    bucket: &str,
     endpoint: Option<&str>,
     region: &str,
     managed: Option<&crate::control_plane::ManagedStorageConfig>,
-) -> Client {
-    s3_client_with_transport(endpoint, region, managed, true).await
+) -> anyhow::Result<Bucket> {
+    open(bucket, endpoint, region, managed, Some("celld-lease"))
 }
 
-pub async fn s3_client_with_credentials(
+pub fn s3_client_with_credentials(
+    bucket: &str,
     endpoint: Option<&str>,
     region: &str,
     managed: Option<&crate::control_plane::ManagedStorageConfig>,
-) -> Client {
-    s3_client_with_transport(endpoint, region, managed, false).await
+) -> anyhow::Result<Bucket> {
+    open(bucket, endpoint, region, managed, None)
 }
 
-async fn s3_client_with_transport(
+fn open(
+    bucket: &str,
     endpoint: Option<&str>,
     region: &str,
     managed: Option<&crate::control_plane::ManagedStorageConfig>,
-    isolated_transport: bool,
-) -> Client {
-    let timeouts = aws_config::timeout::TimeoutConfig::builder()
-        .connect_timeout(Duration::from_secs(3))
-        .read_timeout(Duration::from_secs(10))
-        .operation_attempt_timeout(Duration::from_secs(15))
-        .operation_timeout(Duration::from_secs(30))
-        .build();
-    let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
-        .timeout_config(timeouts)
-        .region(aws_config::Region::new(region.to_string()));
-    if isolated_transport {
-        let http_client = aws_smithy_http_client::Builder::new()
-            .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
-                aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
-            ))
-            .build_https();
-        loader = loader
-            .http_client(http_client)
-            .app_name(aws_config::AppName::new("celld-lease").expect("valid lease app name"));
-    }
-    if let Some(endpoint) = endpoint {
-        loader = loader.endpoint_url(endpoint);
-    }
-    if let Some(managed) = managed {
-        loader = loader.credentials_provider(aws_credential_types::Credentials::new(
-            managed.access_key_id.clone(),
-            managed.secret_access_key.clone(),
-            managed.session_token.clone(),
-            None,
-            "managed-installation",
-        ));
-    }
-    let shared = loader.load().await;
-    let config = aws_sdk_s3::config::Builder::from(&shared)
-        .force_path_style(endpoint.is_some())
-        .build();
-    Client::from_conf(config)
+    app: Option<&str>,
+) -> anyhow::Result<Bucket> {
+    let credentials = managed.map(|managed| crate::bucket::StaticCredentials {
+        access_key_id: managed.access_key_id.clone(),
+        secret_access_key: managed.secret_access_key.clone(),
+        session_token: managed.session_token.clone(),
+    });
+    Bucket::open(bucket, endpoint, region, credentials, app)
 }
 
-pub async fn validate_bucket(client: &Client, bucket: &str) -> anyhow::Result<()> {
-    client
-        .head_bucket()
-        .bucket(bucket)
-        .send()
+pub async fn validate_bucket(bucket: &Bucket) -> anyhow::Result<()> {
+    bucket
+        .validate()
         .await
-        .with_context(|| format!("bucket unavailable or inaccessible: s3://{bucket}"))?;
-    Ok(())
+        .with_context(|| format!("bucket unavailable or inaccessible: s3://{}", bucket.name))
 }
 
 /// Validate storage issued by the Managed Control Plane and preserve the
 /// operator-visible failure vocabulary. Newly issued provider credentials can
 /// take a moment to propagate, so only the final rejection is authoritative.
-pub async fn validate_managed_bucket(client: &Client, bucket: &str) -> anyhow::Result<()> {
+pub async fn validate_managed_bucket(bucket: &Bucket) -> anyhow::Result<()> {
     const RETRIES: u32 = 5;
     for attempt in 1..=RETRIES {
-        match validate_managed_bucket_once(client, bucket, attempt == RETRIES).await {
+        match validate_managed_bucket_once(bucket, attempt == RETRIES).await {
             Ok(()) => return Ok(()),
             Err(error) if attempt == RETRIES => return Err(error),
             Err(_) => {
-                info!(bucket, attempt, "storage credential not accepted yet; retrying");
+                info!(
+                    bucket = %bucket.name,
+                    attempt,
+                    "storage credential not accepted yet; retrying"
+                );
                 tokio::time::sleep(Duration::from_millis(500 * u64::from(attempt))).await;
             }
         }
@@ -108,23 +84,23 @@ pub async fn validate_managed_bucket(client: &Client, bucket: &str) -> anyhow::R
     unreachable!("loop returns on the final attempt")
 }
 
-async fn validate_managed_bucket_once(
-    client: &Client,
-    bucket: &str,
-    report: bool,
-) -> anyhow::Result<()> {
-    match client.head_bucket().bucket(bucket).send().await {
-        Ok(_) => Ok(()),
-        Err(SdkError::ServiceError(error))
-            if matches!(error.raw().status().as_u16(), 401 | 403) =>
-        {
+async fn validate_managed_bucket_once(bucket: &Bucket, report: bool) -> anyhow::Result<()> {
+    match bucket.validate().await {
+        Ok(()) => Ok(()),
+        Err(error) if crate::bucket::is_unauthorized(&error) => {
             if report {
                 crate::control_plane::report_managed_runtime_state(
                     crate::control_plane::ManagedRuntimeState::CredentialRevoked,
                 );
-                bail!("managed storage credential was rejected or revoked for s3://{bucket}");
+                bail!(
+                    "managed storage credential was rejected or revoked for s3://{}",
+                    bucket.name
+                );
             }
-            bail!("managed storage credential was not accepted yet for s3://{bucket}");
+            bail!(
+                "managed storage credential was not accepted yet for s3://{}",
+                bucket.name
+            );
         }
         Err(error) => {
             if report {
@@ -132,7 +108,9 @@ async fn validate_managed_bucket_once(
                     crate::control_plane::ManagedRuntimeState::BucketUnavailable,
                 );
             }
-            Err(error).with_context(|| format!("bucket unavailable or inaccessible: s3://{bucket}"))
+            Err(error).with_context(|| {
+                format!("bucket unavailable or inaccessible: s3://{}", bucket.name)
+            })
         }
     }
 }
@@ -151,17 +129,16 @@ pub(crate) struct DiagnosticNode {
 }
 
 pub async fn diagnose(
-    client: &Client,
-    bucket: &str,
+    bucket: &Bucket,
     peers: Vec<String>,
     unsafe_public_advertise: bool,
 ) -> anyhow::Result<()> {
-    validate_bucket(client, bucket).await?;
-    println!("ok bucket s3://{bucket}");
+    validate_bucket(bucket).await?;
+    println!("ok bucket s3://{}", bucket.name);
 
     let enumerated = peers.is_empty();
     let peers = if enumerated {
-        let peers = diagnostic_node_ids(client, bucket).await?;
+        let peers = diagnostic_node_ids(bucket).await?;
         println!("ok fleet {} node lease(s) enumerated", peers.len());
         peers
     } else {
@@ -177,13 +154,13 @@ pub async fn diagnose(
         .build()
         .context("build peer diagnostic client")?;
     let auth = crate::peer_auth::PeerAuth::new(
-        crate::peer_auth::load_existing(client, bucket).await?,
+        crate::peer_auth::load_existing(bucket).await?,
         "diagnostic",
     )?;
     let mut failures = 0_usize;
     let mut expired = 0_usize;
     for peer in peers {
-        let node = match diagnostic_node(client, bucket, &peer).await {
+        let node = match diagnostic_node(bucket, &peer).await {
             Ok(Some(node)) => node,
             Ok(None) if enumerated => {
                 expired += 1;
@@ -232,6 +209,14 @@ pub async fn diagnose(
                 .saturating_sub(node.load.sampled_ms)
                 .to_string()
         };
+        // A 1-byte RSS is the sentinel a platform without /proc leaves behind,
+        // not a measurement. Report it the way the load age already reports a
+        // missing sample, so no operator reads it as a real number.
+        let rss_bytes = if node.load.rss_bytes <= 1 {
+            "unknown".to_string()
+        } else {
+            node.load.rss_bytes.to_string()
+        };
         println!(
             "ok peer {} at {} (signed direct probe) protocol={} resident_cells={} \
              websockets={} rss_bytes={} cpu_percent={:.2} fds={}/{} pressured={} \
@@ -241,7 +226,7 @@ pub async fn diagnose(
             node.peer_protocol,
             node.load.resident_cells,
             node.load.host_websockets,
-            node.load.rss_bytes,
+            rss_bytes,
             node.load.cpu_percent_x100 as f64 / 100.0,
             node.load.open_fds,
             node.load.fd_limit,
@@ -259,14 +244,10 @@ pub async fn diagnose(
     Ok(())
 }
 
-async fn diagnostic_node(
-    client: &Client,
-    bucket: &str,
-    peer: &str,
-) -> anyhow::Result<Option<DiagnosticNode>> {
+async fn diagnostic_node(bucket: &Bucket, peer: &str) -> anyhow::Result<Option<DiagnosticNode>> {
     let key = format!("nodes/{peer}.json");
-    let node: DiagnosticNode = serde_json::from_str(&get_string(client, bucket, &key).await?)
-        .with_context(|| format!("decode s3://{bucket}/{key}"))?;
+    let node: DiagnosticNode = serde_json::from_str(&get_string(bucket, &key).await?)
+        .with_context(|| format!("decode s3://{}/{key}", bucket.name))?;
     if node.node != peer {
         bail!(
             "node lease {key} identifies unexpected node {:?}",
@@ -282,30 +263,23 @@ async fn diagnostic_node(
     Ok(Some(node))
 }
 
-async fn diagnostic_node_ids(client: &Client, bucket: &str) -> anyhow::Result<Vec<String>> {
+async fn diagnostic_node_ids(bucket: &Bucket) -> anyhow::Result<Vec<String>> {
     let mut nodes = Vec::new();
-    let mut token: Option<String> = None;
-    loop {
-        let mut request = client.list_objects_v2().bucket(bucket).prefix("nodes/");
-        if let Some(token) = &token {
-            request = request.continuation_token(token);
-        }
-        let page = request.send().await.context("enumerate node leases")?;
-        for object in page.contents() {
-            let Some(node) = object
-                .key()
-                .and_then(|key| key.strip_prefix("nodes/"))
-                .and_then(|key| key.strip_suffix(".json"))
-            else {
-                continue;
-            };
-            if !node.is_empty() {
-                nodes.push(node.to_string());
-            }
-        }
-        match page.next_continuation_token() {
-            Some(next) => token = Some(next.to_string()),
-            None => break,
+    for object in bucket
+        .list("nodes/")
+        .await
+        .context("enumerate node leases")?
+    {
+        let Some(node) = object
+            .location
+            .as_ref()
+            .strip_prefix("nodes/")
+            .and_then(|key| key.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        if !node.is_empty() {
+            nodes.push(node.to_string());
         }
     }
     nodes.sort();
@@ -349,10 +323,10 @@ pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
         .or_else(|| env("AWS_REGION"))
         .or_else(|| env("AWS_DEFAULT_REGION"))
         .unwrap_or_else(|| "us-east-1".to_string());
-    let client = s3_client(options.endpoint.as_deref(), &region).await;
-    validate_bucket(&client, &bucket).await?;
+    let store = s3_client(&bucket, options.endpoint.as_deref(), &region)?;
+    validate_bucket(&store).await?;
     let started = std::time::Instant::now();
-    deploy::write(&client, &bucket, &built).await?;
+    deploy::write(&store, &built).await?;
     println!(
         "Uploaded {} ({:.2} sec)",
         built.script_name,
@@ -364,61 +338,42 @@ pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn get_string(client: &Client, bucket: &str, key: &str) -> anyhow::Result<String> {
-    let object = client
-        .get_object()
-        .bucket(bucket)
-        .key(key)
-        .send()
-        .await
-        .with_context(|| format!("read s3://{bucket}/{key}"))?;
-    let bytes = object
-        .body
-        .collect()
-        .await
-        .with_context(|| format!("read body s3://{bucket}/{key}"))?
-        .into_bytes();
+async fn get_string(bucket: &Bucket, key: &str) -> anyhow::Result<String> {
+    let (bytes, _) = bucket
+        .get(key)
+        .await?
+        .with_context(|| format!("read s3://{}/{key}: no such key", bucket.name))?;
     String::from_utf8(bytes.to_vec()).context("deployment module is not UTF-8")
 }
 
 pub async fn load_current_worker(
-    client: &Client,
-    bucket: &str,
+    bucket: &Bucket,
     node: String,
 ) -> anyhow::Result<LoadedDeployment> {
-    load_worker_from_pointer(client, bucket, "deploy/current.json", node).await
+    load_worker_from_pointer(bucket, "deploy/current.json", node).await
 }
 
 pub async fn load_named_worker(
-    client: &Client,
-    bucket: &str,
+    bucket: &Bucket,
     script: &str,
     node: String,
 ) -> anyhow::Result<LoadedDeployment> {
-    load_worker_from_pointer(
-        client,
-        bucket,
-        &format!("deploy/{script}/current.json"),
-        node,
-    )
-    .await
+    load_worker_from_pointer(bucket, &format!("deploy/{script}/current.json"), node).await
 }
 
 async fn load_worker_from_pointer(
-    client: &Client,
-    bucket: &str,
+    bucket: &Bucket,
     pointer_key: &str,
     node: String,
 ) -> anyhow::Result<LoadedDeployment> {
-    let pointer: DeployPointer =
-        serde_json::from_str(&get_string(client, bucket, pointer_key).await?)
-            .with_context(|| format!("decode {pointer_key}"))?;
+    let pointer: DeployPointer = serde_json::from_str(&get_string(bucket, pointer_key).await?)
+        .with_context(|| format!("decode {pointer_key}"))?;
     let manifest: Manifest = serde_json::from_str(
-        &get_string(client, bucket, &format!("{}/manifest.json", pointer.prefix)).await?,
+        &get_string(bucket, &format!("{}/manifest.json", pointer.prefix)).await?,
     )
     .context("decode deployment manifest")?;
     let src = match manifest.main_module.as_deref() {
-        Some(main) => get_string(client, bucket, &format!("{}/{main}", pointer.prefix)).await?,
+        Some(main) => get_string(bucket, &format!("{}/{main}", pointer.prefix)).await?,
         None if manifest.assets.is_some() => {
             // Ingress is handled by the immutable asset resolver. Keeping a
             // synthetic Worker makes the runtime construction path uniform
@@ -433,12 +388,7 @@ async fn load_worker_from_pointer(
         if manifest.main_module.as_deref() == Some(module.name.as_str()) {
             continue;
         }
-        let source = get_string(
-            client,
-            bucket,
-            &format!("{}/{}", pointer.prefix, module.name),
-        )
-        .await?;
+        let source = get_string(bucket, &format!("{}/{}", pointer.prefix, module.name)).await?;
         text.push((format!("./{}", module.name), source));
     }
     let do_bindings = bindings(&manifest, "durable_object_namespace")
@@ -462,7 +412,6 @@ async fn load_worker_from_pointer(
     let assets = match &manifest.assets {
         Some(reference) => Some(
             crate::assets::AssetResolver::load(
-                client,
                 bucket,
                 &pointer.prefix,
                 reference,

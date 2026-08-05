@@ -19,7 +19,7 @@ Attribution for the vendored and ported work:
 - **rustyriver** — Copyright 2026 The rustyriver authors, licensed under the
   Apache License, Version 2.0.
 - **Litestream** (https://github.com/benbjohnson/litestream), pinned by celld
-  to tag v0.5.15 — Copyright (c) Ben Johnson and the Litestream authors,
+  to tag v0.5.11 — Copyright (c) Ben Johnson and the Litestream authors,
   licensed under the Apache License, Version 2.0. Replication behavior and test
   vectors are ported for wire-compatible interoperability.
 - **LTX file format and reference implementation**

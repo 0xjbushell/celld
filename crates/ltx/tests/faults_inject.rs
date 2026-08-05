@@ -21,13 +21,13 @@
 //! (they assert error/typing/no-panic); the recovery cases that compare DB
 //! contents self-skip (never fail) when `sqlite3` is not on PATH.
 
-use rusqlite::Connection;
 use celld_ltx::client::file::FileReplicaClient;
 use celld_ltx::client::ReplicaClient;
 use celld_ltx::db::Db;
 use celld_ltx::ltx::{self, FileInfo};
 use celld_ltx::replica::{self, Replica, SNAPSHOT_LEVEL};
 use celld_ltx::{ltx_file_path, Error, TXID};
+use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
