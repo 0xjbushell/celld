@@ -216,6 +216,14 @@
                 if (this.#port) o += ':' + this.#port;
                 return o;
             }
+            // A blob: URL inherits the origin of its path parsed as a URL, so
+            // `blob:https://example.com:443/` is same-origin with
+            // `https://example.com`. A path that is not a URL (the common
+            // `blob:<uuid>` form) has no origin to inherit.
+            if (p === 'blob:') {
+                try { return new URL(this.#pathname).origin; }
+                catch { return 'null'; }
+            }
             return 'null';
         }
 

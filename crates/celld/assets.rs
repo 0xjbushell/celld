@@ -89,10 +89,13 @@ impl AssetResolver {
             return Err(anyhow!("unsupported asset index name: {}", reference.index));
         }
         let key = format!("{prefix}/{}", reference.index);
-        let (bytes, _) = bucket
-            .get(&key)
-            .await?
-            .with_context(|| format!("read s3://{}/{key}: no such key", bucket.name))?;
+        let (bytes, _) = bucket.get(&key).await?.with_context(|| {
+            format!(
+                "read {}://{}/{key}: no such key",
+                bucket.scheme(),
+                bucket.name
+            )
+        })?;
         let sha256 = format!("{:x}", Sha256::digest(&bytes));
         if sha256 != reference.sha256 {
             return Err(anyhow!("asset index checksum mismatch"));
@@ -106,10 +109,8 @@ impl AssetResolver {
             .unwrap_or_else(|| std::env::temp_dir().join("celld").join("asset-cache"));
         std::fs::create_dir_all(&cache_root)
             .with_context(|| format!("create asset cache directory {}", cache_root.display()))?;
-        let cache_max_bytes = std::env::var("CELLD_ASSET_CACHE_BYTES")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(DEFAULT_ASSET_CACHE_BYTES);
+        let cache_max_bytes =
+            crate::env_vars::with_default("CELLD_ASSET_CACHE_BYTES", DEFAULT_ASSET_CACHE_BYTES)?;
         Ok(Self {
             inner: Arc::new(AssetResolverInner {
                 bucket: bucket.clone(),
@@ -332,9 +333,6 @@ impl AssetResolver {
             });
         }
         let path = url::Url::parse(url).context("invalid assets binding URL")?;
-        let encoded_path = path.path().to_string();
-        let query = path.query().map(str::to_string);
-        let host = path.host_str().map(str::to_string);
         let mut request_headers = HeaderMap::new();
         for (name, value) in headers {
             let Ok(name) = name.parse::<axum::http::HeaderName>() else {
@@ -347,9 +345,9 @@ impl AssetResolver {
         }
         let response = match self
             .response(
-                &encoded_path,
-                query.as_deref(),
-                host.as_deref(),
+                path.path(),
+                path.query(),
+                path.host_str(),
                 method == "HEAD",
                 &request_headers,
                 true,
@@ -363,14 +361,14 @@ impl AssetResolver {
                 .body(Body::from("Not found"))?,
         };
         let (parts, body) = response.into_parts();
-        let body = axum::body::to_bytes(body, 25 * 1024 * 1024 + 1)
-            .await
-            .context("buffer assets binding response")?
-            .to_vec();
         Ok(js::HttpResponse {
             status: parts.status.as_u16(),
-            body,
-            stream: None,
+            body: Vec::new(),
+            stream: Some(Box::pin(body.into_data_stream().map(|chunk| {
+                chunk
+                    .map(|bytes| bytes.to_vec())
+                    .map_err(|error| format!("asset response stream: {error}"))
+            }))),
             headers: parts
                 .headers
                 .iter()
@@ -494,7 +492,8 @@ impl AssetResolver {
             .with_context(|| format!("read asset {resolved_path}"))?
             .with_context(|| {
                 format!(
-                    "asset {resolved_path} missing from s3://{}/{key}",
+                    "asset {resolved_path} missing from {}://{}/{key}",
+                    self.inner.bucket.scheme(),
                     self.inner.bucket.name
                 )
             })?;

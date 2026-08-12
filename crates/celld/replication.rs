@@ -63,9 +63,12 @@ pub struct ActivationOptions<'a> {
     pub fresh: bool,
     /// This activation seized the cell from a DIFFERENT node. When false the
     /// ownership record still named us at `epoch - 1`, so no other process
-    /// has written the cell since we hibernated it and our preserved local
+    /// has written the cell since we evicted it and our preserved local
     /// state is authoritative.
     pub took_over: bool,
+    /// Open the exact existing local epoch after a certified node-level
+    /// handoff. This path performs no remote discovery or restore.
+    pub resume_local: bool,
 }
 
 pub struct ActivationResult {
@@ -73,8 +76,10 @@ pub struct ActivationResult {
     pub restored: bool,
 }
 
-/// Enforce a byte ceiling over the `.hibernated` snapshots under `watch`,
+/// Enforce a byte ceiling over the preserved snapshots under `watch`,
 /// evicting least-recently-used first. The walk is layout-independent.
+/// `.hibernated` is the pre-2026-08-05 name and is still swept, or a node
+/// upgrading would keep those files forever without counting them.
 pub(crate) fn prune_watch(watch: &std::path::Path, max_bytes: u64) -> (usize, usize, u64) {
     use celld_logic::cache::CacheEntry;
     let mut paths = Vec::new();
@@ -89,7 +94,10 @@ pub(crate) fn prune_watch(watch: &std::path::Path, max_bytes: u64) -> (usize, us
             let Ok(meta) = item.metadata() else { continue };
             if meta.is_dir() {
                 stack.push(path);
-            } else if path.extension().is_some_and(|ext| ext == "hibernated") {
+            } else if path
+                .extension()
+                .is_some_and(|ext| ext == "evicted" || ext == "hibernated")
+            {
                 let last_used_ms = meta
                     .modified()
                     .ok()

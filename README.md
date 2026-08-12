@@ -3,26 +3,29 @@
 Self-hosted, distributed **Durable Objects**.
 
 celld is an open-source daemon that runs Cloudflare Workers and Durable
-Objects on your own machines. Each object is its own SQLite database,
-addressed by name and replicated to an
-S3-compatible bucket you own; nodes coordinate through that bucket alone, with
-no control plane or consensus. Because every object is its own small database,
+Objects on your own machines. Each object is its own SQLite database.
+celld addresses an object by name and replicates it to a bucket that you
+own. The bucket can be S3-compatible or Google Cloud Storage. The nodes
+coordinate through that bucket alone, with no control plane and no
+consensus. Because every object is its own small database,
 applications shard by construction — the contention and blast-radius failures
-of one shared database are designed out, not managed. Idle cells hibernate to
-nearly nothing. Learn more at [celld.dev](https://celld.dev) or read the
+of one shared database are designed out, not managed. A cell that no node
+holds is inactive, and an inactive cell costs nearly nothing. Learn more at
+[celld.dev](https://celld.dev) or read the
 [documentation](https://celld.dev/docs).
 
 ## How it works
 
-Every `celld` node embeds V8 and executes Wrangler bundles. The fleet shares an
-S3-compatible bucket containing deployments, cell state, and small ownership
-records. Object-storage compare-and-swap ensures that exactly one node owns a
+Every `celld` node embeds V8 and executes Wrangler bundles. The fleet shares
+one bucket, which contains deployments, cell state, and small ownership
+records. The bucket can be S3-compatible or Google Cloud Storage. Object-storage compare-and-swap ensures that exactly one node owns a
 cell at a time, without a membership protocol, failure detector, or consensus
 service.
 
 celld continuously replicates each cell's SQLite database to the bucket.
-When a cell moves or wakes up, its new owner restores that database and resumes
-execution. The bucket is the durable source of truth; nodes are replaceable.
+When a cell moves, or when an inactive cell activates, its new owner restores
+that database and resumes execution. The bucket is the durable source of
+truth; nodes are replaceable.
 
 ## Install
 
@@ -38,12 +41,12 @@ Put `~/.local/bin` on your `PATH` if the installer asks you to.
 Worker projects deployed with `celld deploy` need
 [esbuild](https://esbuild.github.io) on `PATH`; asset-only projects do not.
 
-The installer keeps verified releases under `~/.local/lib/celld/releases` and
-atomically switches one `current` pointer. To remove celld, use the guarded
-uninstaller:
+The installer keeps each release under `~/.local/lib/celld/releases` and points
+one symlink at the current one. To remove celld, delete the symlink and the
+releases:
 
 ```sh
-curl -fsSL https://celld.dev/uninstall.sh | sh
+rm `which celld` && rm -rf ~/.local/lib/celld
 ```
 
 ## Container
@@ -71,11 +74,12 @@ docker run --rm --network host \
   --endpoint https://ACCOUNT.r2.cloudflarestorage.com \
   --region auto \
   --listen 0.0.0.0:8080 \
-  --advertise node-a.internal:8080
+  --internal-listen 10.0.0.12:8081 \
+  --advertise node-a.internal:8081
 ```
 
-Drop `--endpoint`/`--region` for real AWS S3. Behind a load balancer,
-give each node a distinct `--advertise` its peers can reach.
+Drop `--endpoint` and `--region` for AWS S3. Expose port 8080 through the load
+balancer, and keep port 8081 on the private network.
 
 ## Run it
 
@@ -89,11 +93,23 @@ celld deploy . \
 celld \
   --bucket s3://my-cells-bucket \
   --listen 0.0.0.0:8080 \
-  --advertise 10.0.0.12:8080
+  --internal-listen 10.0.0.12:8081 \
+  --advertise 10.0.0.12:8081
 ```
 
 Use `--endpoint` for another S3-compatible service and `--region` when it
-cannot be inferred. A fleet runs one application, and every node loads its
+cannot be inferred. A `gs://` bucket selects Google Cloud Storage. celld then
+uses the Cloud Storage XML API with generation preconditions. Authentication
+uses Application Default Credentials. celld rejects an S3 `--endpoint` for a
+`gs://` bucket, and it ignores the storage region:
+
+```sh
+celld deploy . --bucket gs://my-cells-bucket
+celld --bucket gs://my-cells-bucket --listen 0.0.0.0:8080 \
+  --internal-listen 10.0.0.12:8081 --advertise 10.0.0.12:8081
+```
+
+A fleet runs one application, and every node loads its
 latest successfully committed deployment from `deploy/current.json`. Run
 `celld --help` for the complete command line.
 Deployment objects use the documented types in `crates/celld/protocol.rs`. `celld
@@ -102,14 +118,17 @@ Wrangler config subset—including co-deployed or asset-only static
 assets—and writes those objects directly. Every node discovers owners and
 peers from bucket leases; there is no account or join service.
 
-Peer HTTP does not terminate TLS. Put every advertised address on a trusted
-private network or an encrypted overlay such as WireGuard or Tailscale; do not
-publish the peer port directly. A literal public IP is rejected unless
-`--unsafe-public-advertise` is supplied explicitly. The first current node creates
-`fleet/peer-auth.json` in the bucket. All peer requests are protocol-versioned,
-body-bound, HMAC-authenticated, clock-bounded, and replay-protected with that
-fleet secret. Treat access to the bucket and its credentials as fleet
-administrator access.
+Peer HTTP and the operator API use the internal listener. Put every advertised
+address on a trusted private network or an encrypted overlay such as WireGuard
+or Tailscale. Do not publish the internal port. celld rejects a literal public
+IP unless you supply `--unsafe-public-advertise`. An explicit advertised
+address requires an explicit internal-listener address. celld cannot verify a
+hostname or a translated port, so you must route the advertised address to the
+internal listener. The first current node creates `fleet/peer-auth.json` in the
+bucket. All peer requests are
+protocol-versioned, body-bound, HMAC-authenticated, clock-bounded, and
+replay-protected with that fleet secret. Treat access to the bucket and its
+credentials as fleet administrator access.
 
 ## Operate a fleet
 
@@ -126,40 +145,23 @@ and incompatible protocols. It also prints each node's coarse resident-cell,
 WebSocket, RSS, CPU, file-descriptor, pressure, and shedding sample. Pass one
 or more `--peer NODE_ID` options to restrict the check.
 
-Pressure shedding is opt-in while the first release's safe defaults are being
-measured. Set a resident-cell high and low watermark on loaded nodes:
+Set a hard resident-cell limit on each loaded node:
 
 ```sh
 CELLD_MAX_RESIDENT_CELLS=1000 \
-CELLD_RESIDENT_LOW_WATER=800 \
 celld --bucket s3://my-cells-bucket --listen 0.0.0.0:8080 \
-  --advertise node-a.internal:8080
+  --internal-listen 10.0.0.12:8081 --advertise node-a.internal:8081
 ```
 
-On Linux, `CELLD_MAX_RSS_MB` and `CELLD_MAX_CPU_PERCENT` add process-memory and
-CPU triggers; the resident-cell watermark is portable. Under pressure, celld
-durably replicates and fences least-recently used idle cells, publishes them as
-unowned without resetting their epoch, and refuses to reacquire new unowned
-cells until the low watermark is reached. A spare receives no assignment: it
-acquires released cells through the same bucket protocol when normal traffic
-reaches it. Cells with active work or live host WebSockets are not shed.
-
-## Build from source
-
-```sh
-cargo build --locked
-cargo test --locked
-cargo clippy --all-targets --locked -- -D warnings
-```
-
-The workspace builds the `celld` runtime. Its versioned object-storage
-protocol lives in `crates/celld/protocol.rs`. Small Wrangler projects under `examples/`
-exercise the supported Worker and Durable Object surface.
-
-The runtime and compatibility surface are still evolving. Public tests cover
-the standalone engine smoke path; conformance against the Workers and Durable
-Objects reference behavior, and a deterministic simulation of the distributed
-protocol under fault injection, run before each release.
+celld enables an RSS threshold at 80% of the available memory by default. Set
+`CELLD_MAX_RSS_MB` to change the threshold, or set it to `0` to disable memory
+pressure shedding. Under pressure, celld durably replicates and fences the
+least-recently used idle cells. It then publishes the cells as unowned without
+resetting their epochs. Those cells become inactive, and celld refuses to
+reacquire new unowned cells until RSS reaches 80% of the threshold. A spare
+receives no assignment. It acquires a released cell through the same bucket
+protocol when normal traffic reaches it. celld does not shed a cell with active
+work or a live host WebSocket.
 
 ## Contributions
 

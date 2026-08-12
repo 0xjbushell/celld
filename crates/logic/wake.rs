@@ -194,7 +194,7 @@ impl WakeCore {
                 },
                 Op::Delete { key: e.key.clone() },
             ],
-            // adopted but never proven: assert it so the cell can hibernate
+            // adopted but never proven: assert it so the cell can be evicted
             Some(e) if !e.verified => {
                 vec![Op::Put {
                     key: want,
@@ -206,7 +206,7 @@ impl WakeCore {
     }
 
     /// Take responsibility for the entry a restored alarm implies. Without
-    /// this, a cell revived anywhere but the process that hibernated it has no
+    /// this, a cell revived anywhere but the process that evicted it has no
     /// record to delete from: its entry outlives the alarm and re-wakes the
     /// cell on every lease lapse.
     pub fn adopt(&mut self, cell: &str, due_ms: Ms) {
@@ -240,7 +240,7 @@ impl WakeCore {
         self.flushed.get(cell).is_some_and(|e| e.deleting)
     }
 
-    /// Entries whose cells this node hibernated and whose due time has arrived.
+    /// Entries whose cells this node evicted and whose due time has arrived.
     /// Sorted, unlike production's `HashMap` walk, so the schedule is
     /// reproducible — determinism the sans-IO core owes its executor.
     pub fn due_cells(&self, now_ms: Ms) -> Vec<String> {
@@ -414,7 +414,7 @@ pub fn should_adopt_hint(tracks: bool, hint_ms: Ms) -> bool {
 /// May this node take the singleton waker-role lease — because it already holds
 /// it, or the current holder's lease has expired? An exactly-expired lease MUST
 /// be claimable (`<=`, not `<`): the waker is a SINGLE role, so a claim that
-/// stalls on the boundary leaves every hibernated cell's alarm unwoken until
+/// stalls on the boundary leaves every evicted cell's alarm unwoken until
 /// some other node happens to reclaim.
 pub fn waker_may_claim(held_by_us: bool, expires_ms: Ms, now_ms: Ms) -> bool {
     held_by_us || expires_ms <= now_ms

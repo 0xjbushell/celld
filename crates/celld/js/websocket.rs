@@ -1,0 +1,847 @@
+// Copyright 2026 Deno Land Inc. Apache-2.0 license.
+
+//! WebSockets inside the isolate: the registry, the ops JS calls, and the
+//! frames waiting to leave.
+//!
+//! A socket outlives the event that created it, so the registry is what
+//! connects the two — JS holds an id, and this module knows what that id
+//! is attached to. Frames emitted inside an output-gate region are held
+//! until the gate opens, which is why emitting is not simply a send.
+use super::*;
+
+/// Outbound WebSocket traffic from a DO's `ws.send`/`ws.close`. The host holds
+/// the socket in a task decoupled from the isolate (so the cell can hibernate
+/// while the socket lives); `ws.send` routes here by wsId.
+pub enum WsOut {
+    Text(String),
+    Binary(Vec<u8>),
+    Close(u16, String),
+}
+
+/// The result of delivering one `webSocketMessage`. `frames` are the outbound
+/// frames the handler produced, captured by the output gate; `write_position`
+/// is the cell's committed-write count after the handler when it advanced past
+/// where it stood before — i.e. the handler wrote, and its frames must be held
+/// until that position is durable. `None` means no write: flush the frames.
+pub struct WsDispatch {
+    pub frames: Vec<(u64, WsOut)>,
+    pub write_position: Option<u64>,
+}
+
+/// One inbound event on a socket the ISOLATE polls, rather than one the host
+/// pushes into a cell.
+///
+/// A Durable Object socket must survive between events and wake a hibernated
+/// cell, so its frames arrive as `CellJob`s. A Worker socket cannot work that
+/// way: the stateless pool has no addressable isolate, and `asyncrt`'s region
+/// aborts every pending op when the request ends. That is not a limitation to
+/// route around — it is exactly the lifetime Cloudflare gives a Worker socket,
+/// which lives and dies with its `IoContext`. So the isolate pulls, the same
+/// way it already pulls a streamed response body.
+pub enum WsPull {
+    Open(String),
+    Text(String),
+    Binary(Vec<u8>),
+    Close(u16, String, bool),
+}
+
+/// Tags for the byte frame `__ws_next` resolves with. A tagged buffer keeps a
+/// binary message on its fast path instead of base64 through a JSON envelope.
+const WS_PULL_TAG_TEXT: u8 = 0;
+const WS_PULL_TAG_BINARY: u8 = 1;
+const WS_PULL_TAG_OPEN: u8 = 2;
+const WS_PULL_TAG_CLOSE: u8 = 3;
+
+impl WsPull {
+    fn encode(self) -> Vec<u8> {
+        let (tag, mut body) = match self {
+            WsPull::Text(text) => (WS_PULL_TAG_TEXT, text.into_bytes()),
+            WsPull::Binary(bytes) => (WS_PULL_TAG_BINARY, bytes),
+            WsPull::Open(protocol) => (WS_PULL_TAG_OPEN, protocol.into_bytes()),
+            WsPull::Close(code, reason, was_clean) => (
+                WS_PULL_TAG_CLOSE,
+                serde_json::json!({
+                    "code": code,
+                    "reason": reason,
+                    "wasClean": was_clean,
+                })
+                .to_string()
+                .into_bytes(),
+            ),
+        };
+        let mut framed = Vec::with_capacity(body.len() + 1);
+        framed.push(tag);
+        framed.append(&mut body);
+        framed
+    }
+}
+
+pub type WsPullReceiver = tokio::sync::mpsc::UnboundedReceiver<WsPull>;
+pub type WsPullSender = tokio::sync::mpsc::UnboundedSender<WsPull>;
+
+/// One socket's inbound queue. Shared so an op can await it without holding
+/// the registry lock; one isolate polls a given socket serially.
+type WsPullQueue = Arc<tokio::sync::Mutex<WsPullReceiver>>;
+type WsPullRegistry = std::sync::Mutex<HashMap<u64, WsPullQueue>>;
+
+/// Inbound queues for isolate-polled sockets, keyed by wsId.
+static WS_PULL: OnceLock<WsPullRegistry> = OnceLock::new();
+
+fn ws_pull() -> &'static WsPullRegistry {
+    WS_PULL.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+pub fn ws_pull_register(id: u64, rx: WsPullReceiver) {
+    ws_pull()
+        .lock()
+        .unwrap()
+        .insert(id, Arc::new(tokio::sync::Mutex::new(rx)));
+}
+
+pub fn ws_pull_unregister(id: u64) {
+    ws_pull().lock().unwrap().remove(&id);
+}
+
+pub fn ws_region_enter() {
+    let context = current_context();
+    let adopted = context.pending_sockets.lock().unwrap().drain(..).collect();
+    context.sockets.lock().unwrap().push(adopted);
+}
+
+/// Close every isolate-polled socket the closing region opened. A Worker
+/// socket lives and dies with its request, exactly as it does on Cloudflare.
+pub fn ws_region_exit() {
+    let opened = current_context()
+        .sockets
+        .lock()
+        .unwrap()
+        .pop()
+        .unwrap_or_default();
+    for id in opened {
+        ws_emit(id, WsOut::Close(1001, "request ended".into()));
+        ws_pull_unregister(id);
+        ws_unregister(id);
+    }
+}
+
+fn ws_region_track(id: u64) {
+    let context = current_context();
+    let mut regions = context.sockets.lock().unwrap();
+    match regions.last_mut() {
+        Some(current) => current.push(id),
+        None => {
+            drop(regions);
+            context.pending_sockets.lock().unwrap().push(id);
+        }
+    }
+}
+pub enum WsIn {
+    Text(String),
+    Binary(Vec<u8>),
+}
+struct WsMeta {
+    scope: String,
+    hibernatable: bool,
+    tags: Vec<String>,
+    /// Structured-clone bytes, not JSON: `serializeAttachment` accepts
+    /// anything cloneable, so Date, Map and Set must survive a round trip.
+    attachment: Option<Vec<u8>>,
+    pending: Vec<WsOut>,
+    /// When the shell last answered this socket with the cell's auto-response,
+    /// unix ms. Lives here rather than in the isolate because the reply is
+    /// sent while the cell may not be resident at all.
+    auto_response_at: Option<f64>,
+}
+#[derive(Default)]
+struct WsRegistry {
+    outputs: HashMap<u64, tokio::sync::mpsc::UnboundedSender<WsOut>>,
+    metadata: HashMap<u64, WsMeta>,
+}
+impl WsRegistry {
+    fn register(&mut self, id: u64, tx: tokio::sync::mpsc::UnboundedSender<WsOut>) {
+        if let Some(meta) = self.metadata.get_mut(&id) {
+            for pending in meta.pending.drain(..) {
+                let _ = tx.send(pending);
+            }
+        }
+        self.outputs.insert(id, tx);
+    }
+
+    fn unregister(&mut self, id: u64) -> Option<WsMeta> {
+        self.outputs.remove(&id);
+        self.metadata.remove(&id)
+    }
+
+    fn emit(&mut self, id: u64, out: WsOut) {
+        if let Some(tx) = self.outputs.get(&id) {
+            tracing::debug!(ws_id = id, "queued outbound WebSocket frame");
+            let _ = tx.send(out);
+        } else if let Some(meta) = self.metadata.get_mut(&id) {
+            tracing::debug!(ws_id = id, "buffered pre-upgrade WebSocket frame");
+            meta.pending.push(out);
+        } else {
+            // The socket is gone and the frame has nowhere to go. Silence here
+            // is what made a held frame indistinguishable from a sent one.
+            tracing::warn!(ws_id = id, "dropped a frame for a closed WebSocket");
+        }
+    }
+}
+static WS_REGISTRY: OnceLock<std::sync::Mutex<WsRegistry>> = OnceLock::new();
+static REGULAR_WS_COUNTS: OnceLock<std::sync::Mutex<HashMap<String, usize>>> = OnceLock::new();
+static NEXT_WS_ID: AtomicU64 = AtomicU64::new(1);
+fn ws_registry() -> &'static std::sync::Mutex<WsRegistry> {
+    WS_REGISTRY.get_or_init(|| std::sync::Mutex::new(WsRegistry::default()))
+}
+fn regular_ws_counts() -> &'static std::sync::Mutex<HashMap<String, usize>> {
+    REGULAR_WS_COUNTS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+fn increment_regular_ws(scope: &str) {
+    *regular_ws_counts()
+        .lock()
+        .unwrap()
+        .entry(scope.to_string())
+        .or_default() += 1;
+}
+fn decrement_regular_ws(scope: &str) {
+    let mut counts = regular_ws_counts().lock().unwrap();
+    let Some(count) = counts.get_mut(scope) else {
+        return;
+    };
+    *count = count.saturating_sub(1);
+    if *count == 0 {
+        counts.remove(scope);
+    }
+}
+pub fn has_regular_websocket(scope: &str) -> bool {
+    regular_ws_counts()
+        .lock()
+        .unwrap()
+        .get(scope)
+        .is_some_and(|count| *count > 0)
+}
+/// The auto-response pair per cell scope, set by
+/// `state.setWebSocketAutoResponse`. Shell state, like the socket registry:
+/// the whole point of the feature is answering a matched message while the
+/// cell is not resident, so the isolate cannot hold it.
+static WS_AUTO_RESPONSE: OnceLock<std::sync::Mutex<HashMap<String, (String, String)>>> =
+    OnceLock::new();
+
+fn ws_auto_responses() -> &'static std::sync::Mutex<HashMap<String, (String, String)>> {
+    WS_AUTO_RESPONSE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// The shell's read path asks here before dispatching a text frame. A match
+/// returns the response to send on the same socket and stamps the socket's
+/// timestamp; the frame then never reaches the cell — no dispatch, no wake.
+/// Only hibernatable sockets participate, as in workerd, where matching
+/// lives in the hibernation manager's read loop.
+pub fn ws_auto_response(scope: &str, id: u64, text: &str) -> Option<String> {
+    let response = {
+        let pairs = ws_auto_responses().lock().unwrap();
+        let (request, response) = pairs.get(scope)?;
+        if request != text {
+            return None;
+        }
+        response.clone()
+    };
+    let mut registry = ws_registry().lock().unwrap();
+    let meta = registry.metadata.get_mut(&id)?;
+    if !meta.hibernatable {
+        return None;
+    }
+    meta.auto_response_at = Some(unix_ms());
+    Some(response)
+}
+
+fn unix_ms() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as f64
+}
+
+pub fn ws_hibernatable(id: u64) -> Option<bool> {
+    ws_registry()
+        .lock()
+        .unwrap()
+        .metadata
+        .get(&id)
+        .map(|meta| meta.hibernatable)
+}
+pub fn ws_next_id() -> u64 {
+    NEXT_WS_ID.fetch_add(1, Ordering::Relaxed)
+}
+pub fn ws_register(id: u64, tx: tokio::sync::mpsc::UnboundedSender<WsOut>) {
+    ws_registry().lock().unwrap().register(id, tx);
+}
+pub fn ws_register_outbound(id: u64, scope: &str) {
+    let inserted = {
+        let mut registry = ws_registry().lock().unwrap();
+        if let std::collections::hash_map::Entry::Vacant(entry) = registry.metadata.entry(id) {
+            entry.insert(WsMeta {
+                scope: scope.to_string(),
+                hibernatable: false,
+                tags: Vec::new(),
+                attachment: None,
+                pending: Vec::new(),
+                auto_response_at: None,
+            });
+            true
+        } else {
+            false
+        }
+    };
+    if inserted {
+        increment_regular_ws(scope);
+    }
+}
+pub fn ws_unregister(id: u64) {
+    let meta = ws_registry().lock().unwrap().unregister(id);
+    if let Some(meta) = meta.filter(|meta| !meta.hibernatable) {
+        decrement_regular_ws(&meta.scope);
+    }
+}
+
+pub(super) fn ws_capture_begin() {
+    current_context()
+        .ws_capture
+        .lock()
+        .unwrap()
+        .push(Vec::new());
+}
+
+pub(super) fn ws_capture_take() -> Vec<(u64, WsOut)> {
+    current_context()
+        .ws_capture
+        .lock()
+        .unwrap()
+        .pop()
+        .unwrap_or_default()
+}
+
+/// Whether a socket is one the output gate may hold frames for: a hibernatable
+/// transport, whose messages the host pushes into the cell.
+///
+/// A socket the isolate opened and polls itself is not. Its handler runs inside
+/// the isolate's event loop, and that loop is what a held frame would be
+/// waiting on: the reply to a frame the gate is withholding never arrives, so
+/// the loop never finishes, so the frame is never released. Frames from those
+/// sockets go straight out, as they did before the gate existed.
+fn ws_gate_may_hold(id: u64) -> bool {
+    let registry = ws_registry().lock().unwrap();
+    registry
+        .metadata
+        .get(&id)
+        .is_some_and(|meta| meta.hibernatable)
+}
+
+static WS_DEFERRED: OnceLock<std::sync::Mutex<HashMap<u64, Vec<WsOut>>>> = OnceLock::new();
+
+/// Frames held back because the handler that produced them has written
+/// something not yet durable, one queue per socket.
+///
+/// A socket with a queue has a flush already scheduled, and every later frame
+/// for that socket joins the queue rather than overtaking it: a socket's
+/// frames must arrive in the order the script sent them. Ordering is a
+/// property of one socket, which is what the key says.
+///
+/// Process-wide, not thread-local. It is filled inside the isolate and
+/// drained by an op, and an op runs on the host runtime — so a thread-local
+/// queue was filled on one thread and taken, empty, on another. The frames
+/// never left the process, and because the queue stayed non-empty every
+/// later frame joined them.
+fn ws_deferred() -> &'static std::sync::Mutex<HashMap<u64, Vec<WsOut>>> {
+    WS_DEFERRED.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn ws_emit(id: u64, out: WsOut) {
+    let context = current_context();
+    let mut capture = context.ws_capture.lock().unwrap();
+    if !capture.is_empty() && ws_gate_may_hold(id) {
+        capture.last_mut().unwrap().push((id, out));
+        return;
+    }
+    drop(capture);
+    // A socket the isolate opened itself, which the capture above deliberately
+    // will not hold: releasing captured frames waits for the handler to
+    // return, and this handler may be awaiting a reply to the very frame being
+    // held. Waiting on the DURABILITY ticket instead has no such cycle -- it
+    // is resolved by the replicator, which does not need this event loop -- so
+    // the frame can be held without deadlocking the script that sent it.
+    let pending = egress_gate_pending();
+    // Held until this frame is either queued or sent. A flush runs on another
+    // thread, so releasing here would let it drain its queue between the test
+    // below and the send, putting a later frame ahead of an earlier one.
+    let mut deferred = ws_deferred().lock().unwrap();
+    let already_deferring = deferred.contains_key(&id);
+    if pending.is_some() || already_deferring {
+        deferred.entry(id).or_default().push(out);
+        if !already_deferring {
+            // Detached onto the HOST runtime (`op_handle`) deliberately:
+            // this flush exists precisely to outlive the dispatch that
+            // produced the frames — a writing connect handler's ready frame,
+            // an alarm broadcast — and it awaits a durability ticket that
+            // resolves with no isolate involvement. Both region-owned homes
+            // silently kill it: `asyncrt::enqueue`'s future is aborted when
+            // the dispatch region closes, and the isolate thread's local
+            // request driver stops polling its operation future the moment the
+            // dispatch returns. Either way the frames never left the
+            // process.
+            asyncrt::op_handle().spawn(async move {
+                let held = await_egress_gate(pending).await;
+                let mut deferred = ws_deferred().lock().unwrap();
+                let frames = deferred.remove(&id).unwrap_or_default();
+                match held {
+                    // Unprovable: these frames describe a write the fleet may
+                    // never have, so they must not be delivered. Dropping them
+                    // and leaving the socket open is not an option -- a
+                    // WebSocket is an ordered stream, and a peer cannot see a
+                    // hole in one. It would read the frames on either side of
+                    // the gap as consecutive.
+                    //
+                    // Close instead. A truncated stream is something the peer
+                    // can detect and resynchronise from; a silently incomplete
+                    // one is not. The cell is reset underneath this as well,
+                    // but that is a separate path and this must not depend on
+                    // its timing.
+                    Err(_) => {
+                        ws_emit_batch(vec![(
+                            id,
+                            WsOut::Close(
+                                1011,
+                                "celld could not prove the write behind this message durable"
+                                    .to_string(),
+                            ),
+                        )]);
+                    }
+                    Ok(()) => {
+                        ws_emit_batch(frames.into_iter().map(|out| (id, out)).collect());
+                    }
+                }
+            });
+        }
+        return;
+    }
+    ws_registry().lock().unwrap().emit(id, out);
+}
+
+/// Flush frames the output gate held: send each to its socket's task. Called
+/// from the actor thread once the gating write is proved durable.
+pub fn ws_emit_batch(frames: Vec<(u64, WsOut)>) {
+    let mut registry = ws_registry().lock().unwrap();
+    for (id, out) in frames {
+        registry.emit(id, out);
+    }
+}
+
+/// Break a cell's sockets: the output gate could not prove a write durable, so
+/// close every socket the cell owns rather than let a client keep a connection
+/// whose acknowledged effects may not have persisted (a reset DO).
+pub fn ws_close_scope(scope: &str, code: u16, reason: &str) {
+    // A reset cell is a new actor; workerd's hibernation manager dies with
+    // the old one and takes the auto-response pair with it.
+    ws_auto_responses().lock().unwrap().remove(scope);
+    let mut registry = ws_registry().lock().unwrap();
+    let ids: Vec<u64> = registry
+        .metadata
+        .iter()
+        .filter(|(_, meta)| meta.scope == scope)
+        .map(|(id, _)| *id)
+        .collect();
+    for id in ids {
+        registry.emit(id, WsOut::Close(code, reason.to_string()));
+    }
+}
+
+pub(super) fn op_ws_send(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let id = args
+        .get(0)
+        .to_integer(scope)
+        .map(|n| n.value() as u64)
+        .unwrap_or(0);
+    let data = args.get(1).to_rust_string_lossy(scope);
+    ws_emit(id, WsOut::Text(data));
+}
+pub(super) fn op_ws_send_binary(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let id = args
+        .get(0)
+        .to_integer(scope)
+        .map(|n| n.value() as u64)
+        .unwrap_or(0);
+    let data = view_bytes(args.get(1)).unwrap_or_default();
+    ws_emit(id, WsOut::Binary(data));
+}
+pub(super) fn op_ws_close(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let id = args
+        .get(0)
+        .to_integer(scope)
+        .map(|n| n.value() as u64)
+        .unwrap_or(0);
+    let code = args.get(1).uint32_value(scope).unwrap_or(1000) as u16;
+    let reason = args.get(2).to_rust_string_lossy(scope);
+    ws_emit(id, WsOut::Close(code, reason));
+}
+pub(super) fn op_ws_alloc(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    rv.set(v8::Number::new(scope, ws_next_id() as f64).into());
+}
+/// `fetch(url, { headers: { Upgrade: "websocket" } })`. Returns a JSON
+/// envelope: either an upgraded socket, or the ordinary response a server sent
+/// instead, which the caller returns unchanged.
+pub(super) fn op_ws_upgrade(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    if actor_runtime_state(scope).egress == EgressPolicy::Deny {
+        return loader_throw(
+            scope,
+            "This worker is not permitted to access the internet via global functions.",
+        );
+    }
+    let id = args
+        .get(0)
+        .to_integer(scope)
+        .map(|n| n.value() as u64)
+        .unwrap_or(0);
+    let cell = args.get(1).to_rust_string_lossy(scope);
+    let url = args.get(2).to_rust_string_lossy(scope);
+    let headers: Vec<(String, String)> =
+        serde_json::from_str(&args.get(3).to_rust_string_lossy(scope)).unwrap_or_default();
+    let protocols: Vec<String> = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("sec-websocket-protocol"))
+        .map(|(_, value)| value.split(',').map(|p| p.trim().to_string()).collect())
+        .unwrap_or_default();
+    let pull = cell.is_empty().then(|| {
+        let (pull_tx, pull_rx) = tokio::sync::mpsc::unbounded_channel();
+        ws_pull_register(id, pull_rx);
+        ws_region_track(id);
+        pull_tx
+    });
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let sent = OUTBOUND_WS_TX.get().is_some_and(|sender| {
+        sender
+            .send(OutboundWsReq {
+                scope: cell,
+                id,
+                url,
+                protocols,
+                pull,
+                headers,
+                want_response: true,
+                reply: tx,
+            })
+            .is_ok()
+    });
+    let async_id = asyncrt::enqueue(async move {
+        if !sent {
+            return Err("no outbound WebSocket channel".into());
+        }
+        let open = match rx.await {
+            Ok(Ok(open)) => open,
+            Ok(Err(error)) => return Err(format!("WebSocket upgrade failed: {error}")),
+            Err(error) => return Err(format!("WebSocket connector dropped: {error}")),
+        };
+        Ok(match open.declined {
+            Some(declined) => serde_json::json!({
+                "upgraded": false,
+                "status": declined.status,
+                "headers": declined.headers,
+                "body": declined.body,
+            })
+            .to_string(),
+            None => serde_json::json!({
+                "upgraded": true,
+                "protocol": open.protocol.unwrap_or_default(),
+            })
+            .to_string(),
+        })
+    });
+    rv.set(promise_for(scope, async_id));
+}
+
+/// Await the next inbound event on an isolate-polled socket. Resolves with a
+/// tagged buffer; a closed queue resolves as a 1006 close so the JS pump always
+/// terminates rather than hanging on a dropped sender.
+pub(super) fn op_ws_next(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let id = args
+        .get(0)
+        .to_integer(scope)
+        .map(|n| n.value() as u64)
+        .unwrap_or(0);
+    let queue = ws_pull().lock().unwrap().get(&id).cloned();
+    let async_id = asyncrt::enqueue(async move {
+        let Some(queue) = queue else {
+            return Ok(WsPull::Close(1006, "socket is not registered".into(), false).encode());
+        };
+        let mut queue = queue.lock().await;
+        Ok(queue
+            .recv()
+            .await
+            .unwrap_or_else(|| WsPull::Close(1006, String::new(), false))
+            .encode())
+    });
+    rv.set(promise_for(scope, async_id));
+}
+
+pub(super) fn op_ws_connect(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    if actor_runtime_state(scope).egress == EgressPolicy::Deny {
+        return loader_throw(
+            scope,
+            "This worker is not permitted to access the internet via global functions.",
+        );
+    }
+    let id = args
+        .get(0)
+        .to_integer(scope)
+        .map(|n| n.value() as u64)
+        .unwrap_or(0);
+    let cell = args.get(1).to_rust_string_lossy(scope);
+    let url = args.get(2).to_rust_string_lossy(scope);
+    let protocols: Vec<String> =
+        serde_json::from_str(&args.get(3).to_rust_string_lossy(scope)).unwrap_or_default();
+    // No cell means a Worker socket: the isolate polls it, so register the
+    // queue here on the JS thread and track it against the running region.
+    let pull = cell.is_empty().then(|| {
+        let (pull_tx, pull_rx) = tokio::sync::mpsc::unbounded_channel();
+        ws_pull_register(id, pull_rx);
+        ws_region_track(id);
+        pull_tx
+    });
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let sent = OUTBOUND_WS_TX.get().is_some_and(|sender| {
+        sender
+            .send(OutboundWsReq {
+                scope: cell,
+                id,
+                url,
+                protocols,
+                pull,
+                headers: Vec::new(),
+                want_response: false,
+                reply: tx,
+            })
+            .is_ok()
+    });
+    let async_id = asyncrt::enqueue(async move {
+        if !sent {
+            return Err("no outbound WebSocket channel".into());
+        }
+        match rx.await {
+            Ok(Ok(open)) => Ok(open.protocol.unwrap_or_default()),
+            Ok(Err(error)) => Err(format!("WebSocket connection failed: {error}")),
+            Err(error) => Err(format!("WebSocket connector dropped: {error}")),
+        }
+    });
+    rv.set(promise_for(scope, async_id));
+}
+pub(super) fn op_ws_accept(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let id = args
+        .get(0)
+        .to_integer(scope)
+        .map(|n| n.value() as u64)
+        .unwrap_or(0);
+    let cell = args.get(1).to_rust_string_lossy(scope);
+    let tags: Vec<String> =
+        serde_json::from_str(&args.get(2).to_rust_string_lossy(scope)).unwrap_or_default();
+    let replaced_regular_scope = {
+        let mut registry = ws_registry().lock().unwrap();
+        let sockets = &mut registry.metadata;
+        let replaced_regular_scope = sockets
+            .get(&id)
+            .filter(|meta| !meta.hibernatable)
+            .map(|meta| meta.scope.clone());
+        sockets
+            .entry(id)
+            .and_modify(|meta| {
+                meta.scope = cell.clone();
+                meta.hibernatable = true;
+                meta.tags = tags.clone();
+            })
+            .or_insert(WsMeta {
+                scope: cell.clone(),
+                hibernatable: true,
+                tags,
+                attachment: None,
+                pending: Vec::new(),
+                auto_response_at: None,
+            });
+        replaced_regular_scope
+    };
+    if let Some(scope) = replaced_regular_scope {
+        decrement_regular_ws(&scope);
+    }
+    tracing::info!(ws_id = id, scope = %cell, "accepted hibernatable WebSocket");
+}
+pub(super) fn op_ws_accept_regular(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let id = args
+        .get(0)
+        .to_integer(scope)
+        .map(|n| n.value() as u64)
+        .unwrap_or(0);
+    let cell = args.get(1).to_rust_string_lossy(scope);
+    let inserted = {
+        let mut registry = ws_registry().lock().unwrap();
+        let sockets = &mut registry.metadata;
+        if let std::collections::hash_map::Entry::Vacant(entry) = sockets.entry(id) {
+            entry.insert(WsMeta {
+                scope: cell.clone(),
+                hibernatable: false,
+                tags: Vec::new(),
+                attachment: None,
+                pending: Vec::new(),
+                auto_response_at: None,
+            });
+            true
+        } else {
+            false
+        }
+    };
+    if inserted {
+        increment_regular_ws(&cell);
+    }
+    tracing::info!(ws_id = id, scope = %cell, "accepted regular WebSocket");
+}
+pub(super) fn op_ws_list(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let cell = args.get(0).to_rust_string_lossy(scope);
+    let tag = args.get(1);
+    let tag = if tag.is_undefined() || tag.is_null() {
+        None
+    } else {
+        Some(tag.to_rust_string_lossy(scope))
+    };
+    let rows = ws_registry()
+        .lock()
+        .unwrap()
+        .metadata
+        .iter()
+        .filter(|(_, meta)| {
+            meta.hibernatable
+                && meta.scope == cell
+                && tag.as_ref().is_none_or(|tag| meta.tags.contains(tag))
+        })
+        .map(|(id, meta)| {
+            serde_json::json!({
+                "id": id,
+                "tags": meta.tags,
+                "attachment": meta.attachment,
+            })
+        })
+        .collect::<Vec<_>>();
+    let json = serde_json::to_string(&rows).unwrap();
+    rv.set(v8::String::new(scope, &json).unwrap().into());
+}
+pub(super) fn op_ws_attachment_set(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let id = args
+        .get(0)
+        .to_integer(scope)
+        .map(|n| n.value() as u64)
+        .unwrap_or(0);
+    let Some(attachment) = view_bytes(args.get(1)) else {
+        let message = v8::String::new(scope, "__ws_attachment_set expects bytes").unwrap();
+        let exception = v8::Exception::type_error(scope, message);
+        scope.throw_exception(exception);
+        return;
+    };
+    if let Some(meta) = ws_registry().lock().unwrap().metadata.get_mut(&id) {
+        meta.attachment = Some(attachment.to_vec());
+    }
+}
+
+pub(super) fn op_ws_auto_response_set(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let cell = args.get(0).to_rust_string_lossy(scope);
+    let request = args.get(1);
+    if request.is_null() || request.is_undefined() {
+        ws_auto_responses().lock().unwrap().remove(&cell);
+        return;
+    }
+    let request = request.to_rust_string_lossy(scope);
+    let response = args.get(2).to_rust_string_lossy(scope);
+    ws_auto_responses()
+        .lock()
+        .unwrap()
+        .insert(cell, (request, response));
+}
+pub(super) fn op_ws_auto_response_get(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let cell = args.get(0).to_rust_string_lossy(scope);
+    let pair = ws_auto_responses().lock().unwrap().get(&cell).cloned();
+    let json = match pair {
+        Some((request, response)) => serde_json::to_string(&[request, response]).unwrap(),
+        None => "null".to_string(),
+    };
+    rv.set(v8::String::new(scope, &json).unwrap().into());
+}
+pub(super) fn op_ws_auto_response_ts(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let id = args
+        .get(0)
+        .to_integer(scope)
+        .map(|n| n.value() as u64)
+        .unwrap_or(0);
+    let stamped = ws_registry()
+        .lock()
+        .unwrap()
+        .metadata
+        .get(&id)
+        .and_then(|meta| meta.auto_response_at);
+    match stamped {
+        Some(ms) => rv.set(v8::Number::new(scope, ms).into()),
+        None => rv.set(v8::null(scope).into()),
+    }
+}
+
+#[cfg(all(test, celld_internal_tests))]
+mod websocket_registry_private {
+    include!(env!("CELLD_CONFORMANCE_WEBSOCKET_REGISTRY_TESTS"));
+}

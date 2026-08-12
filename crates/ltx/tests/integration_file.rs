@@ -73,7 +73,7 @@ fn litestream_usable(test: &str) -> bool {
         }
         Ok(o) => {
             let v = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if v.starts_with("v0.5") {
+            if v.starts_with("v0.5") || v.starts_with("0.5") {
                 true
             } else {
                 eprintln!(
@@ -157,7 +157,7 @@ async fn round_trip_file_client_reproduces_source() {
     assert!(dpos.txid.0 >= 6, "at least 6 transactions captured");
 
     // Verify the replica tree actually holds the L0 files.
-    let files = replica.client.ltx_files(0, TXID(0), false).await.unwrap();
+    let files = replica.client.ltx_files(0, TXID(0)).await.unwrap();
     assert!(
         files.len() as u64 >= dpos.txid.0,
         "every captured TXID is on the replica (got {} files, txid={})",

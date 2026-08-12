@@ -1,7 +1,7 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Restore-source durability predicates, reified sans-IO. Activation restores a
-//! cell's SQLite from the newest SAFE source — a local hibernation snapshot or
+//! cell's SQLite from the newest SAFE source — a local eviction snapshot or
 //! the replicated bucket. Which source is a durability decision: pick a stale
 //! one over a newer replica and the cell serves lost writes; pick a
 //! needlessly-remote one and pay dozens of sequential round trips (measured:
@@ -18,8 +18,8 @@
 
 pub type Epoch = u64;
 
-/// May a hibernation snapshot from the PREVIOUS epoch be reused? Ordinary idle
-/// hibernation is followed by an epoch advance, so its cache sits under
+/// May an eviction snapshot from the PREVIOUS epoch be reused? Ordinary idle
+/// eviction is followed by an epoch advance, so its cache sits under
 /// `epoch - 1` — safe to reuse only when we did NOT take the cell over from
 /// another node. A takeover means someone else may have written the cell while
 /// we slept, so their newer durable state, not our stale snapshot, is
@@ -27,4 +27,3 @@ pub type Epoch = u64;
 pub fn previous_epoch_reusable(epoch: Epoch, took_over: bool) -> bool {
     epoch > 1 && !took_over
 }
-

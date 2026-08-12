@@ -13,28 +13,6 @@
 //! the bytes but not the decision. That keeps the shell mechanical and lets
 //! callers exercise the same branch production takes.
 
-/// Where a top-level Worker fetch runs when it reaches a cell isolate.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Route {
-    /// The isolate is idle: run the fetch on the resident isolate (fast path).
-    OnIsolate,
-    /// The isolate is pumping an actor event: hand the fetch to the stateless
-    /// Worker pool with its request identity preserved. A Worker event never
-    /// runs nested in an isolate already running an actor event.
-    RescheduleToPool,
-}
-
-/// Route a top-level Worker fetch reaching a cell isolate. The load-bearing
-/// invariant: a Worker event must never execute nested in an isolate already
-/// pumping an actor event, so a busy isolate always reschedules to the pool.
-pub fn route_worker_fetch(isolate_active: bool) -> Route {
-    if isolate_active {
-        Route::RescheduleToPool
-    } else {
-        Route::OnIsolate
-    }
-}
-
 /// Select the protocol close code the shell must echo after the application
 /// close handler has run and all of its output has been written.
 ///

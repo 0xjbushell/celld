@@ -1,0 +1,754 @@
+// Copyright 2026 Deno Land Inc. Apache-2.0 license.
+
+//! The vocabulary the core is written in: what it is told, what it
+//! answers with, and the records it reads and writes.
+//!
+//! Everything here is data. `Event` is the only way in, `Effect` the only
+//! way out, and the rest are the shapes those two carry. No decision is
+//! made in this file — that is `State` in the crate root.
+use super::*;
+
+pub type Ms = i64;
+
+pub type CellId = String;
+pub type NodeId = String;
+pub type RequestId = u64;
+pub type WebSocketId = u64;
+pub type OpId = u64;
+pub type Epoch = u64;
+
+/// One runtime that this node can currently serve locally.
+///
+/// Presence is a read-only projection of the decision core, not a second
+/// inventory maintained by an adapter. Keeping the epoch beside the cell ID
+/// lets management and inspection traffic identify the exact fenced runtime.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PresenceCell {
+    pub id: CellId,
+    pub epoch: Epoch,
+}
+
+/// Cumulative lifecycle decisions exposed to management from the same state
+/// machine that made them. These are advisory counters, but they are not a
+/// second shell-owned model and replay to the same values for the same events.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ActivitySnapshot {
+    pub acquired: u64,
+    pub proxied: u64,
+    pub expired_owner_leases: u64,
+    pub restored: u64,
+    pub advanced_epochs: u64,
+}
+
+/// Management-facing lifecycle state derived atomically from [`State`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PresenceSnapshot {
+    pub serving: bool,
+    pub cells: Vec<PresenceCell>,
+    pub activity: ActivitySnapshot,
+    pub lazy_lease_shadow: LeaseLifecycleShadowBatch,
+}
+
+impl PresenceSnapshot {
+    pub fn owned_cells(&self) -> usize {
+        self.cells.len()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Config {
+    /// Resident cells plus activation reservations may never exceed this.
+    pub max_resident: usize,
+    /// Complete nonresident routes which may be in flight at once.
+    ///
+    /// This is deliberately independent of the stateless Worker pool. A warm
+    /// request consumes no activation slot, while a cold request holds one
+    /// across ownership resolution, capacity waiting, restore, and publish.
+    pub max_activations: usize,
+    /// Evictions that may hold a durability proof in flight at once.
+    ///
+    /// A proof is a round trip to the bucket, so draining a node one cell at a
+    /// time takes the number of cells times that latency -- a node shedding
+    /// five hundred cells against a two hundred millisecond proof refuses
+    /// admission for a minute and a half while it walks down. Bounded
+    /// concurrency is what makes the walk down finish in a time anyone can
+    /// reason about.
+    pub max_evictions: usize,
+    /// Evictions in flight at once during a shutdown handoff.
+    ///
+    /// `max_evictions` is tuned for a background walk down beside live
+    /// traffic. A drain has no live traffic to protect and a stop grace to
+    /// beat, so it runs wider -- but still bounded, because a node handing
+    /// off thousands of cells at once is the same thundering herd against
+    /// the bucket that eviction bounding exists to prevent.
+    pub max_releases: usize,
+    /// Concurrent outbound WebSockets one cell may hold.
+    ///
+    /// Distinct from the node-wide pin budget, which counts *cells* held
+    /// resident: one socket is enough to pin a cell, so that budget says
+    /// nothing about how many a single cell may open. This bounds what one
+    /// application can consume on its own behalf.
+    pub max_outbound_websockets: usize,
+    /// What an evicted cell's ownership record should say.
+    ///
+    /// Releasing it lets any node take the cell next, which is what makes a
+    /// loaded node shed load rather than merely stop hosting it: keeping the
+    /// record means every later request for that cell still routes here, to a
+    /// node that already decided it has no room. Keeping it is right when the
+    /// local eviction snapshot is the point, because a same-node wake is a
+    /// rename instead of a restore.
+    pub ownership_on_evict: OwnershipOnEvict,
+    /// Production executors require a live self-node lease before serving.
+    /// Deterministic unit slices which do not exercise node authority can
+    /// disable this explicitly.
+    pub require_node_lease: bool,
+    /// Exact cross-node request protocol this process can authenticate and
+    /// understand. A live owner speaking another version is unavailable, not
+    /// stale: incompatibility never authorizes takeover.
+    pub peer_protocol: u16,
+    /// How long an activation effect may remain outstanding before the core
+    /// stops waiting for it.
+    ///
+    /// Without this a swallowed effect is invisible: no event ever arrives, no
+    /// timer is watching, and the request waits forever while every piece of
+    /// state remains perfectly consistent. celld shipped that and parked
+    /// requests past ninety seconds. `None` restores the old behaviour, which
+    /// only a test that wants to observe an indefinite wait should ask for.
+    pub operation_deadline_ms: Option<u64>,
+    /// How close an armed alarm may be before the cell stops being worth
+    /// evicting. Inside this window the wake would cost more than the
+    /// residency it saves, so the cell is held.
+    pub alarm_resident_ms: u64,
+    /// How long a cell may sit unused before the node gives it back, with no
+    /// pressure involved. `None` keeps every cell resident until something
+    /// needs the room.
+    pub idle_evict_ms: Option<u64>,
+    /// Ceilings and low watermarks for load shedding.
+    ///
+    /// `max_resident` is a hard cap on reservations; this is the softer,
+    /// resource-aware question of whether the node is overloaded at all.
+    /// Without it a node has only a cell count to reason about, so it meets
+    /// memory exhaustion by running into it rather than shedding.
+    pub pressure: pressure::PressureConfig,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnerRecord {
+    /// `None` is a deliberately released, fenced record. Epochs never reset.
+    pub node: Option<NodeId>,
+    pub epoch: Epoch,
+    pub etag: String,
+}
+
+/// The routing and authority fields read from `nodes/<node>.json`.
+///
+/// The executor samples wall time and returns the verbatim record. The core,
+/// not the storage adapter, decides whether it is live and routable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeLeaseRecord {
+    pub node: NodeId,
+    pub addr: String,
+    pub expires_ms: u64,
+    pub peer_protocol: u16,
+    /// Per-process generation; production stores this in
+    /// `ownership_index_generation`.
+    pub generation: String,
+    /// Object version observed by the read. Empty only in synthetic events.
+    pub etag: String,
+}
+
+/// One advisory fleet-capacity observation returned by the storage shell.
+///
+/// Membership and expiry remain authoritative node-lease facts. Load is only
+/// used to choose where an unowned cell should try to land; the chosen peer
+/// must still atomically admit the handoff before it acquires ownership.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapacityPeer {
+    pub node: NodeId,
+    pub addr: String,
+    pub expires_ms: u64,
+    pub peer_protocol: u16,
+    pub sampled_ms: u64,
+    pub resident_cells: usize,
+    pub host_websockets: usize,
+    pub rss_bytes: u64,
+    pub pressured: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeLeaseSpec {
+    pub addr: String,
+    pub peer_protocol: u16,
+    pub generation: String,
+    /// The generation named by a clean local reload certificate. An initial
+    /// lease CAS can resume local cells only when it replaces this exact,
+    /// still-live generation.
+    pub resume_generation: Option<String>,
+    pub ttl_ms: u64,
+    pub mode: NodeLeaseMode,
+    pub linger_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NodeLeaseMode {
+    #[default]
+    Continuous,
+    Shadow,
+    Lazy,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeLeaseAuthorityAction {
+    Hold,
+    Renew,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeaseLifecycleShadowSnapshot {
+    pub mode: NodeLeaseMode,
+    pub active_cells: usize,
+    pub serving_cells: usize,
+    pub idle_ms: u64,
+    pub linger_ms: u64,
+    pub lease_active: bool,
+    pub elapsed_since_ok_ms: u64,
+    pub elapsed_since_renew_ms: u64,
+    pub ttl_ms: u64,
+    pub shadow_release_reported: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LeaseLifecycleShadowExpected {
+    pub shadow_release: bool,
+    pub authority_action: NodeLeaseAuthorityAction,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeaseLifecycleShadowDecision {
+    pub sequence: u64,
+    pub observed_at_ms: u64,
+    pub snapshot: LeaseLifecycleShadowSnapshot,
+    pub expected: LeaseLifecycleShadowExpected,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LeaseLifecycleShadowBatch {
+    pub dropped: u64,
+    pub decisions: Vec<LeaseLifecycleShadowDecision>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CasGuard {
+    Absent,
+    Match(String),
+}
+
+/// See [`Config::ownership_on_evict`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OwnershipOnEvict {
+    /// Publish the cell as unowned so any node may take it next.
+    #[default]
+    Release,
+    /// Keep the record, so a same-node wake can reuse the local snapshot.
+    Sticky,
+}
+
+/// Why the node is halting. The shell writes this down: a process that
+/// self-fences and exits without saying why leaves an operator with an exit
+/// code and nothing else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HaltReason {
+    /// The node lease was not renewed inside its TTL, so this node can no
+    /// longer prove it owns anything it is serving.
+    NodeLeaseExpired,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CasOutcome {
+    Applied,
+    Rejected,
+}
+
+/// Observable result of a successful restore effect. A non-fresh activation
+/// may still discover that no local or replicated database exists; the
+/// adapter reports what happened instead of making the core infer I/O truth.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RestoreOutcome {
+    pub restored: bool,
+    /// The alarm the restored database already had armed.
+    ///
+    /// A cell carries its alarm in its own SQLite, so a cell that arrives
+    /// here from another node — or wakes cold — has one the isolate has not
+    /// re-armed yet. Nothing else tells this node about it: the observer
+    /// fires when a *running* isolate calls `setAlarm`, which is exactly the
+    /// case this is not. Without it the mirror reads "no alarm" and every
+    /// residency decision that consults it is wrong in the direction of
+    /// shedding a cell that is about to fire.
+    pub alarm: Option<RestoredAlarm>,
+}
+
+/// See [`RestoreOutcome::alarm`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RestoredAlarm {
+    pub at_ms: i64,
+    /// Whether a durable wake entry already covers it. Read from the same
+    /// flusher the observer consults, not assumed: claiming coverage this
+    /// node cannot prove is how an alarm gets lost across an eviction.
+    pub covered: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LeaseCasOutcome {
+    Applied { etag: String },
+    Rejected,
+}
+
+/// Deterministic timers are versioned effects, not implicit clock reads. A
+/// stale firing from a replaced lease generation is harmless.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Timer {
+    NodeLeaseRenew {
+        generation: u64,
+    },
+    NodeLeaseFence {
+        generation: u64,
+    },
+    CellAlarm {
+        cell: CellId,
+        generation: u64,
+    },
+    /// Fires if `op` is still outstanding. Identified by operation rather than
+    /// by cell, so a completion that lands first simply leaves a stale timer
+    /// that finds nothing to expire.
+    OperationDeadline {
+        op: OpId,
+    },
+}
+
+/// Whether a failed operation definitely did not commit or may have committed
+/// before its caller lost the response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Failure {
+    Definite,
+    Ambiguous,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WebSocketKind {
+    Hibernatable,
+    Regular,
+    /// A transport the cell opened itself with `new WebSocket(url)`. It pins
+    /// its cell exactly as a regular one does -- a live transport cannot move
+    /// with ownership -- but unlike an inbound client socket it is created by
+    /// application code at a rate the application chooses, so how much of the
+    /// node it may hold is budgeted.
+    Outbound,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Event {
+    StartNodeLease {
+        now_ms: u64,
+        spec: NodeLeaseSpec,
+    },
+    SelfNodeLeaseRead {
+        op: OpId,
+        now_ms: u64,
+        now_mono_ms: u64,
+        result: Result<Option<NodeLeaseRecord>, Failure>,
+    },
+    NodeLeaseCasCompleted {
+        op: OpId,
+        now_mono_ms: u64,
+        result: Result<LeaseCasOutcome, Failure>,
+    },
+    /// The executor scanned the local paths after an exact node-generation
+    /// handoff. These cells retain their existing ownership epochs, so the
+    /// core can materialize them without reading or changing each owner.
+    LocalCellsRead {
+        result: Result<Vec<LocalCell>, Failure>,
+    },
+    TimerFired {
+        timer: Timer,
+        now_ms: u64,
+        now_mono_ms: u64,
+    },
+    Request {
+        request: RequestId,
+        cell: CellId,
+    },
+    /// Production form of [`Event::Request`] with the sampled clocks needed
+    /// to acquire an idle lazy node lease. Untimed model slices retain the
+    /// compact variant above and use the state's last observed clocks.
+    RequestAt {
+        request: RequestId,
+        cell: CellId,
+        now_ms: u64,
+        now_mono_ms: u64,
+    },
+    /// A peer selected this node as a possible landing place for an unowned
+    /// cell. Unlike ordinary ingress, this request must refuse immediately if
+    /// its advertised capacity has gone stale; waiting here would strand the
+    /// forwarding node instead of letting it traverse another candidate.
+    CapacityRequestAt {
+        request: RequestId,
+        cell: CellId,
+        now_ms: u64,
+        now_mono_ms: u64,
+    },
+    /// Reserve an idle resident isolate for a top-level Worker request. The
+    /// shell falls back to the stateless pool when no resident is available;
+    /// choosing and pinning a resident is lifecycle policy and therefore
+    /// belongs in the replayable core.
+    WorkerRequest {
+        request: RequestId,
+    },
+    /// Stop cold activation work for a planned same-node replacement while
+    /// leaving published runtimes and ownership intact. Late shell completions
+    /// are stale, so a long restore cannot consume the complete shutdown grace
+    /// and disable the certified local-reload path for every resident cell.
+    BeginPreserve,
+    Cancel {
+        request: RequestId,
+    },
+    ActivityFinished {
+        request: RequestId,
+    },
+    /// A request that ran locally advanced its cell's committed WAL to
+    /// `position`. Its response is withheld — the output gate — until that
+    /// position is replicated, so celld never acknowledges a write it could
+    /// still lose. Read-only requests emit [`Event::ActivityFinished`] instead
+    /// and pay no durability latency. The epoch is not carried: the core reads
+    /// it from the pinned cell's resident phase, which cannot change while the
+    /// request holds it.
+    Wrote {
+        request: RequestId,
+        position: u64,
+    },
+    /// The shell finished proving a gated write durable. `Ok(position)` reports
+    /// the committed-write position the replica has *actually* proved durable;
+    /// the core acknowledges only when it covers the gated write's position, so
+    /// a replicator that proves less than it was asked to cannot force an early
+    /// ack. `Err` failed the proof outright.
+    DurableReached {
+        op: OpId,
+        result: Result<u64, Failure>,
+    },
+    WebSocketOpened {
+        cell: CellId,
+        websocket: WebSocketId,
+        kind: WebSocketKind,
+    },
+    WebSocketClosed {
+        cell: CellId,
+        websocket: WebSocketId,
+    },
+    AlarmObserved {
+        cell: CellId,
+        at_ms: Option<i64>,
+        covered: bool,
+        now_ms: u64,
+        now_mono_ms: u64,
+    },
+    AlarmFinished {
+        op: OpId,
+        now_ms: u64,
+        now_mono_ms: u64,
+        result: Result<(Option<i64>, bool), Failure>,
+    },
+    WakeHint {
+        cell: CellId,
+    },
+    WakeHintAt {
+        cell: CellId,
+        now_ms: u64,
+        now_mono_ms: u64,
+    },
+    OwnerRead {
+        op: OpId,
+        /// Wall-clock observation made when the ownership read completed. It
+        /// bounds reuse of a shared owner-node lease without letting the core
+        /// read a clock itself.
+        now_ms: u64,
+        result: Result<Option<OwnerRecord>, Failure>,
+    },
+    NodeLeaseRead {
+        op: OpId,
+        now_ms: u64,
+        result: Result<Option<NodeLeaseRecord>, Failure>,
+    },
+    CapacityPeersRead {
+        op: OpId,
+        now_ms: u64,
+        result: Result<Vec<CapacityPeer>, Failure>,
+    },
+    OwnerCasCompleted {
+        op: OpId,
+        result: Result<CasOutcome, Failure>,
+    },
+    OwnerReleased {
+        op: OpId,
+        result: Result<CasOutcome, Failure>,
+    },
+    RestoreCompleted {
+        op: OpId,
+        result: Result<RestoreOutcome, Failure>,
+    },
+    RuntimeStarted {
+        op: OpId,
+        result: Result<(), Failure>,
+    },
+    Published {
+        op: OpId,
+        result: Result<(), Failure>,
+    },
+    DurabilityChecked {
+        op: OpId,
+        result: Result<(), Failure>,
+    },
+    RuntimeStopped {
+        op: OpId,
+    },
+    /// Policy input for this first slice. Later eviction selection emits this
+    /// from the same core rather than an external caller choosing a victim.
+    Evict {
+        cell: CellId,
+    },
+    /// A periodic resource sample from the edge.
+    ///
+    /// The core never reads a clock or a proc file; the shell measures and
+    /// hands the numbers over, and every decision that follows -- whether the
+    /// node is overloaded, whether the latch stays hot, how far to shed --
+    /// happens here where a schedule can replay it.
+    LoadSampled {
+        load: pressure::Load,
+        now_mono_ms: u64,
+    },
+    /// Retire an exact cached remote route after a dispatch failure which is
+    /// known not to have executed the request. Newer route generations are
+    /// unaffected by delayed failure reports.
+    InvalidateRemote {
+        cell: CellId,
+        node: NodeId,
+        epoch: Epoch,
+    },
+    NodeFenced,
+    /// The node is shutting down: hand every resident cell to a peer by
+    /// releasing its owner record, so a takeover is immediate rather than
+    /// waiting out the node lease. Unlike an on-demand evict this always
+    /// releases, whatever `ownership_on_evict` is set to. Releases run at
+    /// most `max_releases` at a time, and the pump takes the next resident
+    /// as each one completes -- a cell that is active when the drain begins
+    /// is picked up once its activity finishes.
+    ReleaseAll,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Route {
+    Local,
+    Remote {
+        node: NodeId,
+        addr: String,
+        epoch: Epoch,
+        peer_protocol: u16,
+    },
+}
+
+/// Exact resident isolate reserved for a top-level Worker request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkerRoute {
+    pub cell: CellId,
+    pub epoch: Epoch,
+    /// A pending durability proof made stale by selecting this still-routable
+    /// resident. The executor uses the ID only to release its effect waiter;
+    /// a late completion is ignored by the core's phase check.
+    pub retired_durability: Option<OpId>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestError {
+    NodeUnavailable,
+    ResolveFailed,
+    AcquireFailed,
+    RestoreFailed,
+    RuntimeFailed,
+    PublishFailed,
+    NodeFenced,
+    PeerIncompatible,
+    CapacityExhausted,
+    /// A local write ran but its durability could not be proven, so the
+    /// response must fail rather than falsely acknowledge the write.
+    DurabilityUnproven,
+}
+
+/// Work performed outside the core. Every asynchronous effect is versioned;
+/// completion events with an obsolete `op` are ignored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Effect {
+    ScheduleTimer {
+        timer: Timer,
+        at_mono_ms: u64,
+    },
+    ReadSelfNodeLease {
+        op: OpId,
+    },
+    CasNodeLease {
+        op: OpId,
+        guard: CasGuard,
+        record: NodeLeaseRecord,
+        /// The prior record's peer-visible expiry for a renewal. The shell
+        /// uses it to report how much authority remained when the attempt
+        /// completed. An initial acquisition has no prior authority.
+        authority_expires_ms: Option<u64>,
+    },
+    /// Read the local cell inventory. This is emitted only after the initial
+    /// node lease CAS replaced the exact certified predecessor generation.
+    ReadLocalCells,
+    /// Shadow mode proposed the lazy release but deliberately retained
+    /// authority. The shell only records this decision; it performs no I/O.
+    ObserveNodeLeaseShadowRelease {
+        sequence: u64,
+    },
+    /// Lazy mode stopped renewing its idle node lease. The bucket object is
+    /// intentionally left to expire; this effect is observability only.
+    ObserveNodeLeaseReleased,
+    ReadOwner {
+        op: OpId,
+        cell: CellId,
+    },
+    ReadNodeLease {
+        op: OpId,
+        cell: CellId,
+        owner: NodeId,
+    },
+    /// Enumerate recent node leases and return their advisory load records.
+    /// Listing and bounded parallel reads are adapter mechanics; selection,
+    /// reservations, and exclusions are deterministic core policy.
+    ReadCapacityPeers {
+        op: OpId,
+        cell: CellId,
+    },
+    CasOwner {
+        op: OpId,
+        cell: CellId,
+        guard: CasGuard,
+        epoch: Epoch,
+        takeover: bool,
+    },
+    /// Bring the bucket's wake entry for this cell into line with its alarm.
+    ///
+    /// Emitted wherever the alarm settles, which is the only place that
+    /// knows. An arm needs an entry; a consumed alarm needs its entry gone,
+    /// or every later due scan finds a hint for an alarm that already fired
+    /// and wakes a cell with nothing to do. `next_alarm_ms` is -1 when no
+    /// alarm remains.
+    ReconcileWakeEntry {
+        cell: CellId,
+        next_alarm_ms: i64,
+    },
+    /// Publish an evicted cell as unowned, keeping its epoch, so the next
+    /// node to want it can take it without waiting for this one to notice.
+    ReleaseOwner {
+        op: OpId,
+        cell: CellId,
+        epoch: Epoch,
+    },
+    Restore {
+        op: OpId,
+        cell: CellId,
+        spec: RestoreSpec,
+    },
+    StartRuntime {
+        op: OpId,
+        cell: CellId,
+        epoch: Epoch,
+    },
+    Publish {
+        op: OpId,
+        cell: CellId,
+        epoch: Epoch,
+    },
+    /// Prove that every commit made before this effect is recoverable from
+    /// replica authority. Voluntary eviction cannot begin until this succeeds.
+    EnsureDurable {
+        op: OpId,
+        cell: CellId,
+        epoch: Epoch,
+    },
+    /// The output gate: prove the cell's committed `position` is replicated so
+    /// a withheld local write response can be released. Unlike
+    /// [`Effect::EnsureDurable`] this is per-request and changes no cell phase,
+    /// so the cell keeps serving co-resident requests while one response waits.
+    AwaitDurable {
+        op: OpId,
+        cell: CellId,
+        epoch: Epoch,
+        position: u64,
+    },
+    StopRuntime {
+        op: OpId,
+        cell: CellId,
+        epoch: Epoch,
+        cause: StopCause,
+    },
+    FireAlarm {
+        op: OpId,
+        cell: CellId,
+        epoch: Epoch,
+        scheduled_ms: i64,
+    },
+    Complete {
+        request: RequestId,
+        result: Result<Route, RequestError>,
+    },
+    /// Release a withheld local write response now that its durability is
+    /// decided: `Ok` acknowledges the write, `Err` fails it. Emitted only for a
+    /// request the shell held open via [`Event::Wrote`].
+    ReleaseResponse {
+        request: RequestId,
+        result: Result<(), RequestError>,
+    },
+    /// Complete the synchronous resident-selection decision. `None` means
+    /// the executor must use the ordinary stateless Worker pool.
+    CompleteWorker {
+        request: RequestId,
+        route: Option<WorkerRoute>,
+    },
+    /// Refuse a transport the node cannot afford to hold. The shell closes it;
+    /// the cell carries on without it.
+    CloseWebSocket {
+        cell: CellId,
+        websocket: WebSocketId,
+    },
+    Halt {
+        code: i32,
+        reason: HaltReason,
+    },
+}
+
+/// One database encoded by the local cell path.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LocalCell {
+    pub id: CellId,
+    pub epoch: Epoch,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StopCause {
+    Cleanup,
+    /// `rebalance` means this eviction hands the cell to the fleet: its
+    /// ownership record is released and the local replica is not worth
+    /// keeping. An idle eviction is the opposite on both counts -- it
+    /// keeps the record so the next activation here renames the file into
+    /// place instead of paying a full remote restore.
+    Evict {
+        rebalance: bool,
+    },
+    Fence,
+    /// A durability proof came back negative, so this runtime's memory and its
+    /// local database may hold writes the bucket does not. celld has just told
+    /// the caller those writes failed; continuing to serve them is the
+    /// divergence, not the failure. Stop, keep no local snapshot, and let the
+    /// next activation restore from the bucket.
+    Reset,
+}

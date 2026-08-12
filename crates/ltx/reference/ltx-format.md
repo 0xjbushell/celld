@@ -1,8 +1,8 @@
 # LTX file format (Version 3) — byte layout
 
-Derived by reading `reference/ltx-go` @ v0.5.1 (`ltx.go`, `checksum.go`,
-`encoder.go`, `decoder.go`). This is the spec `src/ltx.rs` (T2) implements.
-All multi-byte integers are **big-endian**. (Produced in T2; not a vendored file.)
+Derived from `superfly/ltx` v0.5.2 (`ltx.go`, `checksum.go`, `encoder.go`, and
+`decoder.go`). The implementation is in `src/ltx.rs`. All multi-byte integers
+are **big-endian**.
 
 ## File structure
 
@@ -10,7 +10,7 @@ All multi-byte integers are **big-endian**. (Produced in T2; not a vendored file
 +----------------------+
 | Header   (100 bytes) |
 +----------------------+
-| Page 0               |   PageHeader(6) + LZ4-frame(page data)
+| Page 0               |   PageHeader(6) + Size(4) + LZ4-block(page data)
 | Page 1               |
 | ...                  |
 +----------------------+
@@ -46,19 +46,27 @@ All multi-byte integers are **big-endian**. (Produced in T2; not a vendored file
 
 ## Page block
 
-Each page: `PageHeader` then the page data as **one independent LZ4 frame**
-(pierrec/lz4 v4, 64 KiB block, "Fast" level). The block ends with an **empty
-PageHeader** (`pgno == 0`).
+Each v0.5.2 page contains a `PageHeader`, a four-byte compressed size, and one
+independent raw LZ4 block. The writer uses the fast compressor from
+`pierrec/lz4` v4.1.23. The block ends with an **empty PageHeader**
+(`pgno == 0`).
 
-**PageHeader (6 bytes):** `Pgno (u32 @0)`, `Flags (u16 @4)` (must be 0).
+**PageHeader (6 bytes):** `Pgno (u32 @0)`, `Flags (u16 @4)`. The
+`PageHeaderFlagSize` bit (`1<<0`) marks the size-prefixed block representation.
+No other flag is valid.
+
+Files written through LTX v0.5.1 have a zero page flag and one independent LZ4
+frame after each page header. A v0.5.2 decoder accepts both representations,
+so existing Litestream objects remain readable.
 
 ## Page index
 
 After the empty page header, for each page in ascending pgno order:
 `uvarint(pgno) ++ uvarint(offset) ++ uvarint(size)` where `offset` is the page's
-byte offset from file start and `size = 6 + len(compressed page data)`. Terminated
-by `uvarint(0)`, then a `u64` big-endian giving the byte length of the index
-region (elements + terminator, **excluding** this size field).
+byte offset from the file start. A v0.5.2 page uses
+`size = 6 + 4 + len(compressed page data)`. A legacy page omits the four-byte
+size. The index ends with `uvarint(0)` and a big-endian `u64` index length. The
+length includes the elements and terminator, but it excludes its own field.
 
 ## Trailer (16 bytes)
 
@@ -73,11 +81,12 @@ region (elements + terminator, **excluding** this size field).
 - Rolling DB checksum (post-apply): start `ChecksumFlag`, then for each non-lock
   page `chksum = ChecksumFlag | (chksum ^ ChecksumPage(pgno, data))`. Verified
   against the trailer's PostApplyChecksum **only for snapshots**.
-- **FileChecksum** = `ChecksumFlag | CRC64(feed)` where `feed` is, in write order:
-  `header(100)` ++ for each page `[ pageheader(6) ++ DECOMPRESSED data ]` ++
-  `empty pageheader(6)` ++ `page index region (incl. u64 size field)` ++
-  `trailer[0..8]` (PostApplyChecksum). The page **data is fed uncompressed**, so a
-  decoder must decompress and re-feed — it cannot hash the raw file bytes.
+- **FileChecksum** = `ChecksumFlag | CRC64(feed)`. The v0.5.2 feed contains the
+  header and each page header. It also contains each compressed-size field and
+  the corresponding uncompressed page data. It then contains the empty page
+  header, the page index with its size field, and the post-apply checksum. The
+  compressed page bytes are not part of the feed. A legacy feed omits each
+  compressed-size field.
 
 ## Filename
 

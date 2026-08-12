@@ -6,11 +6,8 @@
 //!
 //! # DECISION: buffered I/O for the KEEP scope
 //! Go's `ReplicaClient` uses `io.Reader`/`io.ReadCloser`. We take/return owned
-//! byte buffers (`&[u8]` / `Vec<u8>`) instead. The `(offset, size)` parameters on
-//! `open_ltx_file` preserve the partial-read capability the restore path relies
-//! on (fetching just the page-index tail), so this is a buffering choice, not a
-//! capability loss. L0 files are bounded in size; streaming large snapshots is a
-//! noted follow-on (logged in OPEN_QUESTIONS).
+//! byte buffers (`&[u8]` / `Vec<u8>`) instead. L0 files are bounded in size;
+//! streaming large snapshots is a noted follow-on (logged in OPEN_QUESTIONS).
 
 use crate::error::Result;
 use crate::ltx::{self, FileInfo, Header, HEADER_FLAG_NO_CHECKSUM, VERSION};
@@ -26,30 +23,29 @@ pub mod object_store;
 /// take a compaction `level` (0 = L0, the only level in the one-shot scope).
 #[async_trait]
 pub trait ReplicaClient: Send + Sync {
-    /// The backend type string (e.g. `"file"`, `"s3"`).
-    fn type_name(&self) -> &str;
-
-    /// Initializes the client (idempotent; default no-op).
-    async fn init(&self) -> Result<()> {
-        Ok(())
-    }
-
     /// Returns all LTX files for `level`, sorted ascending by `min_txid`, that
-    /// start at or after `seek`. `use_metadata=true` requests accurate header
-    /// timestamps (for timestamp-based restore) rather than fast listing times.
-    async fn ltx_files(&self, level: i32, seek: TXID, use_metadata: bool) -> Result<Vec<FileInfo>>;
+    /// start at or after `seek`.
+    async fn ltx_files(&self, level: i32, seek: TXID) -> Result<Vec<FileInfo>>;
 
-    /// Reads `size` bytes of an LTX file starting at `offset`. `size == 0` means
-    /// read to end of file. Returns an `io::ErrorKind::NotFound` error (wrapped)
-    /// if the file does not exist.
-    async fn open_ltx_file(
+    /// Returns at most `limit` LTX files at or after `seek`.
+    ///
+    /// Remote clients can stop their object listing after they collect the
+    /// requested prefix. The default keeps compatibility with local and test
+    /// clients.
+    async fn ltx_files_bounded(
         &self,
         level: i32,
-        min_txid: TXID,
-        max_txid: TXID,
-        offset: i64,
-        size: i64,
-    ) -> Result<Vec<u8>>;
+        seek: TXID,
+        limit: usize,
+    ) -> Result<Vec<FileInfo>> {
+        let mut files = self.ltx_files(level, seek).await?;
+        files.truncate(limit);
+        Ok(files)
+    }
+
+    /// Reads an LTX file. Returns an `io::ErrorKind::NotFound` error (wrapped)
+    /// if the file does not exist.
+    async fn open_ltx_file(&self, level: i32, min_txid: TXID, max_txid: TXID) -> Result<Vec<u8>>;
 
     /// Writes an LTX file to the replica and returns its metadata.
     async fn write_ltx_file(
@@ -92,18 +88,15 @@ pub fn make_test_ltx_file(min_txid: TXID, max_txid: TXID, seed: u8) -> Vec<u8> {
 }
 
 /// Generic conformance suite every `ReplicaClient` backend must pass: empty
-/// state, write, listing order, seek filtering, full + partial reads, not-found,
-/// and deletion. Call from an async test; panics with a descriptive message on
+/// state, write, listing order, seek filtering, reads, not-found, and deletion.
+/// Call from an async test; panics with a descriptive message on
 /// the first violation.
 ///
 /// Ported from the shared `TestReplicaClient_*` behaviors in replica_client_test.go.
 pub async fn run_client_suite<C: ReplicaClient>(client: &C) {
     // 1. Starts empty.
     client.delete_all().await.expect("delete_all");
-    let files = client
-        .ltx_files(0, TXID(0), false)
-        .await
-        .expect("list empty");
+    let files = client.ltx_files(0, TXID(0)).await.expect("list empty");
     assert!(files.is_empty(), "replica should start empty");
 
     // 2. Write a snapshot (txid 1) plus four incremental L0 files.
@@ -122,7 +115,7 @@ pub async fn run_client_suite<C: ReplicaClient>(client: &C) {
 
     // 3. Listing returns all files, ascending by min txid (the brief's sort
     //    invariant — must hold regardless of backend listing order).
-    let listed = client.ltx_files(0, TXID(0), false).await.expect("list all");
+    let listed = client.ltx_files(0, TXID(0)).await.expect("list all");
     assert_eq!(listed.len(), 5, "all files listed");
     let order: Vec<u64> = listed.iter().map(|f| f.min_txid.0).collect();
     assert_eq!(
@@ -132,64 +125,47 @@ pub async fn run_client_suite<C: ReplicaClient>(client: &C) {
     );
 
     // 4. Seek filters to files starting at or after the given txid.
-    let seeked = client
-        .ltx_files(0, TXID(3), false)
-        .await
-        .expect("seek list");
+    let seeked = client.ltx_files(0, TXID(3)).await.expect("seek list");
     let order: Vec<u64> = seeked.iter().map(|f| f.min_txid.0).collect();
     assert_eq!(order, vec![3, 4, 5], "seek=3 yields txids >= 3");
+
+    let bounded = client
+        .ltx_files_bounded(0, TXID(2), 2)
+        .await
+        .expect("bounded list");
+    let order: Vec<u64> = bounded.iter().map(|f| f.min_txid.0).collect();
+    assert_eq!(order, vec![2, 3], "bounded listing stops at its limit");
 
     // 5. Full read returns the exact written bytes, which still decode + verify.
     for (info, data) in &written {
         let got = client
-            .open_ltx_file(0, info.min_txid, info.max_txid, 0, 0)
+            .open_ltx_file(0, info.min_txid, info.max_txid)
             .await
             .expect("full read");
         assert_eq!(&got, data, "full read matches written bytes");
         ltx::decode_file(&got).expect("round-tripped file still verifies");
     }
 
-    // 6. Partial reads: an explicit (offset,size) window, and size==0 → to EOF.
-    let (info, data) = &written[0];
-    let mid = client
-        .open_ltx_file(0, info.min_txid, info.max_txid, 4, 10)
-        .await
-        .expect("partial read");
-    assert_eq!(mid.as_slice(), &data[4..14], "offset+size window");
-    let tail_off = (data.len() - 16) as i64;
-    let tail = client
-        .open_ltx_file(0, info.min_txid, info.max_txid, tail_off, 0)
-        .await
-        .expect("tail read");
-    assert_eq!(
-        tail.as_slice(),
-        &data[data.len() - 16..],
-        "size==0 reads to EOF"
-    );
-
-    // 7. Opening a missing file is an error.
-    let missing = client.open_ltx_file(0, TXID(99), TXID(99), 0, 0).await;
+    // 6. Opening a missing file is an error.
+    let missing = client.open_ltx_file(0, TXID(99), TXID(99)).await;
     assert!(missing.is_err(), "missing file must error");
 
-    // 8. Deleting a subset removes exactly those files.
+    // 7. Deleting a subset removes exactly those files.
     let to_delete: Vec<FileInfo> = listed.iter().take(2).cloned().collect();
     client
         .delete_ltx_files(&to_delete)
         .await
         .expect("delete subset");
     let after = client
-        .ltx_files(0, TXID(0), false)
+        .ltx_files(0, TXID(0))
         .await
         .expect("list after delete");
     assert_eq!(after.len(), 3, "two files deleted");
     let order: Vec<u64> = after.iter().map(|f| f.min_txid.0).collect();
     assert_eq!(order, vec![3, 4, 5], "the first two were removed");
 
-    // 9. delete_all clears everything.
+    // 8. delete_all clears everything.
     client.delete_all().await.expect("delete_all");
-    let empty = client
-        .ltx_files(0, TXID(0), false)
-        .await
-        .expect("list empty");
+    let empty = client.ltx_files(0, TXID(0)).await.expect("list empty");
     assert!(empty.is_empty(), "delete_all clears the replica");
 }

@@ -9,7 +9,10 @@
 //! gate can prove a fresh cell durable with no cold-start window.
 //!
 //! The object layout is `cells/<cell>/ltx/e<epoch>/` in the bucket, mirroring
-//! the local `<watch>/<cell>/ltx/e<epoch>/db.sqlite` tree.
+//! the local `<watch>/<cell>/ltx/e<epoch>/db.sqlite` tree. This backend builds
+//! its own object-store clients rather than going through `bucket::Bucket`, so
+//! it carries the fleet's key prefix itself: without that, two fleets sharing
+//! one bucket would replicate over each other.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -19,16 +22,20 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::Weak;
 use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::anyhow;
 use celld_ltx::object_store::ObjectStore;
 use celld_ltx::replica;
+use celld_ltx::replica_compactor::ReplicaCompactor;
 use celld_ltx::Db;
 use celld_ltx::ObjectStoreClient;
 use celld_ltx::ObjectStoreConfig;
 use celld_ltx::Replica;
 use celld_ltx::TXID;
+use tokio::sync::mpsc;
 use tokio::sync::Notify;
 use tokio::sync::Semaphore;
 use tracing::info;
@@ -46,6 +53,45 @@ use crate::replication::SyncWait;
 /// and in-flight object-store requests under high write fan-out.
 const SYNC_CONCURRENCY: usize = 64;
 
+/// Max LTX object downloads across every restore on this node. A hot cell can
+/// contain thousands of L0 files, so serial reads turn a takeover into minutes
+/// of terminal failures. This shared ceiling hides round-trip latency without
+/// multiplying the bound by the activation count.
+const RESTORE_DOWNLOAD_CONCURRENCY: usize = 64;
+
+/// One attempt consumes at most this many source objects. This bound keeps a
+/// first compaction of an old, write-hot cell from reading its complete L0
+/// history into memory.
+const COMPACTION_MAX_FILES: usize = 256;
+
+/// The current `ReplicaClient` interface buffers objects, so bound the complete
+/// input set until the client gains a streaming read and write surface.
+const COMPACTION_MAX_INPUT_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy)]
+struct CompactionConfig {
+    min_txids: u64,
+    concurrency: usize,
+}
+
+struct CellCompaction {
+    cell: String,
+    epoch: u64,
+    client: ObjectStoreClient,
+    local_path: PathBuf,
+    queue: mpsc::UnboundedSender<CompactionWork>,
+    min_txids: u64,
+    compacted_txid: AtomicU64,
+    queued: AtomicBool,
+    cancelled: AtomicBool,
+    cancel: Notify,
+}
+
+struct CompactionWork {
+    cell: Weak<Cell>,
+    queued_at: Instant,
+}
+
 /// One resident cell's replication state: the `celld_ltx::Db` shadowing its WAL
 /// (behind a `std::sync::Mutex` because the `rusqlite` handle is `!Sync` and
 /// must never cross an `.await`, so every capture+upload runs inside a
@@ -59,11 +105,13 @@ struct Cell {
     replica: Mutex<Replica<ObjectStoreClient>>,
     req_seq: AtomicU64,
     synced_seq: AtomicU64,
+    durable_txid: AtomicU64,
     /// Set while a sync for this cell is in flight, so the loop never runs two
     /// at once for one cell (they would serialize on the mutex and waste work).
     syncing: AtomicBool,
     /// Notified when `synced_seq` advances (or a sync fails), waking waiters.
     ready: Notify,
+    compaction: Option<CellCompaction>,
 }
 type CellHandle = Arc<Cell>;
 
@@ -71,6 +119,8 @@ pub struct LtxRepl {
     /// Local root: cell dbs live at `watch/<cell>/ltx/e<epoch>/db.sqlite`.
     watch: PathBuf,
     bucket: String,
+    /// The bucket spec's key prefix: empty, or slash-terminated.
+    prefix: String,
     endpoint: Option<String>,
     region: String,
     credentials: Option<StorageCredentials>,
@@ -80,34 +130,111 @@ pub struct LtxRepl {
     /// Woken when a cell's `committed` advances, so the background loop syncs
     /// without polling; a slow tick backstops any missed notification.
     dirty: Arc<Notify>,
+    /// Shared by every activation, so the restore bound is per node, not per
+    /// cell. The generic LTX restore keeps its sequential compatibility path.
+    restore_slots: Arc<Semaphore>,
+    compaction_queue: Option<mpsc::UnboundedSender<CompactionWork>>,
+    compaction_min_txids: u64,
 }
 
 impl LtxRepl {
-    pub fn start(
+    /// Private-corpus constructor over an injected store, so the epoch-seal
+    /// protocol runs against an in-memory bucket instead of S3.
+    #[cfg(all(test, celld_internal_tests))]
+    pub fn start_with_store_for_test(watch: &Path, store: Arc<dyn ObjectStore>) -> Self {
+        let cells: Arc<Mutex<HashMap<(String, u64), CellHandle>>> = Arc::default();
+        let dirty = Arc::new(Notify::new());
+        let slots = Arc::new(Semaphore::new(SYNC_CONCURRENCY));
+        tokio::spawn(sync_loop(cells.clone(), dirty.clone(), slots));
+        Self {
+            watch: watch.to_path_buf(),
+            bucket: "test".into(),
+            prefix: String::new(),
+            endpoint: None,
+            region: "auto".into(),
+            credentials: None,
+            store,
+            cells,
+            dirty,
+            restore_slots: Arc::new(Semaphore::new(RESTORE_DOWNLOAD_CONCURRENCY)),
+            compaction_queue: None,
+            compaction_min_txids: 0,
+        }
+    }
+
+    /// Private-corpus constructor with additive L1 compaction enabled.
+    #[cfg(all(test, celld_internal_tests))]
+    pub fn start_with_compaction_for_test(
         watch: &Path,
+        store: Arc<dyn ObjectStore>,
+        min_txids: u64,
+        concurrency: usize,
+    ) -> Self {
+        let cells: Arc<Mutex<HashMap<(String, u64), CellHandle>>> = Arc::default();
+        let dirty = Arc::new(Notify::new());
+        let sync_slots = Arc::new(Semaphore::new(SYNC_CONCURRENCY));
+        tokio::spawn(sync_loop(cells.clone(), dirty.clone(), sync_slots));
+        let config = CompactionConfig {
+            min_txids,
+            concurrency,
+        };
+        let queue = start_compaction_loop(config);
+        Self {
+            watch: watch.to_path_buf(),
+            bucket: "test".into(),
+            prefix: String::new(),
+            endpoint: None,
+            region: "auto".into(),
+            credentials: None,
+            store,
+            cells,
+            dirty,
+            restore_slots: Arc::new(Semaphore::new(RESTORE_DOWNLOAD_CONCURRENCY)),
+            compaction_queue: Some(queue),
+            compaction_min_txids: min_txids,
+        }
+    }
+
+    pub(crate) fn start(
+        watch: &Path,
+        backend: crate::bucket::StorageBackend,
         bucket: String,
+        prefix: String,
         endpoint: Option<String>,
         region: String,
         credentials: Option<StorageCredentials>,
     ) -> anyhow::Result<Self> {
-        let store = node_config(&bucket, endpoint.as_deref(), &region, credentials.as_ref())
-            .build_store()
-            .map_err(|error| anyhow!("build shared object store: {error}"))?;
+        let compaction = compaction_config_from_env()?;
+        // Everything downstream of the store is backend-agnostic already,
+        // so the dialect decides construction and nothing else.
+        let store = match backend {
+            crate::bucket::StorageBackend::Gcs => crate::bucket::gcs_replica_store(&bucket)?,
+            crate::bucket::StorageBackend::S3 => {
+                node_config(&bucket, endpoint.as_deref(), &region, credentials.as_ref())
+                    .build_store()
+                    .map_err(|error| anyhow!("build shared object store: {error}"))?
+            }
+        };
         let cells: Arc<Mutex<HashMap<(String, u64), CellHandle>>> = Arc::default();
         let dirty = Arc::new(Notify::new());
         // Bound how many cells upload at once so one slow cell cannot stall the
         // others and a thousand hot cells cannot open a thousand uploads.
         let slots = Arc::new(Semaphore::new(SYNC_CONCURRENCY));
         tokio::spawn(sync_loop(cells.clone(), dirty.clone(), slots));
+        let compaction_queue = compaction.map(start_compaction_loop);
         Ok(Self {
             watch: watch.to_path_buf(),
             bucket,
+            prefix,
             endpoint,
             region,
             credentials,
             store,
             cells,
             dirty,
+            restore_slots: Arc::new(Semaphore::new(RESTORE_DOWNLOAD_CONCURRENCY)),
+            compaction_queue,
+            compaction_min_txids: compaction.map_or(0, |config| config.min_txids),
         })
     }
 
@@ -129,7 +256,7 @@ impl LtxRepl {
             &self.region,
             self.credentials.as_ref(),
         );
-        config.path = format!("cells/{cell}/ltx/e{epoch}");
+        config.path = format!("{}cells/{cell}/ltx/e{epoch}", self.prefix);
         ObjectStoreClient::with_store(config, self.store.clone())
     }
 
@@ -137,7 +264,7 @@ impl LtxRepl {
     /// durable copy to restore on takeover.
     async fn highest_nonempty_epoch(&self, cell: &str) -> anyhow::Result<Option<u64>> {
         use celld_ltx::object_store::path::Path as ObjPath;
-        let base = ObjPath::from(format!("cells/{cell}/ltx"));
+        let base = ObjPath::from(format!("{}cells/{cell}/ltx", self.prefix));
         let listing = self.store.list_with_delimiter(Some(&base)).await?;
         let mut best: Option<u64> = None;
         for prefix in listing.common_prefixes {
@@ -152,8 +279,105 @@ impl LtxRepl {
         Ok(best)
     }
 
+    /// The seal for a restore-source epoch: a file *beside* the epoch
+    /// directories (`cells/<cell>/ltx/e<from>.seal.json`), so nothing that
+    /// lists an epoch's LTX contents parses it, and `highest_nonempty_epoch`'s
+    /// prefix listing never mistakes it for an epoch.
+    fn seal_key(&self, cell: &str, epoch: u64) -> String {
+        format!("{}cells/{cell}/ltx/e{epoch}.seal.json", self.prefix)
+    }
+
+    /// Read the source epoch's seal, writing it first if this activation is
+    /// the first to restore from `from` (Cellarium §5.6, tracker item 1 in
+    /// wiki/designs/coordination-hardening.md).
+    ///
+    /// Restore's rule is "highest non-empty epoch", so if a takeover's new
+    /// epoch stays empty (it dies before its first sync) while the fenced old
+    /// owner keeps uploading into the old prefix — its PUTs are unconditional
+    /// and the bucket checks nothing — the *next* activation restores the old prefix
+    /// again, now including the zombie's tail: writes no client was ever
+    /// acknowledged (the ownership re-read refuses the zombie's acks), and
+    /// possibly writes a client was told had definitively failed, resurrect.
+    ///
+    /// The seal closes this by fixing, before the first restore reads a byte,
+    /// the TXID every restore of this epoch may read through. Ordering makes
+    /// it safe for acknowledged writes: an ack requires the ownership record
+    /// to still name the writer, the takeover's record CAS precedes this seal,
+    /// and the acked write's upload preceded its ownership read — so every
+    /// acked write is at or below the sealed TXID. Conversely a fenced owner's
+    /// later uploads land above the seal and are never restored again.
+    /// First-writer-wins (conditional create) keeps every later restorer on
+    /// the same cut. A seal-write failure fails the activation: restoring an
+    /// unsealed prefix reopens the hole.
+    async fn read_or_seal(
+        &self,
+        cell: &str,
+        from: u64,
+        by_epoch: u64,
+        client: &ObjectStoreClient,
+    ) -> anyhow::Result<u64> {
+        use celld_ltx::object_store::path::Path as ObjPath;
+        use celld_ltx::object_store::PutMode;
+        use celld_ltx::object_store::PutOptions;
+        use celld_ltx::object_store::PutPayload;
+
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct EpochSeal {
+            max_txid: u64,
+            sealed_by_epoch: u64,
+        }
+
+        let key = ObjPath::from(self.seal_key(cell, from));
+        let existing = |bytes: Vec<u8>| -> anyhow::Result<u64> {
+            let seal: EpochSeal = serde_json::from_slice(&bytes)?;
+            Ok(seal.max_txid)
+        };
+        match self.store.get(&key).await {
+            Ok(get) => return existing(get.bytes().await?.to_vec()),
+            Err(celld_ltx::object_store::Error::NotFound { .. }) => {}
+            Err(error) => return Err(anyhow!("read seal for {cell} e{from}: {error}")),
+        }
+        let plan = replica::calc_restore_plan(client, TXID(0))
+            .await
+            .map_err(|error| anyhow!("plan seal for {cell} e{from}: {error}"))?;
+        let cap = plan
+            .iter()
+            .map(|info| info.max_txid.0)
+            .max()
+            .ok_or_else(|| anyhow!("seal target {cell} e{from} is empty"))?;
+        let seal = EpochSeal {
+            max_txid: cap,
+            sealed_by_epoch: by_epoch,
+        };
+        let put = PutOptions {
+            mode: PutMode::Create,
+            ..Default::default()
+        };
+        match self
+            .store
+            .put_opts(&key, PutPayload::from(serde_json::to_vec(&seal)?), put)
+            .await
+        {
+            Ok(_) => {
+                info!(cell, from, to = by_epoch, cap, "sealed restore source");
+                Ok(cap)
+            }
+            Err(celld_ltx::object_store::Error::AlreadyExists { .. }) => {
+                // A racing claimant sealed first; its cut is the one every
+                // restore must share.
+                let get = self
+                    .store
+                    .get(&key)
+                    .await
+                    .map_err(|error| anyhow!("reread seal for {cell} e{from}: {error}"))?;
+                existing(get.bytes().await?.to_vec())
+            }
+            Err(error) => Err(anyhow!("seal {cell} e{from}: {error}")),
+        }
+    }
+
     /// Does the bucket hold any LTX for this cell at this epoch? The fail-closed
-    /// hibernation gate: never delete the last local copy of state the bucket
+    /// eviction gate: never delete the last local copy of state the bucket
     /// cannot restore.
     pub async fn epoch_replicated(&self, cell: &str, epoch: u64) -> bool {
         let client = self.client_for(cell, epoch);
@@ -172,41 +396,79 @@ impl LtxRepl {
             epoch,
             fresh,
             took_over,
+            resume_local,
         } = options;
         let dst = self.db_path(cell, epoch);
         std::fs::create_dir_all(dst.parent().unwrap())?;
 
-        // Reuse a preserved local hibernation snapshot when it is safe to: the
+        // Reuse a preserved local eviction snapshot when it is safe to: the
         // same epoch always, the previous epoch only when we did not take the
         // cell from another node.
-        let same_epoch = dst.with_extension("hibernated");
+        // `.evicted` is the current name; `.hibernated` is what releases
+        // before 2026-08-05 wrote. Accept both, so an upgrade reuses the
+        // snapshots already on disk instead of restoring every cell from the
+        // bucket. Writes always use the new name, so the old one dies out.
+        let legacy = |path: &PathBuf| path.with_extension("hibernated");
+        let same_epoch = dst.with_extension("evicted");
         let previous = celld_logic::restore::previous_epoch_reusable(epoch, took_over)
-            .then(|| self.db_path(cell, epoch - 1).with_extension("hibernated"));
+            .then(|| self.db_path(cell, epoch - 1).with_extension("evicted"));
         let is_file = |path: &PathBuf| path.is_file();
-        let local_hibernated = (!fresh)
-            .then(|| {
-                if is_file(&same_epoch) {
-                    Some(same_epoch.clone())
-                } else {
-                    previous.filter(is_file)
-                }
-            })
+        let first_present = |path: PathBuf| {
+            if path.is_file() {
+                Some(path)
+            } else {
+                Some(legacy(&path)).filter(is_file)
+            }
+        };
+        let local_snapshot = (!fresh && !resume_local)
+            .then(|| first_present(same_epoch.clone()).or_else(|| previous.and_then(first_present)))
             .flatten();
 
-        let mut restored = false;
-        if let Some(hibernated) = local_hibernated {
-            std::fs::rename(&hibernated, &dst)?;
-            info!(cell, epoch, "reused local hibernation snapshot");
+        let mut restored = resume_local;
+        if resume_local {
+            anyhow::ensure!(
+                dst.is_file(),
+                "clean reload database is missing: {}",
+                dst.display()
+            );
+            info!(cell, epoch, "resumed clean local replica");
+        } else if let Some(snapshot) = local_snapshot {
+            std::fs::rename(&snapshot, &dst)?;
+            info!(cell, epoch, "reused local eviction snapshot");
             restored = true;
         } else if !fresh {
-            // Restore the newest durable epoch into this epoch's path.
+            // Restore the newest durable epoch into this epoch's path — up to
+            // its seal, never past it. Sealing before reading fixes the cut
+            // every later restore of this prefix shares, so a fenced owner's
+            // late uploads into it can never resurrect (see `read_or_seal`).
             if let Some(from) = self.highest_nonempty_epoch(cell).await? {
                 let client = self.client_for(cell, from);
+                let cap = self.read_or_seal(cell, from, epoch, &client).await?;
                 let _ = std::fs::remove_file(&dst);
-                replica::restore(&client, &dst, TXID(0))
-                    .await
-                    .map_err(|error| anyhow!("restore {cell} e{from}: {error}"))?;
-                info!(cell, from, to = epoch, "restored remote replica");
+                let stats = replica::restore_with_download_slots(
+                    &client,
+                    &dst,
+                    TXID(cap),
+                    self.restore_slots.clone(),
+                )
+                .await
+                .map_err(|error| anyhow!("restore {cell} e{from}@{cap}: {error}"))?;
+                let levels = stats
+                    .by_level
+                    .iter()
+                    .map(|(level, count)| format!("L{level}:{count}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                info!(
+                    event = "restore_plan",
+                    cell,
+                    epoch = from,
+                    objects = stats.objects,
+                    bytes = stats.bytes,
+                    %levels,
+                    "computed restore plan"
+                );
+                info!(cell, from, to = epoch, cap, "restored remote replica");
                 restored = true;
             }
         }
@@ -231,16 +493,33 @@ impl LtxRepl {
         if let Some(pos) = seed {
             replica.seed_pos(pos);
         }
-        self.cells.lock().unwrap().insert(
-            (cell.to_string(), epoch),
-            Arc::new(Cell {
-                replica: Mutex::new(replica),
-                req_seq: AtomicU64::new(0),
-                synced_seq: AtomicU64::new(0),
-                syncing: AtomicBool::new(false),
-                ready: Notify::new(),
+        let handle = Arc::new(Cell {
+            replica: Mutex::new(replica),
+            req_seq: AtomicU64::new(0),
+            synced_seq: AtomicU64::new(0),
+            durable_txid: AtomicU64::new(seed.map_or(0, |pos| pos.txid.0)),
+            syncing: AtomicBool::new(false),
+            ready: Notify::new(),
+            compaction: self.compaction_queue.as_ref().map(|queue| CellCompaction {
+                cell: cell.to_string(),
+                epoch,
+                client: self.client_for(cell, epoch),
+                local_path: Db::meta_path_for_path(&dst),
+                queue: queue.clone(),
+                min_txids: self.compaction_min_txids,
+                compacted_txid: AtomicU64::new(0),
+                queued: AtomicBool::new(false),
+                cancelled: AtomicBool::new(false),
+                cancel: Notify::new(),
             }),
-        );
+        });
+        self.cells
+            .lock()
+            .unwrap()
+            .insert((cell.to_string(), epoch), handle.clone());
+        if let Some(pos) = seed {
+            maybe_queue_compaction(&handle, pos.txid.0);
+        }
 
         Ok(ActivationResult {
             path: dst,
@@ -287,7 +566,7 @@ impl LtxRepl {
         }
     }
 
-    /// A direct, synchronous durability pass for the rare hibernation/eviction
+    /// A direct, synchronous durability pass for the rare eviction
     /// gates (not the hot write path). Also advances the cell's durable position
     /// so any output-gate waiters ride it.
     pub async fn sync_wait(&self, cell: &str, epoch: u64, _timeout: Duration) -> SyncWait {
@@ -307,17 +586,21 @@ impl LtxRepl {
         }
     }
 
-    pub async fn hibernate(&self, cell: &str, epoch: u64, preserve_local: bool) {
+    pub async fn evict(&self, cell: &str, epoch: u64, preserve_local: bool) {
         // A final durability pass so no acknowledged write is stranded, then
         // drop the managed Db (releasing the WAL) before touching the file.
         let _ = self.sync_wait(cell, epoch, Duration::from_secs(10)).await;
-        self.cells
+        let removed = self
+            .cells
             .lock()
             .unwrap()
             .remove(&(cell.to_string(), epoch));
+        if let Some(handle) = removed {
+            cancel_compaction(&handle);
+        }
         let db = self.db_path(cell, epoch);
         if preserve_local {
-            let preserved = db.with_extension("hibernated");
+            let preserved = db.with_extension("evicted");
             if let Err(error) = std::fs::rename(&db, &preserved) {
                 warn!(cell, epoch, %error, "preserve local snapshot failed");
             }
@@ -363,14 +646,111 @@ impl LtxRepl {
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory)?;
         let path = directory.join("db.sqlite");
-        replica::restore(&self.client_for(cell, epoch), &path, TXID(0))
-            .await
-            .map_err(|error| anyhow!("restore snapshot {cell} e{epoch}: {error}"))?;
+        replica::restore_with_download_slots(
+            &self.client_for(cell, epoch),
+            &path,
+            TXID(0),
+            self.restore_slots.clone(),
+        )
+        .await
+        .map_err(|error| anyhow!("restore snapshot {cell} e{epoch}: {error}"))?;
         Ok(Some(RestoredSnapshot::new(epoch, path, directory)))
     }
 
     pub fn prune_local_cache(&self, max_bytes: u64) -> (usize, usize, u64) {
         prune_watch(&self.watch, max_bytes)
+    }
+
+    /// Close the replicator handle while retaining the live database and WAL
+    /// exactly where the local path encodes them.
+    pub fn close_for_reload(&self, cell: &str, epoch: u64) -> anyhow::Result<()> {
+        let removed = self
+            .cells
+            .lock()
+            .unwrap()
+            .remove(&(cell.to_string(), epoch));
+        if let Some(handle) = removed {
+            cancel_compaction(&handle);
+        }
+        let path = self.db_path(cell, epoch);
+        anyhow::ensure!(
+            path.is_file(),
+            "resident database is missing: {}",
+            path.display()
+        );
+        Ok(())
+    }
+
+    /// Enumerate live-named databases. Cached `.evicted` files are separate
+    /// and remain under the ordinary cache byte limit.
+    pub fn local_cells(&self) -> Vec<celld_logic::LocalCell> {
+        let mut cells = Vec::new();
+        let Ok(cell_dirs) = std::fs::read_dir(&self.watch) else {
+            return cells;
+        };
+        for cell_dir in cell_dirs.flatten() {
+            let Ok(kind) = cell_dir.file_type() else {
+                continue;
+            };
+            if !kind.is_dir() {
+                continue;
+            }
+            let Some(cell) = cell_dir.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Ok(epochs) = std::fs::read_dir(cell_dir.path().join("ltx")) else {
+                continue;
+            };
+            for epoch_dir in epochs.flatten() {
+                let Some(epoch) = epoch_dir
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.strip_prefix('e'))
+                    .and_then(|epoch| epoch.parse::<u64>().ok())
+                else {
+                    continue;
+                };
+                if epoch_dir.path().join("db.sqlite").is_file() {
+                    cells.push(celld_logic::LocalCell {
+                        id: cell.clone(),
+                        epoch,
+                    });
+                }
+            }
+        }
+        cells.sort();
+        cells.dedup();
+        cells
+    }
+
+    /// Delete stale live-named epochs after the runtime has identified and
+    /// closed its exact resident set. Remote replicas remain authoritative.
+    pub fn prune_stale_live(
+        &self,
+        keep: &std::collections::BTreeSet<(String, u64)>,
+    ) -> anyhow::Result<usize> {
+        let stale: Vec<_> = self
+            .local_cells()
+            .into_iter()
+            .filter(|cell| !keep.contains(&(cell.id.clone(), cell.epoch)))
+            .collect();
+        for cell in &stale {
+            if let Some(parent) = self.db_path(&cell.id, cell.epoch).parent() {
+                std::fs::remove_dir_all(parent)?;
+            }
+        }
+        let remaining: std::collections::BTreeSet<_> = self
+            .local_cells()
+            .into_iter()
+            .map(|cell| (cell.id, cell.epoch))
+            .collect();
+        anyhow::ensure!(
+            &remaining == keep,
+            "clean reload inventory mismatch after pruning: expected {}, found {}",
+            keep.len(),
+            remaining.len()
+        );
+        Ok(stale.len())
     }
 
     /// No external process to watch: the in-process replicator is healthy as
@@ -384,8 +764,8 @@ impl LtxRepl {
 /// wake its waiters. Everything committed before the capture is durable once
 /// uploaded, so the target is read before `db.sync`. The `rusqlite` handle is
 /// `!Sync`, so the whole pass runs on a blocking thread with `block_on` for the
-/// async upload. `Some(true)` on success, `Some(false)` on failure, `None` if
-/// the replica lost its db.
+/// async upload. `Some(true)` means success, `Some(false)` means failure, and
+/// `None` means that the replica lost its database.
 async fn sync_cell(handle: CellHandle) -> Option<bool> {
     let runtime = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {
@@ -400,22 +780,214 @@ async fn sync_cell(handle: CellHandle) -> Option<bool> {
             handle.ready.notify_waiters();
             return Some(false);
         }
-        let ok = match runtime.block_on(replica.sync()) {
-            Ok(()) => true,
+        let durable_txid = match runtime.block_on(replica.sync()) {
+            Ok(()) => Some(replica.pos().txid.0),
             Err(error) => {
                 warn!(%error, "ltx upload failed");
-                false
+                None
             }
         };
         drop(replica);
-        if ok {
+        if let Some(durable_txid) = durable_txid {
             handle.synced_seq.fetch_max(captured, Ordering::SeqCst);
+            handle.durable_txid.store(durable_txid, Ordering::SeqCst);
+            maybe_queue_compaction(&handle, durable_txid);
         }
         handle.ready.notify_waiters();
-        Some(ok)
+        Some(durable_txid.is_some())
     })
     .await
     .unwrap_or(Some(false))
+}
+
+fn maybe_queue_compaction(handle: &CellHandle, durable_txid: u64) {
+    let Some(compaction) = &handle.compaction else {
+        return;
+    };
+    if compaction.cancelled.load(Ordering::SeqCst)
+        || durable_txid.saturating_sub(compaction.compacted_txid.load(Ordering::SeqCst))
+            < compaction.min_txids
+        || compaction
+            .queued
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+    {
+        return;
+    }
+    if compaction
+        .queue
+        .send(CompactionWork {
+            cell: Arc::downgrade(handle),
+            queued_at: Instant::now(),
+        })
+        .is_err()
+    {
+        compaction.queued.store(false, Ordering::SeqCst);
+    }
+}
+
+fn cancel_compaction(handle: &CellHandle) {
+    let Some(compaction) = &handle.compaction else {
+        return;
+    };
+    compaction.cancelled.store(true, Ordering::SeqCst);
+    compaction.cancel.notify_waiters();
+}
+
+fn start_compaction_loop(config: CompactionConfig) -> mpsc::UnboundedSender<CompactionWork> {
+    let (queue, mut work) = mpsc::unbounded_channel::<CompactionWork>();
+    let slots = Arc::new(Semaphore::new(config.concurrency));
+    tokio::spawn(async move {
+        while let Some(work) = work.recv().await {
+            let Ok(permit) = slots.clone().acquire_owned().await else {
+                break;
+            };
+            let Some(cell) = work.cell.upgrade() else {
+                continue;
+            };
+            tokio::spawn(async move {
+                let _permit = permit;
+                compact_cell(cell, work.queued_at).await;
+            });
+        }
+    });
+    queue
+}
+
+async fn compact_cell(handle: CellHandle, queued_at: Instant) {
+    let Some(compaction) = &handle.compaction else {
+        return;
+    };
+    let cancelled = compaction.cancel.notified();
+    tokio::pin!(cancelled);
+    if compaction.cancelled.load(Ordering::SeqCst) {
+        return;
+    }
+
+    let queue_ms = queued_at.elapsed().as_millis() as u64;
+    let started = Instant::now();
+    let compactor = ReplicaCompactor::new(&compaction.client)
+        .with_verification(true)
+        .with_local_path(&compaction.local_path)
+        .with_limits(COMPACTION_MAX_FILES, COMPACTION_MAX_INPUT_BYTES);
+    let worker = compactor.compact(1);
+    tokio::pin!(worker);
+    let result = tokio::select! {
+        biased;
+        _ = &mut cancelled => None,
+        result = &mut worker => Some(result),
+    };
+
+    let mut completed = false;
+    match result {
+        Some(Ok(Some(output))) => {
+            let info = output.info;
+            compaction
+                .compacted_txid
+                .store(info.max_txid.0, Ordering::SeqCst);
+            completed = true;
+            info!(
+                event = "ltx_compaction",
+                cell = %compaction.cell,
+                epoch = compaction.epoch,
+                source_level = 0,
+                destination_level = info.level,
+                min_txid = info.min_txid.0,
+                max_txid = info.max_txid.0,
+                input_objects = output.input_files,
+                input_bytes = output.input_bytes,
+                local_input_objects = output.local_input_files,
+                remote_input_objects = output.input_files - output.local_input_files,
+                output_bytes = info.size,
+                queue_ms,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                result = "ok",
+                "compacted an additive LTX level"
+            );
+        }
+        Some(Ok(None)) => {
+            compaction
+                .compacted_txid
+                .store(handle.durable_txid.load(Ordering::SeqCst), Ordering::SeqCst);
+            completed = true;
+            info!(
+                event = "ltx_compaction",
+                cell = %compaction.cell,
+                epoch = compaction.epoch,
+                source_level = 0,
+                destination_level = 1,
+                queue_ms,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                result = "no_work",
+                "the additive LTX level is current"
+            );
+        }
+        Some(Err(error)) => {
+            warn!(
+                event = "ltx_compaction",
+                cell = %compaction.cell,
+                epoch = compaction.epoch,
+                source_level = 0,
+                destination_level = 1,
+                queue_ms,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                result = "error",
+                %error,
+                "additive LTX compaction failed"
+            );
+        }
+        None => {
+            info!(
+                event = "ltx_compaction",
+                cell = %compaction.cell,
+                epoch = compaction.epoch,
+                source_level = 0,
+                destination_level = 1,
+                queue_ms,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                result = "cancelled",
+                "cancelled an additive LTX compaction"
+            );
+        }
+    }
+    compaction.queued.store(false, Ordering::SeqCst);
+
+    if completed && !compaction.cancelled.load(Ordering::SeqCst) {
+        // Pace consecutive rounds for one cell: a restart with a large tail
+        // otherwise drains back-to-back for minutes. The pause matches the
+        // round it follows (capped), so a cell compacts at half duty cycle
+        // while the worker slot frees for other cells immediately — this
+        // task detaches and does not hold the concurrency permit.
+        let pause = started.elapsed().min(std::time::Duration::from_secs(2));
+        let handle_ = handle.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(pause).await;
+            let durable_txid = handle_.durable_txid.load(Ordering::SeqCst);
+            maybe_queue_compaction(&handle_, durable_txid);
+        });
+    }
+}
+
+fn compaction_config_from_env() -> anyhow::Result<Option<CompactionConfig>> {
+    // On by default. A mixed fleet must set `0` until every node can read
+    // v0.5.2 block objects. An old reader cannot take over a cell after its
+    // first L1 publication.
+    let enabled = crate::env_vars::flag("CELLD_LTX_COMPACTION", true)?;
+    if !enabled {
+        return Ok(None);
+    }
+
+    let min_txids = crate::env_vars::with_default("CELLD_LTX_COMPACTION_MIN_TXIDS", 256)?;
+    let concurrency = crate::env_vars::with_default("CELLD_LTX_COMPACTIONS", 2)?;
+    anyhow::ensure!(
+        min_txids >= 2,
+        "CELLD_LTX_COMPACTION_MIN_TXIDS must be at least 2"
+    );
+    anyhow::ensure!(concurrency > 0, "CELLD_LTX_COMPACTIONS must be positive");
+    Ok(Some(CompactionConfig {
+        min_txids: min_txids as u64,
+        concurrency,
+    }))
 }
 
 /// The node's background sync loop: wake on a dirty cell (or a slow tick) and
@@ -529,6 +1101,5 @@ fn node_config(
         session_token,
         skip_verify: false,
         part_size: 0,
-        concurrency: 0,
     }
 }

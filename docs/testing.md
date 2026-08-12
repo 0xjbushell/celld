@@ -117,9 +117,10 @@ its conditions has no value.
   storage round trip is therefore the minimum latency for one write.
   Concurrent writes to one cell join one shared upload, so the throughput
   of one cell is not one round trip for each write.
-- **Restores are fast.** A 62 MB cell restores from the bucket in 1.35 s,
-  and placement handles a restore as normal work, not as an emergency
-  procedure.
+- **A restore is normal work.** Placement handles the restore of an
+  inactive cell as ordinary work, and not as an emergency procedure. The
+  measured restore times come from the retired external replicator, so this
+  page gives no number until a fleet run measures `celld-ltx`.
 - **Ten small nodes held real scale.** A fleet of ten nodes, each with 4
   vCPU and 8 GB, held 10,000 resident cells and 20,000 concurrent
   WebSocket connections. We stopped two of the ten nodes, and the data of

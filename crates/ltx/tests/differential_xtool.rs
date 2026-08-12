@@ -1,5 +1,5 @@
 //! differential_xtool — **GATE G3 ("M1 correct"), PLAN.md §6.3**: cross-tool
-//! differential tests against the REAL `litestream` binary (pinned v0.5.11).
+//! differential tests against the REAL `litestream` binary (pinned v0.5.16).
 //!
 //! This is the strongest correctness oracle in the project. It does not compare
 //! against rustyriver's own output (forbidden by AGENTS.md rule 3): the expected
@@ -71,9 +71,9 @@ fn db_equal(mode: &str, a: &Path, b: &Path) -> Result<(), String> {
 }
 
 /// The real binary under test: `$LITESTREAM_BIN`, or `litestream` on PATH.
-/// The oracle is pinned to the v0.5 replica format (v0.5.11); a v0.3-era
-/// binary knows nothing of LTX and fails as a baffling "no matching
-/// backups found", so a wrong-era binary skips loudly instead.
+/// The oracle is pinned to Litestream v0.5.16, which uses superfly/ltx v0.5.2.
+/// Older v0.5 binaries cannot read the size-prefixed block representation, so
+/// the test must not accept any v0.5 binary as an equivalent oracle.
 fn litestream_bin() -> String {
     std::env::var("LITESTREAM_BIN").unwrap_or_else(|_| "litestream".into())
 }
@@ -92,12 +92,12 @@ fn litestream_usable(test: &str) -> bool {
         }
         Ok(o) => {
             let v = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if v.starts_with("v0.5") {
+            if v == "v0.5.16" || v == "0.5.16" {
                 true
             } else {
                 eprintln!(
-                    "skipping {test}: litestream {v:?} is the wrong era \
-                     (pinned v0.5.11); point LITESTREAM_BIN at a v0.5 binary"
+                    "skipping {test}: litestream {v:?} is not the pinned v0.5.16 \
+                     oracle; point LITESTREAM_BIN at v0.5.16"
                 );
                 false
             }
@@ -420,7 +420,7 @@ async fn d2_real_write_our_restore_at_target_txid() {
     let client = FileReplicaClient::new(replica_root.to_string_lossy().into_owned());
     let files = {
         use celld_ltx::client::ReplicaClient;
-        client.ltx_files(0, TXID(0), false).await.unwrap()
+        client.ltx_files(0, TXID(0)).await.unwrap()
     };
     let max_txid = files.iter().map(|f| f.max_txid.0).max().unwrap();
     assert!(

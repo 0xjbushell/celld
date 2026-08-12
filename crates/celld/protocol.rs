@@ -35,12 +35,46 @@ fn legacy_manifest_schema_version() -> u32 {
     1
 }
 
+/// Manifest `required_features` values this build can load. A manifest
+/// requiring anything else must be rejected up front: `ModuleRef` tolerates
+/// unknown fields, so an older node would otherwise deserialize the manifest
+/// partially and fail (or misbehave) at worker load instead.
+pub const SUPPORTED_DEPLOYMENT_FEATURES: &[&str] = &[FEATURE_ASSETS_V1, FEATURE_WASM_V1];
+
+pub const FEATURE_ASSETS_V1: &str = "assets-v1";
+pub const FEATURE_WASM_V1: &str = "wasm-v1";
+
+/// Reject a manifest requiring any feature this build does not support. Both
+/// load paths (control-plane deployments and fleet pointer loads) must apply
+/// the same gate, so it lives here beside the feature list.
+pub fn validate_required_features(required: &[String]) -> anyhow::Result<()> {
+    for feature in required {
+        if !SUPPORTED_DEPLOYMENT_FEATURES.contains(&feature.as_str()) {
+            anyhow::bail!(
+                "deployment requires feature {feature:?} this celld build does not support; upgrade celld"
+            );
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModuleRef {
     pub name: String,
     pub bytes: usize,
     /// content hash of this module's bytes (hex, truncated)
     pub sha256: String,
+    /// Absent means UTF-8 source: the main module is ESM, siblings become
+    /// text modules. `wasm` bytes become a module whose default export is a
+    /// compiled `WebAssembly.Module` (Wrangler's `CompiledWasm` rule).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<ModuleKind>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModuleKind {
+    Wasm,
 }
 
 /// Reference from a deploy manifest to its immutable, canonical asset index.

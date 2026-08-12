@@ -1,6 +1,6 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
-//! S3-compatible ownership effect adapter.
+//! Bucket ownership effect adapter, over either conditional-write dialect.
 //!
 //! This module deliberately contains serialization, wall-clock sampling, SDK
 //! configuration and error classification only. Ownership decisions remain in
@@ -30,19 +30,19 @@ struct OwnerWireOwned {
 }
 
 #[derive(Deserialize, Serialize)]
-struct NodeLeaseWire {
-    node: String,
-    expires_ms: u64,
+pub(crate) struct NodeLeaseWire {
+    pub(crate) node: String,
+    pub(crate) expires_ms: u64,
     #[serde(default)]
-    addr: String,
+    pub(crate) addr: String,
     #[serde(default)]
-    probe_public_key: String,
+    pub(crate) probe_public_key: String,
     #[serde(default)]
-    peer_protocol: u16,
+    pub(crate) peer_protocol: u16,
     #[serde(default, rename = "ownership_index_generation")]
     generation: String,
     #[serde(default)]
-    load: NodeLoadWire,
+    pub(crate) load: NodeLoadWire,
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -56,6 +56,11 @@ pub struct NodeLoadWire {
     pub fd_limit: u64,
     pub pressured: bool,
     pub shed_cells: u64,
+    /// Cold demand queued behind the activation ceiling. Zero in steady
+    /// state; positive only while a restore burst saturates the node, so a
+    /// rollout waits it out before it restarts the next node.
+    #[serde(default)]
+    pub restoring: u64,
 }
 
 /// A node record older than this is not worth reading. Three lease
@@ -79,8 +84,8 @@ pub fn now_ms() -> u64 {
 
 /// The production-compatible conditional object store used by ownership
 /// effects. A failed write is always reported to the core as ambiguous unless
-/// S3 definitively returned HTTP 412.
-pub struct S3Ownership {
+/// the store definitively returned HTTP 412.
+pub struct BucketOwnership {
     bucket: Bucket,
     lease_bucket: Bucket,
     node: String,
@@ -92,6 +97,27 @@ pub struct S3Ownership {
 /// What this node currently looks like, for peers deciding where to place a
 /// cell. The executor owns these numbers and publishes them on every lease
 /// renewal; nothing here decides anything locally.
+/// The shedding latch, readable without the core loop.
+///
+/// Admission on the stateless path is a relaxed atomic load, not a message:
+/// that path is the hello-world path, and asking the core would reinstate the
+/// round trip removed to reach its throughput. Set once at startup, alongside
+/// the counters peers rank this node by.
+static NODE_LOAD: std::sync::OnceLock<std::sync::Arc<LiveLoad>> = std::sync::OnceLock::new();
+
+pub fn set_node_load(load: std::sync::Arc<LiveLoad>) {
+    let _ = NODE_LOAD.set(load);
+}
+
+/// Is this node over a resource ceiling and recovering? False when nothing
+/// publishes load (no bucket), which is also when there is no pressure
+/// sampler to say otherwise.
+pub fn node_is_shedding() -> bool {
+    NODE_LOAD
+        .get()
+        .is_some_and(|load| load.pressured.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 #[derive(Debug, Default)]
 pub struct LiveLoad {
     pub resident_cells: AtomicUsize,
@@ -101,24 +127,15 @@ pub struct LiveLoad {
     /// Cells shed since this process started. Monotonic, and only ever read
     /// by a human or a diagnostic -- placement uses the levels, not the rate.
     pub shed_cells: AtomicU64,
+    /// Cold demand queued behind the activation ceiling, republished on every
+    /// lease renewal for a rollout to pace on.
+    pub restoring: AtomicU64,
 }
 
-impl S3Ownership {
-    pub fn new(bucket: Bucket, node: String) -> Self {
-        Self {
-            lease_bucket: bucket.clone(),
-            bucket,
-            node,
-            probe_public_key: String::new(),
-            live: Arc::new(LiveLoad::default()),
-            lease_ttl_ms: 0,
-        }
-    }
-
-    /// Configure the per-process key advertised for challenge-bound direct
-    /// probes. Read-only ownership adapters deliberately use [`Self::new`]
-    /// and cannot accidentally publish a lease.
-    pub fn with_probe_public_key(
+impl BucketOwnership {
+    /// Creates an adapter with an isolated lease pool and the process key
+    /// advertised for challenge-bound direct probes.
+    pub fn new(
         bucket: Bucket,
         lease_bucket: Bucket,
         node: String,
@@ -134,18 +151,6 @@ impl S3Ownership {
         }
     }
 
-    pub async fn from_environment(bucket: String, node: String) -> anyhow::Result<Self> {
-        let endpoint = std::env::var("S3_ENDPOINT").ok();
-        let region = std::env::var("AWS_REGION")
-            .ok()
-            .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
-            .unwrap_or_else(|| "us-east-1".into());
-        Ok(Self::new(
-            Bucket::open(&bucket, endpoint.as_deref(), &region, None, None)?,
-            node,
-        ))
-    }
-
     /// The lease lifetime this fleet renews on, used to decide which node
     /// records are still worth reading.
     pub fn with_lease_ttl_ms(mut self, ttl_ms: u64) -> Self {
@@ -158,6 +163,12 @@ impl S3Ownership {
         self.live.clone()
     }
 
+    /// The storage scheme this adapter coordinates through (`s3` or `gs`),
+    /// for the startup banner.
+    pub fn storage_scheme(&self) -> &'static str {
+        self.bucket.scheme()
+    }
+
     /// Stable identity for this exact lease-writing process.
     pub fn process_generation(&self) -> Option<&str> {
         (!self.probe_public_key.is_empty()).then_some(self.probe_public_key.as_str())
@@ -165,7 +176,7 @@ impl S3Ownership {
 
     pub async fn read_owner(&self, cell: &str) -> anyhow::Result<Option<OwnerRecord>> {
         let key = format!("cells/{cell}/own.json");
-        let Some((owner, etag)) = self.read_json::<OwnerWireOwned>(&key).await? else {
+        let Some((owner, etag)) = load_json::<OwnerWireOwned>(&self.bucket, &key).await? else {
             return Ok(None);
         };
         Ok(Some(OwnerRecord {
@@ -176,7 +187,7 @@ impl S3Ownership {
     }
 
     pub async fn read_node_lease(&self, owner: &str) -> anyhow::Result<Option<NodeLeaseRecord>> {
-        self.read_node_lease_with(&self.bucket, owner).await
+        load_node_lease(&self.bucket, owner).await
     }
 
     /// Read this process's authority record through the isolated lease pool.
@@ -184,26 +195,7 @@ impl S3Ownership {
         &self,
         owner: &str,
     ) -> anyhow::Result<Option<NodeLeaseRecord>> {
-        self.read_node_lease_with(&self.lease_bucket, owner).await
-    }
-
-    async fn read_node_lease_with(
-        &self,
-        bucket: &Bucket,
-        owner: &str,
-    ) -> anyhow::Result<Option<NodeLeaseRecord>> {
-        let key = format!("nodes/{owner}.json");
-        Ok(self
-            .read_json_with::<NodeLeaseWire>(bucket, &key)
-            .await?
-            .map(|(lease, etag)| NodeLeaseRecord {
-                node: lease.node,
-                addr: lease.addr,
-                expires_ms: lease.expires_ms,
-                peer_protocol: lease.peer_protocol,
-                generation: lease.generation,
-                etag,
-            }))
+        load_node_lease(&self.lease_bucket, owner).await
     }
 
     /// Enumerate the fleet membership records used for advisory placement.
@@ -244,7 +236,7 @@ impl S3Ownership {
 
         let mut reads = stream::iter(nodes.into_iter().map(|node| async move {
             let key = format!("nodes/{node}.json");
-            Ok::<_, anyhow::Error>(self.read_json::<NodeLeaseWire>(&key).await?.map(
+            Ok::<_, anyhow::Error>(load_json::<NodeLeaseWire>(&self.bucket, &key).await?.map(
                 |(lease, _)| CapacityPeer {
                     node: lease.node,
                     addr: lease.addr,
@@ -340,26 +332,35 @@ impl S3Ownership {
             None => Ok(LeaseCasOutcome::Rejected),
         }
     }
+}
 
-    async fn read_json<T: for<'de> Deserialize<'de>>(
-        &self,
-        key: &str,
-    ) -> anyhow::Result<Option<(T, String)>> {
-        self.read_json_with(&self.bucket, key).await
-    }
+pub(crate) async fn load_node_lease(
+    bucket: &Bucket,
+    owner: &str,
+) -> anyhow::Result<Option<NodeLeaseRecord>> {
+    let key = format!("nodes/{owner}.json");
+    Ok(load_json::<NodeLeaseWire>(bucket, &key)
+        .await?
+        .map(|(lease, etag)| NodeLeaseRecord {
+            node: lease.node,
+            addr: lease.addr,
+            expires_ms: lease.expires_ms,
+            peer_protocol: lease.peer_protocol,
+            generation: lease.generation,
+            etag,
+        }))
+}
 
-    async fn read_json_with<T: for<'de> Deserialize<'de>>(
-        &self,
-        bucket: &Bucket,
-        key: &str,
-    ) -> anyhow::Result<Option<(T, String)>> {
-        let Some((bytes, etag)) = bucket.get(key).await? else {
-            return Ok(None);
-        };
-        let value = serde_json::from_slice(&bytes)
-            .with_context(|| format!("decode s3://{}/{key}", bucket.name))?;
-        Ok(Some((value, etag)))
-    }
+async fn load_json<T: for<'de> Deserialize<'de>>(
+    bucket: &Bucket,
+    key: &str,
+) -> anyhow::Result<Option<(T, String)>> {
+    let Some((bytes, etag)) = bucket.get(key).await? else {
+        return Ok(None);
+    };
+    let value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("decode {}://{}/{key}", bucket.scheme(), bucket.name))?;
+    Ok(Some((value, etag)))
 }
 
 fn process_load(live: &LiveLoad) -> NodeLoadWire {
@@ -404,5 +405,6 @@ fn process_load(live: &LiveLoad) -> NodeLoadWire {
         host_websockets: live.host_websockets.load(Ordering::Relaxed),
         pressured: live.pressured.load(Ordering::Relaxed),
         shed_cells: live.shed_cells.load(Ordering::Relaxed),
+        restoring: live.restoring.load(Ordering::Relaxed),
     }
 }

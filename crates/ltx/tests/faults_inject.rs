@@ -186,15 +186,7 @@ struct BadSizeClient {
 
 #[async_trait::async_trait]
 impl ReplicaClient for BadSizeClient {
-    fn type_name(&self) -> &str {
-        "bad-size-mock"
-    }
-    async fn ltx_files(
-        &self,
-        level: i32,
-        _seek: TXID,
-        _md: bool,
-    ) -> celld_ltx::Result<Vec<FileInfo>> {
+    async fn ltx_files(&self, level: i32, _seek: TXID) -> celld_ltx::Result<Vec<FileInfo>> {
         if level == SNAPSHOT_LEVEL {
             Ok(vec![FileInfo {
                 level: SNAPSHOT_LEVEL,
@@ -212,8 +204,6 @@ impl ReplicaClient for BadSizeClient {
         _level: i32,
         _min: TXID,
         _max: TXID,
-        _off: i64,
-        _size: i64,
     ) -> celld_ltx::Result<Vec<u8>> {
         Ok(Vec::new())
     }

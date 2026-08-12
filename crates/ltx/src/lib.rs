@@ -5,29 +5,32 @@
 //! `v0.5.11`). See `PLAN.md` for the full specification and `AGENTS.md` for the
 //! non-negotiable operating rules.
 //!
-//! The public surface (`Db`, `Replica`, `Leaser`, `Config`, `restore`) is
+//! The public surface (`Db`, `Replica`, `Config`, `restore`) is
 //! defined incrementally by the task DAG in `PLAN.md` §5; module bodies are
 //! filled by their owning tasks and are scaffold placeholders until then.
 //!
 //! # Core position/identity helpers  (T4)
 //!
 //! Ported from litestream@v0.5.11 litestream.go:18-203 and
-//! ltx@v0.5.1 ltx.go:66-145.
+//! ltx@v0.5.2 ltx.go:66-145.
 
 pub mod client;
+mod codec;
+pub mod compaction_level;
+pub mod compactor;
 pub mod db;
 pub mod error;
-pub mod leaser;
 pub mod ltx;
+mod lz4_block;
 pub mod replica;
+pub mod replica_compactor;
 pub mod replica_url;
-pub mod store;
 pub mod wal;
 
 // ── Crate-root re-exports — the ergonomic public surface (PLAN.md §4) ─────────
 //
 // These `pub use` aliases let a host write `rustyriver::Db`, `rustyriver::Replica`,
-// `rustyriver::restore`, `rustyriver::Leaser`, etc. without naming the owning
+// `rustyriver::restore`, `rustyriver::Db`, etc. without naming the owning
 // module. The original module paths (`rustyriver::db::Db`, …) remain valid; these
 // are additive aliases, not a relocation.
 
@@ -61,18 +64,6 @@ pub use ltx::FileInfo;
 /// A [`ReplicaClient`] that stores LTX files on the local filesystem.
 /// Re-exported from [`crate::client::file::FileReplicaClient`].
 pub use client::file::FileReplicaClient;
-
-/// The object-storage lease provider used for single-primary fencing.
-/// Re-exported from [`crate::leaser::Leaser`].
-pub use leaser::Leaser;
-
-/// The default S3-backed [`Leaser`] implementation (over the `object_store`
-/// crate). Re-exported from [`crate::leaser::S3Leaser`].
-pub use leaser::S3Leaser;
-
-/// A lease value (`generation` + `expires_at` + `owner`) read from or written to
-/// the lock object. Re-exported from [`crate::leaser::Lease`].
-pub use leaser::Lease;
 
 /// The S3/R2/MinIO [`ReplicaClient`], behind the `s3` feature.
 /// Re-exported from [`crate::client::object_store::ObjectStoreClient`].

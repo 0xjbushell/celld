@@ -17,9 +17,7 @@ publish = false
 
 [features]
 default = ["s3"]
-# `s3` enables object_store's AWS backend. reqwest rides object_store/aws's own
-# feature set so it unifies with the already-compiled copy.
-s3 = ["object_store/aws", "dep:reqwest"]
+s3 = ["object_store/aws"]
 gcs = ["object_store/gcp"]
 azure = ["object_store/azure"]
 
@@ -30,13 +28,11 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-u
 rusqlite = { workspace = true, features = ["bundled"] }
 object_store.workspace = true
 bytes.workspace = true
+chrono.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 async-trait.workspace = true
 futures-util.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-reqwest = { workspace = true, optional = true }
 lz4_flex.workspace = true
 
 [dev-dependencies]

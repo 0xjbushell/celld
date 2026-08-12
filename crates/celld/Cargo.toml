@@ -1,6 +1,6 @@
 [package]
 name = "celld"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.94.1"
 license = "Apache-2.0"
@@ -18,7 +18,10 @@ level = "warn"
 check-cfg = ["cfg(celld_internal_tests)", "cfg(celld_proxy_internals)"]
 
 [dependencies]
+aes.workspace = true
 aes-gcm.workspace = true
+cbc.workspace = true
+ctr.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 base64.workspace = true
@@ -29,7 +32,6 @@ encoding_rs.workspace = true
 ed25519-dalek.workspace = true
 fastwebsockets.workspace = true
 flate2.workspace = true
-fs2.workspace = true
 futures-util.workspace = true
 getrandom.workspace = true
 hmac.workspace = true
@@ -37,9 +39,16 @@ http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 md-5.workspace = true
-object_store = { workspace = true, features = ["aws"] }
+object_store = { workspace = true, features = ["aws", "gcp"] }
+parquet.workspace = true
 percent-encoding.workspace = true
 p256.workspace = true
+p384.workspace = true
+p521.workspace = true
+pkcs8.workspace = true
+crc.workspace = true
+dsa.workspace = true
+x25519-dalek.workspace = true
 rand.workspace = true
 regex.workspace = true
 reqwest = { workspace = true, features = ["rustls-tls", "stream", "json"] }
@@ -50,11 +59,15 @@ serde.workspace = true
 serde_json.workspace = true
 sha1.workspace = true
 sha2.workspace = true
+subtle.workspace = true
+tempfile.workspace = true
+tikv-jemallocator.workspace = true
 tokio = { workspace = true, features = ["full"] }
 tokio-rustls.workspace = true
 tokio-stream.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
+tracing-appender.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
 urlpattern.workspace = true

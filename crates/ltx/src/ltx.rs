@@ -1,21 +1,19 @@
 //! ltx.rs — LTX (Lite Transaction) file reader/writer + CRC64-ISO checksums.
 //!
-//! Ported from ltx@v0.5.1 `ltx.go`, `checksum.go`, `encoder.go`, `decoder.go`
+//! Ported from ltx@v0.5.2 `ltx.go`, `checksum.go`, `encoder.go`, `decoder.go`
 //! and litestream@v0.5.11 `v3.go`. The authoritative byte layout is written up
 //! in `reference/ltx-format.md` (produced by this task).
 //!
-//! The reader decodes a complete LTX file — header, LZ4-framed page block,
-//! varint page index, trailer — and verifies the CRC64-ISO file checksum and
-//! (for snapshots) the rolling post-apply checksum. The writer round-trips the
-//! same layout; byte-fidelity against the real binary is proven later by the
-//! differential test D1 (PLAN.md §6.3), not here.
+//! The reader decodes a complete LTX file with either v0.5.2 LZ4 blocks or the
+//! older LZ4 frames. It verifies the CRC64-ISO file checksum and the rolling
+//! snapshot checksum. The v0.5.2 writer emits exact upstream bytes, while the
+//! default writer preserves the legacy layout during the staged rollout.
 
 use crate::error::{Error, Result};
 use crate::{Checksum, Pos, CHECKSUM_FLAG, TXID};
-use std::io::{Read, Write};
 use std::time::SystemTime;
 
-// ── Constants (ltx@v0.5.1 ltx.go:18-55) ──────────────────────────────────────
+// ── Constants (ltx@v0.5.2 ltx.go:18-55) ──────────────────────────────────────
 
 /// First 4 bytes of every LTX file.
 pub const MAGIC: &[u8; 4] = b"LTX1";
@@ -29,6 +27,12 @@ pub const CHECKSUM_SIZE: usize = 8;
 /// Header flag: checksums are not tracked for this file.
 pub const HEADER_FLAG_NO_CHECKSUM: u32 = 1 << 1;
 pub const HEADER_FLAG_MASK: u32 = HEADER_FLAG_NO_CHECKSUM;
+
+/// A four-byte compressed-size field follows the page header, and the page
+/// uses raw LZ4 block compression. Files written before ltx v0.5.2 omit this
+/// flag and contain one LZ4 frame per page.
+pub const PAGE_HEADER_FLAG_SIZE: u16 = 1 << 0;
+pub const PAGE_HEADER_FLAG_MASK: u16 = PAGE_HEADER_FLAG_SIZE;
 
 /// SQLite PENDING_BYTE offset; the lock page derives from it.
 pub const PENDING_BYTE: i64 = 0x4000_0000;
@@ -278,8 +282,8 @@ impl PageHeader {
         if self.pgno == 0 {
             return Err(corrupt("page number required"));
         }
-        if self.flags != 0 {
-            return Err(corrupt("no page flags allowed"));
+        if self.flags != (self.flags & PAGE_HEADER_FLAG_MASK) {
+            return Err(corrupt("invalid page header flags"));
         }
         Ok(())
     }
@@ -293,6 +297,22 @@ pub struct Trailer {
 }
 
 impl Trailer {
+    /// Validates the checksum fields against the header checksum mode.
+    pub fn validate(&self, header: Header) -> Result<()> {
+        if header.no_checksum() {
+            if self.post_apply_checksum != 0 {
+                return Err(corrupt("post-apply checksum not allowed"));
+            }
+        } else if self.post_apply_checksum == 0 || self.post_apply_checksum & CHECKSUM_FLAG == 0 {
+            return Err(corrupt("invalid post-apply checksum"));
+        }
+
+        if self.file_checksum == 0 || self.file_checksum & CHECKSUM_FLAG == 0 {
+            return Err(corrupt("invalid file checksum"));
+        }
+        Ok(())
+    }
+
     pub fn parse(b: &[u8]) -> Result<Trailer> {
         if b.len() < TRAILER_SIZE {
             return Err(corrupt("short trailer"));
@@ -350,8 +370,8 @@ pub fn parse_filename(name: &str) -> Result<(TXID, TXID)> {
 ///
 /// `pre_apply_checksum`/`post_apply_checksum` are populated when known (e.g. by
 /// decoding) and are zero when a file is discovered by a bare directory/bucket
-/// listing. `created_at` is the file's timestamp (mtime / LastModified, or the
-/// LTX header timestamp when `use_metadata` is requested).
+/// listing. Listings use the file mtime or object-store LastModified time, and
+/// write results use the LTX header timestamp.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FileInfo {
     pub level: i32,
@@ -385,11 +405,11 @@ impl FileInfo {
 pub struct DecodedFile {
     pub header: Header,
     pub trailer: Trailer,
-    /// Number of real pages (excludes the empty terminating page header).
-    pub page_count: usize,
     /// Page numbers in file (write) order.
     pub pgnos: Vec<u32>,
 }
+
+type DecodedPages = Vec<(u32, Vec<u8>)>;
 
 /// Decodes and fully verifies an in-memory LTX file: header, LZ4-framed pages,
 /// page index, trailer, the CRC64-ISO file checksum, and — for snapshots — the
@@ -398,145 +418,47 @@ pub struct DecodedFile {
 ///
 /// Ported from the read+verify path in decoder.go:68-219.
 pub fn decode_file(bytes: &[u8]) -> Result<DecodedFile> {
-    let len = bytes.len();
-    if len < HEADER_SIZE + PAGE_HEADER_SIZE + 8 + TRAILER_SIZE {
-        return Err(corrupt("file too short"));
-    }
+    decode_file_inner(bytes, false).map(|(file, _)| file)
+}
 
-    // `Header::parse` length-checks internally; pass the full slice so the bound
-    // is enforced by `parse` rather than relying on the floor check above.
-    let header = Header::parse(bytes)?;
-    header.validate()?;
-    let page_size = header.page_size as usize;
+/// Decodes a complete LTX file and retains each decompressed page.
+pub(crate) fn decode_file_with_pages(bytes: &[u8]) -> Result<(DecodedFile, DecodedPages)> {
+    decode_file_inner(bytes, true)
+}
 
-    let trailer = Trailer::parse(&bytes[len - TRAILER_SIZE..len])?;
+fn decode_file_inner(bytes: &[u8], retain_pages: bool) -> Result<(DecodedFile, DecodedPages)> {
+    let mut decoder = crate::codec::Decoder::new(std::io::Cursor::new(bytes));
+    decoder.decode_header()?;
+    let header = decoder.header;
+    let mut page_numbers = Vec::new();
+    let mut pages = Vec::new();
+    let mut data = vec![0; header.page_size as usize];
 
-    // Page index: the u64 size field sits just before the trailer; the index
-    // elements precede it. (encoder.go:137-173 / decoder.go:309-346.)
-    let size_field_off = len - TRAILER_SIZE - 8;
-    let index_size = u64_be(&bytes[size_field_off..]) as usize;
-    let idx_start = size_field_off
-        .checked_sub(index_size)
-        .ok_or_else(|| corrupt("bad page index size"))?;
-    if idx_start < HEADER_SIZE + PAGE_HEADER_SIZE {
-        return Err(corrupt("bad page index offset"));
-    }
-    let index = parse_page_index(&bytes[idx_start..size_field_off])?;
-
-    // The empty page header terminates the page block, immediately before the
-    // page index.
-    let empty_header_off = idx_start - PAGE_HEADER_SIZE;
-
-    let mut crc = Crc64::new();
-    crc.update(&bytes[0..HEADER_SIZE]); // header
-
-    // Rolling post-apply checksum (only meaningful for tracked snapshots).
-    let track = header.is_snapshot() && !header.no_checksum();
-    let mut rolling: Checksum = CHECKSUM_FLAG;
-    let lock = lock_pgno(header.page_size);
-
-    // Walk the page block sequentially in write order.
-    let mut off = HEADER_SIZE;
-    let mut pgnos = Vec::new();
-    let mut scratch = vec![0u8; page_size];
-    while off < empty_header_off {
-        let ph = PageHeader::parse(&bytes[off..off + PAGE_HEADER_SIZE])?;
-        if ph.is_zero() {
-            return Err(corrupt("unexpected empty page header"));
+    while let Some(page) = decoder.decode_page(&mut data)? {
+        page_numbers.push(page.pgno);
+        if retain_pages {
+            pages.push((page.pgno, data.clone()));
         }
-        ph.validate()?;
-        let elem = index
-            .get(&ph.pgno)
-            .ok_or_else(|| corrupt("page missing from index"))?;
-        if elem.offset as usize != off {
-            return Err(corrupt("page index offset mismatch"));
-        }
-        let sz = elem.size as usize;
-        if sz < PAGE_HEADER_SIZE || off + sz > empty_header_off {
-            return Err(corrupt("bad page size in index"));
-        }
-
-        // page header bytes go into the file hash verbatim …
-        crc.update(&bytes[off..off + PAGE_HEADER_SIZE]);
-        // … and the *decompressed* data (the file checksum is over uncompressed
-        // page bytes — decoder.go:177-180).
-        decompress_page(&bytes[off + PAGE_HEADER_SIZE..off + sz], &mut scratch)?;
-        crc.update(&scratch);
-
-        if track && ph.pgno != lock {
-            rolling = CHECKSUM_FLAG | (rolling ^ checksum_page(ph.pgno, &scratch));
-        }
-
-        pgnos.push(ph.pgno);
-        off += sz;
     }
-    if off != empty_header_off {
-        return Err(corrupt("page block did not end on the index boundary"));
-    }
+    decoder.close()?;
 
-    // empty page header (must be all zero) + page index + trailer[:8] all feed
-    // the file hash as raw bytes (decoder.go:82-83, 128, 163).
-    let empty = &bytes[empty_header_off..empty_header_off + PAGE_HEADER_SIZE];
-    if !PageHeader::parse(empty)?.is_zero() {
-        return Err(corrupt("missing empty page header terminator"));
-    }
-    crc.update(empty);
-    crc.update(&bytes[idx_start..len - CHECKSUM_SIZE]);
-
-    let file_checksum = CHECKSUM_FLAG | crc.sum64();
-    if file_checksum != trailer.file_checksum {
-        return Err(Error::ChecksumMismatch);
-    }
-
-    if track && rolling != trailer.post_apply_checksum {
-        return Err(Error::ChecksumMismatch);
-    }
-
-    Ok(DecodedFile {
-        header,
-        trailer,
-        page_count: pgnos.len(),
-        pgnos,
-    })
+    Ok((
+        DecodedFile {
+            header,
+            trailer: decoder.trailer,
+            pgnos: page_numbers,
+        },
+        pages,
+    ))
 }
 
 /// Decodes and verifies a complete LTX file, returning each page's
 /// `(pgno, decompressed_data)` in write order.
 ///
-/// This reuses [`decode_file`] for full verification (file checksum + page
-/// index) and then re-walks the page block to materialize the page bytes —
-/// needed by `DB.verify`'s `lastPageMatch` check (db.go:1457-1474), which
-/// compares a WAL page against the pages stored in the last LTX file.
+/// The decoder retains the pages from its verification pass, so it does not
+/// decompress the file a second time.
 pub fn decode_file_pages(bytes: &[u8]) -> Result<Vec<(u32, Vec<u8>)>> {
-    // Full verification first (also guarantees the index/geometry are sound).
-    decode_file(bytes)?;
-
-    let len = bytes.len();
-    let header = Header::parse(bytes)?;
-    let page_size = header.page_size as usize;
-
-    let size_field_off = len - TRAILER_SIZE - 8;
-    let index_size = u64_be(&bytes[size_field_off..]) as usize;
-    let idx_start = size_field_off
-        .checked_sub(index_size)
-        .ok_or_else(|| corrupt("bad page index size"))?;
-    let index = parse_page_index(&bytes[idx_start..size_field_off])?;
-    let empty_header_off = idx_start - PAGE_HEADER_SIZE;
-
-    let mut out = Vec::new();
-    let mut off = HEADER_SIZE;
-    let mut scratch = vec![0u8; page_size];
-    while off < empty_header_off {
-        let ph = PageHeader::parse(&bytes[off..off + PAGE_HEADER_SIZE])?;
-        let elem = index
-            .get(&ph.pgno)
-            .ok_or_else(|| corrupt("page missing from index"))?;
-        let sz = elem.size as usize;
-        decompress_page(&bytes[off + PAGE_HEADER_SIZE..off + sz], &mut scratch)?;
-        out.push((ph.pgno, scratch.clone()));
-        off += sz;
-    }
-    Ok(out)
+    decode_file_with_pages(bytes).map(|(_, pages)| pages)
 }
 
 /// Reconstructs the full SQLite database image from a **snapshot** LTX file
@@ -546,17 +468,10 @@ pub fn decode_file_pages(bytes: &[u8]) -> Result<Vec<(u32, Vec<u8>)>> {
 /// by the snapshot conformance test (the CRC64 of this image must equal the live
 /// DB's CRC64). Errors if the file is not a snapshot or a page is missing.
 pub fn decode_database_image(bytes: &[u8]) -> Result<Vec<u8>> {
-    // Verify the whole file FIRST. This mirrors Go's `DecodeDatabaseTo`, which
-    // calls `DecodeHeader` (and thus `Header.Validate`) before it computes
-    // `LockPgno` or touches `Commit` (decoder.go:224-236). Validating up front is
-    // what makes the steps below panic-free on adversarial input: a header with
-    // `page_size == 0` is rejected here, so `lock_pgno` (a `PENDING_BYTE / size`
-    // divide) and the `Header::parse` slice never see a degenerate header.
-    let pages = decode_file_pages(bytes)?;
-
-    // The header is now known-valid (decode_file_pages → decode_file validated
-    // it), so `Header::parse` cannot fail and `lock_pgno` cannot divide by zero.
-    let header = Header::parse(bytes)?;
+    // Verify the whole file before `lock_pgno` or `commit` is used. This rejects
+    // a zero page size and keeps the reconstruction panic-free on bad input.
+    let (decoded, pages) = decode_file_with_pages(bytes)?;
+    let header = decoded.header;
     if !header.is_snapshot() {
         return Err(corrupt(
             "cannot decode non-snapshot LTX file to SQLite database",
@@ -585,120 +500,54 @@ pub fn decode_database_image(bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(image)
 }
 
-/// Decompresses one LZ4 frame holding exactly one page into `out`.
-fn decompress_page(compressed: &[u8], out: &mut [u8]) -> Result<()> {
-    let mut fd = lz4_flex::frame::FrameDecoder::new(compressed);
-    fd.read_exact(out)
-        .map_err(|_| corrupt("lz4 decompress failed"))?;
-    Ok(())
-}
-
-#[derive(Debug, Clone, Copy)]
-struct PageIndexElem {
-    offset: u64,
-    size: u64,
-}
-
-/// Parses the varint page index (decoder.go:309-346): tuples of
-/// `(pgno, offset, size)` terminated by a `pgno == 0` marker.
-fn parse_page_index(buf: &[u8]) -> Result<std::collections::HashMap<u32, PageIndexElem>> {
-    let mut map = std::collections::HashMap::new();
-    let mut pos = 0usize;
-    loop {
-        let pgno = read_uvarint(buf, &mut pos)?;
-        if pgno == 0 {
-            break;
-        }
-        let offset = read_uvarint(buf, &mut pos)?;
-        let size = read_uvarint(buf, &mut pos)?;
-        map.insert(pgno as u32, PageIndexElem { offset, size });
-    }
-    Ok(map)
-}
-
 // ── Encoder (round-trip; byte-fidelity vs the real binary is D1's job) ────────
 
-/// Encodes a complete LTX file from a header, an ordered set of pages, and the
-/// post-apply checksum. Mirrors encoder.go's layout; LZ4 framing uses lz4_flex.
+/// Encodes a complete LTX file with the legacy LZ4 frame representation.
+///
+/// This function preserves the current celld write format during the staged
+/// v0.5.2 reader rollout. [`decode_file`] accepts this representation and the
+/// v0.5.2 block representation.
 pub fn encode_file(
     header: &Header,
     pages: &[(u32, Vec<u8>)],
     post_apply_checksum: Checksum,
 ) -> Result<Vec<u8>> {
-    header.validate()?;
-    let page_size = header.page_size as usize;
-
-    let mut out: Vec<u8> = Vec::new();
-    let mut crc = Crc64::new();
-
-    // Header.
-    let hb = header.marshal();
-    out.extend_from_slice(&hb);
-    crc.update(&hb);
-
-    // Pages.
-    let mut index: Vec<(u32, u64, u64)> = Vec::with_capacity(pages.len());
-    for (pgno, data) in pages {
-        if data.len() != page_size {
-            return Err(corrupt("page buffer size mismatch"));
-        }
-        let offset = out.len() as u64;
-        let ph = PageHeader {
-            pgno: *pgno,
-            flags: 0,
-        };
-        ph.validate()?;
-        let phb = ph.marshal();
-        out.extend_from_slice(&phb);
-        crc.update(&phb);
-
-        let compressed = compress_page(data)?;
-        out.extend_from_slice(&compressed);
-        crc.update(data); // hash feeds the *uncompressed* data
-
-        index.push((*pgno, offset, (PAGE_HEADER_SIZE + compressed.len()) as u64));
-    }
-
-    // Empty page header terminator.
-    let empty = [0u8; PAGE_HEADER_SIZE];
-    out.extend_from_slice(&empty);
-    crc.update(&empty);
-
-    // Page index (sorted ascending by pgno).
-    index.sort_by_key(|e| e.0);
-    let idx_region_start = out.len();
-    let mut idx_bytes: Vec<u8> = Vec::new();
-    for (pgno, offset, size) in &index {
-        write_uvarint(&mut idx_bytes, *pgno as u64);
-        write_uvarint(&mut idx_bytes, *offset);
-        write_uvarint(&mut idx_bytes, *size);
-    }
-    write_uvarint(&mut idx_bytes, 0); // end marker
-    out.extend_from_slice(&idx_bytes);
-    crc.update(&idx_bytes);
-
-    let index_size = (out.len() - idx_region_start) as u64;
-    let size_field = index_size.to_be_bytes();
-    out.extend_from_slice(&size_field);
-    crc.update(&size_field);
-
-    // Trailer: post-apply feeds the hash; file checksum is the hash result.
-    crc.update(&post_apply_checksum.to_be_bytes());
-    let file_checksum = CHECKSUM_FLAG | crc.sum64();
-    let trailer = Trailer {
-        post_apply_checksum,
-        file_checksum,
-    };
-    out.extend_from_slice(&trailer.marshal());
-
-    Ok(out)
+    encode_file_with_mode(header, pages, post_apply_checksum, false)
 }
 
-fn compress_page(data: &[u8]) -> Result<Vec<u8>> {
-    let mut fe = lz4_flex::frame::FrameEncoder::new(Vec::new());
-    fe.write_all(data)
-        .map_err(|_| corrupt("lz4 compress failed"))?;
-    fe.finish().map_err(|_| corrupt("lz4 finish failed"))
+/// Encodes a complete LTX file with the byte-exact v0.5.2 block
+/// representation.
+pub fn encode_file_v0_5_2(
+    header: &Header,
+    pages: &[(u32, Vec<u8>)],
+    post_apply_checksum: Checksum,
+) -> Result<Vec<u8>> {
+    encode_file_with_mode(header, pages, post_apply_checksum, true)
+}
+
+fn encode_file_with_mode(
+    header: &Header,
+    pages: &[(u32, Vec<u8>)],
+    post_apply_checksum: Checksum,
+    use_v0_5_2: bool,
+) -> Result<Vec<u8>> {
+    let mut encoder = if use_v0_5_2 {
+        crate::codec::Encoder::new_block(Vec::new())
+    } else {
+        crate::codec::Encoder::new_legacy(Vec::new())
+    };
+    encoder.encode_header(*header)?;
+    for (page_number, data) in pages {
+        encoder.encode_page(
+            PageHeader {
+                pgno: *page_number,
+                flags: 0,
+            },
+            data,
+        )?;
+    }
+    encoder.close(post_apply_checksum)?;
+    Ok(encoder.writer)
 }
 
 // ── small byte / varint helpers ──────────────────────────────────────────────
@@ -711,35 +560,6 @@ fn u32_be(b: &[u8]) -> u32 {
 }
 fn u64_be(b: &[u8]) -> u64 {
     u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
-}
-
-/// LEB128 unsigned varint reader, matching Go `binary.Uvarint`.
-fn read_uvarint(buf: &[u8], pos: &mut usize) -> Result<u64> {
-    let mut x: u64 = 0;
-    let mut s: u32 = 0;
-    loop {
-        let b = *buf.get(*pos).ok_or_else(|| corrupt("uvarint eof"))?;
-        *pos += 1;
-        if b < 0x80 {
-            if s >= 64 || (s == 63 && b > 1) {
-                return Err(corrupt("uvarint overflow"));
-            }
-            return Ok(x | ((b as u64) << s));
-        }
-        x |= ((b & 0x7f) as u64) << s;
-        s += 7;
-        if s >= 70 {
-            return Err(corrupt("uvarint too long"));
-        }
-    }
-}
-
-fn write_uvarint(out: &mut Vec<u8>, mut x: u64) {
-    while x >= 0x80 {
-        out.push((x as u8) | 0x80);
-        x >>= 7;
-    }
-    out.push(x as u8);
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -769,7 +589,7 @@ mod tests {
             assert_eq!(f.header.page_size, 4096, "{name}: page size");
             assert_eq!(f.header.min_txid, TXID(i), "{name}: min txid");
             assert_eq!(f.header.max_txid, TXID(i), "{name}: max txid");
-            assert!(f.page_count >= 1, "{name}: has pages");
+            assert!(!f.pgnos.is_empty(), "{name}: has pages");
             // ChecksumFlag must be set on the stored file checksum.
             assert_ne!(
                 f.trailer.file_checksum & CHECKSUM_FLAG,
@@ -834,6 +654,18 @@ mod tests {
     fn page_header_and_trailer_roundtrip() {
         let ph = PageHeader { pgno: 7, flags: 0 };
         assert_eq!(PageHeader::parse(&ph.marshal()).unwrap(), ph);
+        assert!(PageHeader {
+            pgno: 7,
+            flags: PAGE_HEADER_FLAG_SIZE,
+        }
+        .validate()
+        .is_ok());
+        assert!(PageHeader {
+            pgno: 7,
+            flags: PAGE_HEADER_FLAG_SIZE << 1,
+        }
+        .validate()
+        .is_err());
         assert!(PageHeader::default().is_zero());
 
         let t = Trailer {
@@ -861,8 +693,6 @@ mod tests {
         assert_ne!(c1 & CHECKSUM_FLAG, 0, "flag must be set");
     }
 
-    // Our writer + reader agree (round-trip). Byte-fidelity against the real
-    // binary is verified later by differential D1, not here.
     #[test]
     fn encode_decode_roundtrip_snapshot() {
         let page_size = 4096usize;
@@ -891,12 +721,73 @@ mod tests {
             node_id: 0,
         };
 
-        let encoded = encode_file(&header, &pages, rolling).expect("encode");
-        let decoded = decode_file(&encoded).expect("decode");
-        assert_eq!(decoded.header, header);
-        assert_eq!(decoded.page_count, 3);
-        assert_eq!(decoded.pgnos, vec![1, 2, 3]);
-        assert_eq!(decoded.trailer.post_apply_checksum, rolling);
+        for encoded in [
+            encode_file(&header, &pages, rolling).expect("legacy encode"),
+            encode_file_v0_5_2(&header, &pages, rolling).expect("v0.5.2 encode"),
+        ] {
+            let decoded = decode_file(&encoded).expect("decode");
+            assert_eq!(decoded.header, header);
+            assert_eq!(decoded.pgnos, vec![1, 2, 3]);
+            assert_eq!(decoded.trailer.post_apply_checksum, rolling);
+        }
+    }
+
+    #[test]
+    fn encoder_matches_superfly_ltx_v0_5_2_bytes() {
+        let page1 = vec![0x81; 1024];
+        let page2 = b"abcd".repeat(256);
+        let pages = vec![(1, page1), (2, page2)];
+        let mut rolling = CHECKSUM_FLAG;
+        for (pgno, data) in &pages {
+            rolling = CHECKSUM_FLAG | (rolling ^ checksum_page(*pgno, data));
+        }
+
+        let header = Header {
+            version: VERSION,
+            page_size: 1024,
+            commit: 2,
+            min_txid: TXID(1),
+            max_txid: TXID(1),
+            timestamp: 1000,
+            ..Header::default()
+        };
+        let encoded = encode_file_v0_5_2(&header, &pages, rolling).expect("encode");
+
+        // Generated with github.com/superfly/ltx@v0.5.2 FileSpec.WriteTo.
+        let expected = hex::decode(concat!(
+            "4c54583100000000000004000000000200000000000000010000000000000001",
+            "00000000000003e8000000000000000000000000000000000000000000000000",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "000000000000000100010000001a1f810100ffffffdc000200000200b0818181",
+            "81818181818181810000000200010000001b4f616263640400ffffffdc00ec03",
+            "c061626364616263646162636400000000000001642402880125000000000000",
+            "000008a09639bc718d9c58dc2f8726a386540e",
+        ))
+        .expect("fixture hex");
+        assert_eq!(encoded, expected);
+        decode_file(&encoded).expect("the exact fixture must also verify");
+    }
+
+    #[test]
+    fn legacy_encoder_uses_the_upstream_frame_contract() {
+        let pages = vec![(1, vec![0x81; 1024])];
+        let rolling = CHECKSUM_FLAG | checksum_page(1, &pages[0].1);
+        let header = Header {
+            version: VERSION,
+            page_size: 1024,
+            commit: 1,
+            min_txid: TXID(1),
+            max_txid: TXID(1),
+            ..Header::default()
+        };
+
+        let encoded = encode_file(&header, &pages, rolling).expect("legacy encode");
+        let frame = &encoded[HEADER_SIZE + PAGE_HEADER_SIZE..];
+
+        assert_eq!(&frame[..4], &0x184d_2204_u32.to_le_bytes());
+        assert_ne!(frame[4] & 0x20, 0, "blocks must be independent");
+        assert_ne!(frame[4] & 0x04, 0, "the content checksum must be present");
+        assert_eq!(frame[5] >> 4, 4, "the maximum block size must be 64 KiB");
     }
 
     #[test]

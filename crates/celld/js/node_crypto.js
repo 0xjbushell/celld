@@ -13,8 +13,9 @@
 //   src/node/internal/validators.ts, internal_errors.ts (subsets)
 //
 // Types are stripped; the C++ `node-internal:crypto` builtin maps onto the
-// $$digest / $$hmacSign / $$pbkdf2 / $$hkdf / $$randomValues host ops, with
-// hash state buffered on the JS side (digest runs once, at finalization).
+// $$digest / $$hmacSign / $$pbkdf2 / $$hkdf / $$randomValues /
+// $$timingSafeEqual host ops, with hash state buffered on the JS side (digest
+// runs once, at finalization).
 // checkPrime/generatePrime are pure-JS BigInt Miller–Rabin, mirroring
 // Workerd's src/workerd/api/crypto/prime.c++ semantics (8192-bit cap, the
 // {12,11}/{24,23}/{60,59} add/rem allowlist, top-two-bits-set candidates).
@@ -546,6 +547,30 @@
           ext: true,
         };
       }
+      if (options.format === "jwk") {
+        return keyOp("asym-key-export", {
+          der: Array.from(bytes),
+          visibility: this.type,
+        }).jwk;
+      }
+      // Asymmetric: the host re-encodes into the requested structure. Node's
+      // shapes -- a pem export is a string, a der export a Buffer.
+      if (this.type !== "secret") {
+        const out = keyOp("asym-key-reencode", {
+          der: Array.from(bytes),
+          visibility: this.type,
+          format: options.format,
+          type: options.type,
+          // A passphrase makes this an encrypted PKCS#8 export. The cipher
+          // name is accepted but not honoured -- pkcs5 picks its own scheme,
+          // and the result re-imports either way.
+          passphrase: options.passphrase === undefined ? null : Array.from(
+            asU8(typeof options.passphrase === "string"
+              ? Buffer.from(options.passphrase)
+              : options.passphrase)),
+        });
+        return out.pem !== undefined ? out.pem : Buffer.from(out.der);
+      }
       return Buffer.from(bytes);
     }
     equals(otherKeyObject) {
@@ -565,15 +590,69 @@
   const isKeyObject = (obj) =>
     obj != null && typeof obj === "object" && kHandle in obj;
 
+  // The host normalizes every accepted input to one DER — PKCS#8 for
+  // private keys, SPKI for public — and reports the type and details beside
+  // it. Everything below reads that one shape.
+  const keyOp = (operation, input) => {
+    try {
+      return JSON.parse(__crypto_operation(operation, JSON.stringify(input)));
+    } catch (error) {
+      // The host namespaces every throw with "crypto: ". node:crypto callers
+      // match on Node's own message text — `throws(fn, { message })` compares
+      // it exactly — so the namespace is stripped at this boundary.
+      throw new Error(
+        String(error?.message ?? error).replace(/^crypto: /, ""));
+    }
+  };
+  const asymmetricMaterial = (key) => key.__celldMaterial ?? {};
+  // Node names the Web Crypto algorithm, not the key type, on the CryptoKey.
+  // Node accepts several spellings of the same curve; celld generates P-256
+  // only, so the table doubles as the supported-curve check.
+  const EC_CURVE_ALIASES = {
+    "prime256v1": "P-256",
+    "secp256r1": "P-256",
+    "P-256": "P-256",
+  };
+  const WEB_CRYPTO_ALGORITHM = {
+    rsa: "RSASSA-PKCS1-v1_5",
+    ec: "ECDSA",
+    ed25519: "Ed25519",
+    x25519: "X25519",
+  };
+
+  function asymmetricKeyObject(result, visibility) {
+    const material = {
+      bytes: Uint8Array.from(result.der),
+      keyType: result.keyType,
+      details: result.details,
+    };
+    const algorithm = { name: WEB_CRYPTO_ALGORITHM[result.keyType] };
+    if (result.keyType === "ec") algorithm.namedCurve = "P-256";
+    if (result.keyType === "rsa") {
+      algorithm.modulusLength = result.details.modulusLength;
+      algorithm.hash = { name: "SHA-256" };
+    }
+    return KeyObject.from(
+      new CryptoKey(visibility, algorithm, true, [], material));
+  }
+
   class AsymmetricKeyObject extends KeyObject {
     get asymmetricKeyDetails() {
-      throw ERR_METHOD_NOT_IMPLEMENTED("asymmetricKeyDetails");
+      const details = { ...asymmetricMaterial(this[kHandle]).details };
+      // Node reports the exponent as a BigInt. JSON cannot carry one, so the
+      // host sends a decimal string and it is widened back here.
+      if (details.publicExponent !== undefined)
+        details.publicExponent = BigInt(details.publicExponent);
+      return details;
     }
     get asymmetricKeyType() {
-      throw ERR_METHOD_NOT_IMPLEMENTED("asymmetricKeyType");
+      return asymmetricMaterial(this[kHandle]).keyType;
     }
+    // The handle already *is* a CryptoKey; Node's contract is only that the
+    // result is usable with Web Crypto, and this key was built with the
+    // algorithm Web Crypto expects.
     toCryptoKey() {
-      throw ERR_METHOD_NOT_IMPLEMENTED("toCryptoKey");
+      return this[kHandle];
     }
   }
   class PublicKeyObject extends AsymmetricKeyObject {
@@ -665,18 +744,43 @@
     }
     return { key: data, format: "jwk", type: undefined, passphrase: undefined };
   }
+  // A JWK arrives as an object and crosses as one; every other format is
+  // bytes, and the host reads a plain array.
+  function importAsymmetric(prepared, visibility) {
+    return asymmetricKeyObject(
+      keyOp("asym-key-import", {
+        key: prepared.format === "jwk"
+          ? prepared.key
+          : Array.from(asU8(prepared.key)),
+        format: prepared.format,
+        type: prepared.type ?? null,
+        visibility,
+        passphrase: prepared.passphrase === undefined
+          ? null
+          : Array.from(asU8(prepared.passphrase)),
+      }),
+      visibility,
+    );
+  }
   function createPrivateKey(key) {
-    prepareAsymmetricKey(key, KeyContext.kCreatePrivate);
-    throw ERR_METHOD_NOT_IMPLEMENTED("createPrivateKey");
+    return importAsymmetric(
+      prepareAsymmetricKey(key, KeyContext.kCreatePrivate), "private");
   }
   function createPublicKey(key) {
+    // Node also derives the public half of a private key it is handed.
     if (isKeyObject(key) || key instanceof CryptoKey) {
       if (key.type !== "private")
         throw ERR_INVALID_ARG_TYPE("key", "PrivateKeyObject", key);
-      throw ERR_METHOD_NOT_IMPLEMENTED("createPublicKey");
+      const handle = key instanceof CryptoKey ? key : key[kHandle];
+      return asymmetricKeyObject(
+        keyOp("asym-key-public-from-private", {
+          der: Array.from(asU8(asymmetricMaterial(handle).bytes)),
+        }),
+        "public",
+      );
     }
-    prepareAsymmetricKey(key, KeyContext.kCreatePublic);
-    throw ERR_METHOD_NOT_IMPLEMENTED("createPublicKey");
+    return importAsymmetric(
+      prepareAsymmetricKey(key, KeyContext.kCreatePublic), "public");
   }
 
   function generateKey(type, options, callback) {
@@ -774,7 +878,135 @@
         break;
       }
     }
-    throw ERR_METHOD_NOT_IMPLEMENTED(`generateKeyPairSync ${type}`);
+    // Everything above is Workerd's argument validation, unchanged. Below is
+    // the generation itself, for the algorithms celld carries a crate for.
+    if (type === "dh")
+      throw ERR_METHOD_NOT_IMPLEMENTED(`generateKeyPairSync ${type}`);
+    if (type === "rsa") {
+      // Node's ceiling. Beyond it the prime search is effectively unbounded,
+      // so it is refused rather than left to run.
+      if (modulusLength > 16384)
+        throw new RangeError(`Invalid modulusLength: ${modulusLength}`);
+      // The rsa crate fixes the exponent at 65537; anything else would be
+      // silently ignored, so it is refused instead.
+      if (publicExponent !== 0x10001) {
+        throw ERR_METHOD_NOT_IMPLEMENTED(
+          `generateKeyPairSync rsa with publicExponent ${publicExponent}`);
+      }
+    }
+    if (type === "ec" && EC_CURVE_ALIASES[namedCurve] === undefined) {
+      throw ERR_METHOD_NOT_IMPLEMENTED(
+        `generateKeyPairSync ec ${namedCurve}`);
+    }
+    const pair = keyOp("asym-key-generate", { type, modulusLength });
+    const half = (der, visibility, encoding) => {
+      if (encoding === undefined) {
+        return asymmetricKeyObject(
+          { keyType: pair.keyType, der, details: pair.details }, visibility);
+      }
+      // With an encoding, Node returns the encoded key itself rather than a
+      // KeyObject: a string for pem, a Buffer for der.
+      const out = keyOp("asym-key-reencode", {
+        der,
+        visibility,
+        format: encoding.format,
+        type: encoding.type,
+      });
+      return out.pem !== undefined ? out.pem : Buffer.from(out.der);
+    };
+    return {
+      publicKey: half(pair.publicDer, "public", publicKeyEncoding),
+      privateKey: half(pair.privateDer, "private", privateKeyEncoding),
+    };
+  }
+
+  // ---- one-shot sign / verify ----------------------------------------
+  // Node's `sign(algorithm, data, key)`. For Ed25519 the algorithm must be
+  // null -- the curve fixes its own hash. For RSA and ECDSA it names the
+  // digest. ECDSA signatures are DER here, as Node's `dsaEncoding` default
+  // says, not the raw r||s Web Crypto uses.
+  const SIGN_HASHES = {
+    sha256: "SHA-256", "sha-256": "SHA-256",
+    sha384: "SHA-384", "sha-384": "SHA-384",
+    sha512: "SHA-512", "sha-512": "SHA-512",
+  };
+  function signingKey(key, want, name) {
+    const object = isKeyObject(key)
+      ? key
+      : (key instanceof CryptoKey ? KeyObject.from(key) : createPrivateKey(key));
+    if (object.type !== want) {
+      throw ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE(object.type, want);
+    }
+    const material = asymmetricMaterial(object[kHandle]);
+    if (material.keyType === undefined)
+      throw ERR_INVALID_ARG_TYPE(name, "asymmetric KeyObject", key);
+    return material;
+  }
+  function signHash(algorithm, keyType) {
+    // Ed25519 fixes its own hash, so the algorithm must be null for it and
+    // must be a digest name for everything else. Accepting a digest for
+    // Ed25519 would silently ignore it.
+    if (keyType === "ed25519") {
+      if (algorithm != null)
+        throw ERR_INVALID_ARG_VALUE("algorithm", algorithm);
+      return null;
+    }
+    if (algorithm == null)
+      throw ERR_INVALID_ARG_VALUE("algorithm", algorithm);
+    validateString(algorithm, "algorithm");
+    const hash = SIGN_HASHES[algorithm.toLowerCase()];
+    if (hash === undefined)
+      throw ERR_METHOD_NOT_IMPLEMENTED(`sign with ${algorithm}`);
+    return hash;
+  }
+  function sign(algorithm, data, key) {
+    const material = signingKey(key, "private", "key");
+    const hash = signHash(algorithm, material.keyType);
+    const input = Array.from(asU8(data));
+    const der = Array.from(asU8(material.bytes));
+    switch (material.keyType) {
+      case "ed25519":
+        return Buffer.from(
+          keyOp("ed25519-sign", { key: der, data: input }).bytes);
+      case "rsa":
+        return Buffer.from(
+          keyOp("rsa-pkcs1-sign", { key: der, data: input, hash }).bytes);
+      case "ec":
+        if (material.details.namedCurve !== "prime256v1")
+          throw ERR_METHOD_NOT_IMPLEMENTED(
+            `sign with ${material.details.namedCurve}`);
+        return Buffer.from(
+          keyOp("p256-sign-der", { key: der, data: input }).bytes);
+      default:
+        throw ERR_METHOD_NOT_IMPLEMENTED(`sign with ${material.keyType}`);
+    }
+  }
+  function verify(algorithm, data, key, signature) {
+    // Node accepts a private key here and verifies with its public half.
+    let material = signingKey(
+      isKeyObject(key) && key.type === "private" ? createPublicKey(key) : key,
+      "public",
+      "key",
+    );
+    const hash = signHash(algorithm, material.keyType);
+    const input = Array.from(asU8(data));
+    const der = Array.from(asU8(material.bytes));
+    const sig = Array.from(asU8(signature));
+    switch (material.keyType) {
+      case "ed25519":
+        return keyOp("ed25519-verify", { key: der, data: input, signature: sig }).ok;
+      case "rsa":
+        return keyOp(
+          "rsa-pkcs1-verify", { key: der, data: input, signature: sig, hash }).ok;
+      case "ec":
+        if (material.details.namedCurve !== "prime256v1")
+          throw ERR_METHOD_NOT_IMPLEMENTED(
+            `verify with ${material.details.namedCurve}`);
+        return keyOp(
+          "p256-verify-der", { key: der, data: input, signature: sig }).ok;
+      default:
+        throw ERR_METHOD_NOT_IMPLEMENTED(`verify with ${material.keyType}`);
+    }
   }
 
   // ---- pbkdf2 --------------------------------------------------------------
@@ -1241,9 +1473,7 @@
     const ua = asU8(a), ub = asU8(b);
     if (ua.byteLength !== ub.byteLength)
       throw ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH();
-    let diff = 0;
-    for (let i = 0; i < ua.byteLength; i++) diff |= ua[i] ^ ub[i];
-    return diff === 0;
+    return $$timingSafeEqual(ua, ub);
   }
   // The digests Cells actually implements (Node returns its real list too);
   // hkdf/pbkdf2/hash/hmac accept exactly these.
@@ -1305,8 +1535,7 @@
     // Sign/Verify, ciphers, DH, certs: not implemented — loud, not silent.
     createSign: notImplemented("createSign"),
     createVerify: notImplemented("createVerify"),
-    sign: notImplemented("sign"),
-    verify: notImplemented("verify"),
+    sign, verify,
     createCipheriv: notImplemented("createCipheriv"),
     createDecipheriv: notImplemented("createDecipheriv"),
     publicEncrypt: notImplemented("publicEncrypt"),

@@ -524,37 +524,3 @@ fn test_ltx_error_is_auto_recoverable() {
         );
     }
 }
-
-// ── REVIEWER (T4): standalone verification of the `WrappedCorrupted` sub-case ──
-//
-// The Go suite TestLTXError_IsAutoRecoverable (litestream_test.go:139-163) has
-// EIGHT sub-cases, all of which are already covered by
-// test_ltx_error_is_auto_recoverable above (including WrappedCorrupted at
-// litestream_test.go:155-158 and IOError at litestream_test.go:159-162).
-//
-// This standalone test isolates the chain-walking behaviour for the
-// semantically load-bearing sub-case:
-//
-//     {"WrappedCorrupted", fmt.Errorf("%w: bad data", litestream.ErrLTXCorrupted), true}
-//
-// In Go, `errors.Is` unwraps the chain, so a *wrapped* corruption sentinel is
-// still auto-recoverable. This is the normal production shape: a low-level
-// reader returns context-wrapped corruption (e.g. "reading page 7: <corrupt>")
-// and the caller hands it to NewLTXError. Recovery MUST still trigger.
-//
-// The faithful Rust analog of `%w`-wrapping the sentinel is to carry the
-// corruption inside the error chain (Error::Other(Box::new(Error::LTXCorrupted)))
-// rather than as the bare top-level discriminant. The chain-walking in
-// error.rs must recognise this wrapped form and return true.
-#[test]
-fn test_ltx_error_is_auto_recoverable_wrapped_corrupted() {
-    // Wrap the corruption sentinel with added context, mirroring
-    // fmt.Errorf("%w: bad data", ErrLTXCorrupted).
-    let wrapped: Box<dyn std::error::Error + Send + Sync> =
-        Box::new(Error::LTXCorrupted) as Box<dyn std::error::Error + Send + Sync>;
-    let err = new_ltx_error("open", "/path/to/file.ltx", 0, 1, 1, Error::Other(wrapped));
-    assert!(
-        err.is_auto_recoverable(),
-        "wrapped ErrLTXCorrupted must be auto-recoverable (Go: errors.Is unwraps the chain)"
-    );
-}

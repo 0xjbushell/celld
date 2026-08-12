@@ -1,0 +1,14 @@
+[package]
+name = "counter-demo-rs"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone: keeps cargo and wasm-pack out of the engine workspace above.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+worker = "0.8.5"
+serde_json = "1"

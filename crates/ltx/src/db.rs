@@ -187,7 +187,12 @@ impl Db {
         let conn = Connection::open(&path).map_err(sql_err)?;
 
         // DSN pragmas: busy_timeout + wal_autocheckpoint(0) (db.go:818).
-        // autocheckpoint MUST be 0 — litestream owns checkpointing (footgun F-10).
+        // autocheckpoint MUST be 0 — litestream owns checkpointing (footgun
+        // F-10). Per-connection, not per-file: the cell's own writer
+        // connection keeps SQLite's default 1000-page autocheckpoint, which
+        // is safe because this connection's long-running read transaction
+        // pins a WAL read mark, so a PASSIVE checkpoint elsewhere can
+        // backfill but never reset or truncate the WAL under the reader.
         conn.busy_timeout(Self::DEFAULT_BUSY_TIMEOUT)
             .map_err(sql_err)?;
         conn.pragma_update(None, "wal_autocheckpoint", 0)
@@ -550,7 +555,7 @@ impl Db {
         // Ensure the WAL has at least one frame (db.go:1017-1020).
         self.ensure_wal_exists()?;
 
-        let (orig_wal_size, new_wal_size, synced) = self.verify_and_sync(false)?;
+        let (orig_wal_size, new_wal_size, synced) = self.verify_and_sync()?;
 
         // Track that data was synced for time-based checkpoint decisions.
         if synced {
@@ -570,7 +575,7 @@ impl Db {
     /// Ported from `DB.verifyAndSync` (db.go:1058-1090). Returns
     /// `(orig_wal_size, new_wal_size, synced)` where the sizes are the **logical**
     /// WAL offset (`WALOffset+WALSize` of the last LTX), not file size (#997).
-    fn verify_and_sync(&mut self, checkpointing: bool) -> Result<(i64, i64, bool)> {
+    fn verify_and_sync(&mut self) -> Result<(i64, i64, bool)> {
         // Use the last synced WAL offset as the logical size for checkpoint
         // decisions; on the first sync fall back to file size (db.go:1062-1069).
         let mut orig_wal_size = self.last_synced_wal_offset;
@@ -579,7 +584,7 @@ impl Db {
         }
 
         let info = self.verify()?;
-        let synced = self.sync_inner(checkpointing, info)?;
+        let synced = self.sync_inner(info)?;
 
         let new_wal_size = self.last_synced_wal_offset;
         Ok((orig_wal_size, new_wal_size, synced))
@@ -766,7 +771,7 @@ impl Db {
         let wal_bytes = std::fs::read(self.wal_path())?;
         let rd = WalReader::new(&wal_bytes).map_err(Error::from)?;
         let last_known = known_salts.last().copied().unwrap_or((0, 0));
-        let mut m = rd.frame_salts_until(last_known).map_err(Error::from)?;
+        let mut m = rd.frame_salts_until(last_known);
         for s in known_salts {
             m.remove(s);
         }
@@ -778,12 +783,7 @@ impl Db {
     /// Ported from `DB.sync` (db.go:1517-1723). Returns `true` if an LTX file was
     /// written (there were new pages or we were snapshotting). Atomic
     /// tmp→fsync→rename with the pos cache + anti-feedback flags updated after.
-    fn sync_inner(&mut self, _checkpointing: bool, mut info: SyncInfo) -> Result<bool> {
-        // `_checkpointing` is the Go `checkpointing` flag that controls whether
-        // `sync` re-takes the `chkMu` checkpoint gate (db.go:1544-1548, footgun
-        // F-3). In this synchronous `Db`, `&mut self` already serializes
-        // sync/checkpoint/snapshot, so the gate — and thus the flag — is
-        // unnecessary. Kept in the signature to mirror the Go call sites.
+    fn sync_inner(&mut self, mut info: SyncInfo) -> Result<bool> {
         let pos = self.pos()?;
         let tx_id = TXID(pos.txid.0 + 1);
         let filename = self.ltx_path(0, tx_id, tx_id);
@@ -1024,7 +1024,7 @@ impl Db {
 
         // Copy the end of the WAL before the checkpoint to capture as much as
         // possible (db.go:1823-1826).
-        self.verify_and_sync(true)?;
+        self.verify_and_sync()?;
 
         // Execute the checkpoint, then force a write so a new WAL page exists.
         self.exec_checkpoint(mode)?;
@@ -1050,7 +1050,7 @@ impl Db {
             self.conn
                 .execute_batch("INSERT INTO _litestream_lock (id) VALUES (1)")
                 .map_err(sql_err)?;
-            self.verify_and_sync(true)?;
+            self.verify_and_sync()?;
             Ok(())
         })();
         // Always roll back the write transaction (db.go:1849,1867).

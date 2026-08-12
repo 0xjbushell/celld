@@ -10,7 +10,7 @@
 //! `async` by the JS harness.
 use crate::asyncrt;
 use crate::storage;
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context as _, Result};
 use futures_util::StreamExt as _;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -18,7 +18,6 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tokio::task::JoinSet;
 use v8::{ValueDeserializerHelper, ValueSerializerHelper};
 
 /// The pending exception text from a TryCatch scope (a macro so it needs no
@@ -38,6 +37,10 @@ macro_rules! exc {
 pub struct DoCallReq {
     pub request_id: Option<RequestId>,
     pub cancel: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// An explicit JavaScript AbortSignal must reach the target handler, even
+    /// when it fires before cold routing completes. Transport cancellation has
+    /// no handler contract and can stop the cold route immediately.
+    pub deliver_abort_to_handler: bool,
     pub scope: String,
     pub name: Option<String>,
     pub url: String,
@@ -45,8 +48,136 @@ pub struct DoCallReq {
     pub body: Vec<u8>,
     pub headers: Vec<(String, String)>,
     pub reply: tokio::sync::oneshot::Sender<Result<HttpResponse>>,
+    /// Where this call sits in its caller's order for this cell.
+    pub order: Option<CallOrder>,
+    /// The dispatching handler's trace context, read from CPED at the
+    /// call site, so the cell's span joins the caller's trace.
+    pub parent: Option<crate::telemetry::TraceIds>,
 }
 static DO_CALL_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<DoCallReq>> = OnceLock::new();
+
+/// Delivery order, per caller and per cell.
+///
+/// Two calls a script makes back-to-back on one Durable Object stub reach
+/// the cell in that order. Workerd guarantees it — one pipe per stub — and
+/// celld did too, while a cell's events came off one channel. Nothing
+/// between the call and the cell keeps it now: the caller's two ops race to
+/// the proxy channel, the proxy polls them in a `FuturesUnordered`, and two
+/// drives race for the isolate. So the order is taken where it is still
+/// true, synchronously in `op_do_call_impl`, and carried to the one place
+/// that decides when an event is delivered.
+///
+/// It is a chain, not a counter: each call leaves behind the receiver its
+/// successor waits on, and takes its predecessor's.
+///
+/// **The chain lives on the caller.** It was a process-wide map keyed by
+/// `(context, cell)`, which made every Durable Object call in the node take
+/// one global lock to record something only its own caller could ever read.
+/// A shared mutex on a per-request path is a scalability cliff that a small
+/// machine cannot show you, and the state was never shared to begin with.
+///
+/// **Local delivery only.** A call routed to another node crosses HTTP,
+/// where this order has nowhere to ride, so it is dropped there. Workerd
+/// has the same seam in a different place, and a cell that moves mid-flight
+/// reorders under both.
+pub struct CallOrder {
+    /// The call before this one, or `None` if this is the first.
+    ahead: Option<tokio::sync::oneshot::Receiver<Place>>,
+    /// What the call behind this one waits on.
+    release: Option<tokio::sync::oneshot::Sender<Place>>,
+    /// The caller that owns the chain, and this call's place in it.
+    caller: Arc<IoContext>,
+    cell: String,
+    seq: u64,
+    delivered: bool,
+}
+
+/// What a call hands to the one behind it.
+///
+/// `None` once this call has been delivered: the queue has moved on. `Some`
+/// when it died on the way to a cell and never took its turn, and then it
+/// is this call's own unfinished place — so the call behind waits for what
+/// this one was waiting for instead of jumping the queue.
+///
+/// Without the handoff a failed call releases its successor immediately,
+/// and a third call can be delivered ahead of a first that is still in
+/// flight. Rare, since it needs a call to fail between two that do not, and
+/// silent, since every call involved still gets an answer.
+struct Place(Option<Box<tokio::sync::oneshot::Receiver<Place>>>);
+
+impl CallOrder {
+    /// Wait for every call before this one to be delivered.
+    ///
+    /// A loop rather than one await because a call that died hands back
+    /// what *it* was waiting for. `Err` is the chain ahead going away
+    /// entirely, which is nothing left to wait for.
+    pub async fn wait(&mut self) {
+        let mut ahead = self.ahead.take();
+        while let Some(place) = ahead {
+            ahead = match place.await {
+                Ok(Place(forward)) => forward.map(|boxed| *boxed),
+                Err(_) => None,
+            };
+        }
+    }
+
+    /// This call has been delivered; the one behind it may go.
+    pub fn delivered(&mut self) {
+        self.delivered = true;
+    }
+}
+
+impl Drop for CallOrder {
+    fn drop(&mut self) {
+        // Nothing followed this call, so the chain is empty and its tail is
+        // only a leak. A caller's chains outlive its calls otherwise, and a
+        // cell isolate's default caller outlives everything.
+        let mut chains = self.caller.call_chains.lock().unwrap();
+        if chains
+            .tails
+            .get(&self.cell)
+            .is_some_and(|(seq, _)| *seq == self.seq)
+        {
+            chains.tails.remove(&self.cell);
+        }
+        drop(chains);
+        if let Some(release) = self.release.take() {
+            let forward = (!self.delivered).then(|| self.ahead.take()).flatten();
+            let _ = release.send(Place(forward.map(Box::new)));
+        }
+    }
+}
+
+/// One caller's chains, one per cell it has called.
+#[derive(Default)]
+struct CallChains {
+    next_seq: u64,
+    tails: HashMap<String, (u64, tokio::sync::oneshot::Receiver<Place>)>,
+}
+
+/// Take this call's place in its caller's chain for `cell`. Synchronous, so
+/// the places are taken in the order the script made the calls.
+fn enter_call_order(caller: Arc<IoContext>, cell: &str) -> CallOrder {
+    let (release, next) = tokio::sync::oneshot::channel();
+    let (seq, ahead) = {
+        let mut chains = caller.call_chains.lock().unwrap();
+        chains.next_seq += 1;
+        let seq = chains.next_seq;
+        let ahead = chains
+            .tails
+            .insert(cell.to_string(), (seq, next))
+            .map(|(_, ahead)| ahead);
+        (seq, ahead)
+    };
+    CallOrder {
+        ahead,
+        release: Some(release),
+        caller,
+        cell: cell.to_string(),
+        seq,
+        delivered: false,
+    }
+}
 
 /// An output-gate request for the co-hosted (same-isolate) Durable Object fast
 /// path. That path runs a resident DO's `fetch` inline, bypassing
@@ -66,7 +197,7 @@ pub fn set_gate_tx(tx: tokio::sync::mpsc::UnboundedSender<GateReq>) {
 
 /// A service-binding call: `env.NAME.fetch()`. Unlike a Durable Object call
 /// there is no identity to resolve — any isolate running `script` will do — so
-/// the runtime hands this straight to that script's worker pool.
+/// the runtime hands this straight to that script's stateless isolate pool.
 pub struct SvcCallReq {
     /// Fires when the caller's request signal aborts, so the router stops
     /// waiting on the target instead of leaving the call outstanding.
@@ -141,6 +272,16 @@ pub fn set_arm_gate(gate: ArmGate) {
 /// Whether this node still holds a wake entry for `cell`.
 pub fn wake_entry_tracked(cell: &str) -> bool {
     ARM_GATE.get().is_some_and(|gate| gate.flusher.tracks(cell))
+}
+
+/// Drop this node's belief about `cell`'s wake entry — the cell fenced or
+/// resolved to a remote owner, so the entry is no longer ours to manage.
+/// Defined since the wake audit and now actually called (it was dead code,
+/// which meant a node that lost a cell kept believing in its entry).
+pub fn forget_wake_entry(cell: &str) {
+    if let Some(gate) = ARM_GATE.get() {
+        gate.flusher.forget(cell);
+    }
 }
 
 /// Adopt the wake entry a restored alarm implies, so consuming that alarm
@@ -277,11 +418,28 @@ pub fn parse_request_id(value: &str) -> Option<RequestId> {
     u128::from_str_radix(value, 16).ok()
 }
 
-struct DoCallCancelGuard(RequestId);
+struct DoCallCancelGuard(Option<RequestId>);
+
+impl DoCallCancelGuard {
+    fn new(request: RequestId) -> Self {
+        Self(Some(request))
+    }
+
+    fn disarm(&mut self) {
+        if let Some(request) = self.0.take() {
+            do_call_cancels().lock().unwrap().remove(&request);
+        }
+    }
+}
 
 impl Drop for DoCallCancelGuard {
     fn drop(&mut self) {
-        do_call_cancels().lock().unwrap().remove(&self.0);
+        let Some(request) = self.0.take() else {
+            return;
+        };
+        if let Some(cancel) = do_call_cancels().lock().unwrap().remove(&request) {
+            let _ = cancel.send(());
+        }
     }
 }
 
@@ -403,7 +561,7 @@ pub struct WsTarget {
     pub peer_epoch: Option<u64>,
 }
 
-/// Encode a cell/service response for the JS side. A text body crosses as a
+/// Encode a host response for the JS side. A text body crosses as a
 /// JS string (cheap, lossless), binary as a byte array, and a streaming body
 /// by id — serializing a Vec<u8> as a JSON number array is the dominant cost
 /// for real DO responses. `ws_target` is carried only by the DO path.
@@ -431,8 +589,7 @@ fn encode_http_response(mut response: HttpResponse, ws_target: bool) -> String {
 pub struct HttpResponse {
     pub status: u16,
     pub body: Vec<u8>,
-    /// A final Worker response that directly forwards an outbound fetch body.
-    /// Main hands this reqwest stream to Axum without materializing it.
+    /// A response body forwarded without materializing it in memory.
     pub stream: Option<HttpChunkStream>,
     pub headers: Vec<(String, String)>,
     pub ws: Option<WsTarget>,
@@ -443,9 +600,28 @@ pub struct HttpResponse {
     pub write_position: Option<u64>,
 }
 
-/// Jobs accepted by one resident cell isolate. While a handler awaits an
-/// outbound operation, the isolate may service another event, matching the
-/// Durable Objects event-loop semantics and allowing RPC call-backs (A→B→A).
+/// Which alarm a dispatch runs, and who owns its bookkeeping.
+pub enum AlarmDispatch {
+    /// Claim whatever is due now, and record the outcome. Production only
+    /// ever asks for this.
+    Due,
+    /// Claim whatever is armed, however far ahead its deadline. Test-only:
+    /// the corpus asserts on retry accounting without waiting out real
+    /// deadlines.
+    Armed,
+    /// The caller has already claimed it. Dispatch with this retry count and
+    /// leave the bookkeeping to them. Test-only, so the corpus can assert on
+    /// the claim and the handler separately.
+    Claimed(i64),
+}
+
+/// One event a cell receives.
+///
+/// Every variant is something the outside world did to the cell, and each
+/// becomes an `InFlight` entry driven by its own tokio task. Lifecycle —
+/// taking a cell in, giving it back, cancelling a request — is not here: it
+/// is a direct call on the isolate, because it is not an event and has no
+/// handler to run.
 pub enum CellJob {
     Fetch {
         request_id: Option<RequestId>,
@@ -456,32 +632,16 @@ pub enum CellJob {
         body: Vec<u8>,
         headers: Vec<(String, String)>,
         reply: tokio::sync::oneshot::Sender<Result<HttpResponse>>,
-    },
-    /// Run the worker's `export default fetch` INSIDE this cell isolate. When
-    /// the worker routes `env.NS.get(id)` to a scope this isolate owns, the DO
-    /// call resolves in-isolate, avoiding the `__do_call` host round trip.
-    WorkerFetch {
-        request_id: RequestId,
-        url: String,
-        method: String,
-        body: Vec<u8>,
-        headers: Vec<(String, String)>,
-        /// Keeps the landing cell unavailable to another top-level Worker
-        /// request until this event, including post-response work, is done.
-        inline_activity: crate::CellActivityGuard,
-        /// If this job is observed while another event is already driving the
-        /// landing isolate, run it on the ordinary stateless Worker pool. A
-        /// Worker fetch cannot be nested in the same V8 isolate, but its DO
-        /// calls may safely re-enter this cell through the normal host path.
-        fallback_workers: Arc<crate::WorkerPool>,
-        reply: tokio::sync::oneshot::Sender<Result<HttpResponse>>,
+        /// Where this call sits in its caller's order for this cell, if it
+        /// came from a script rather than from a peer or the ingress.
+        order: Option<CallOrder>,
     },
     Rpc {
         scope: String,
         name: Option<String>,
         method: String,
         args: RpcData,
-        reply: tokio::sync::oneshot::Sender<Result<RpcData>>,
+        reply: tokio::sync::oneshot::Sender<Result<RpcOutcome>>,
     },
     WsOpen {
         scope: String,
@@ -503,361 +663,277 @@ pub enum CellJob {
         was_clean: bool,
         reply: tokio::sync::oneshot::Sender<Result<()>>,
     },
-    AbortFetch {
-        request_id: RequestId,
-    },
     Alarm {
         scope: String,
         scheduled_ms: i64,
-        reply: tokio::sync::oneshot::Sender<Result<Option<i64>>>,
+        /// Which alarm to run, and who owns the bookkeeping.
+        claim: AlarmDispatch,
+        /// Replies with (next alarm, the handler's write delta). The delta is
+        /// sampled inside the turn — cell storage must never be reached from
+        /// the shell — and the shell uses it to prove the consuming commit
+        /// durable before the core settles. Every answer shape samples it the
+        /// same way now, in `InFlight::answer_settled`.
+        reply: tokio::sync::oneshot::Sender<Result<(Option<i64>, Option<u64>)>>,
     },
-    Shutdown,
 }
 
-/// Outbound WebSocket traffic from a DO's `ws.send`/`ws.close`. The host holds
-/// the socket in a task decoupled from the isolate (so the cell can hibernate
-/// while the socket lives); `ws.send` routes here by wsId.
-pub enum WsOut {
-    Text(String),
-    Binary(Vec<u8>),
-    Close(u16, String),
-}
-
-/// The result of delivering one `webSocketMessage`. `frames` are the outbound
-/// frames the handler produced, captured by the output gate; `write_position`
-/// is the cell's committed-write count after the handler when it advanced past
-/// where it stood before — i.e. the handler wrote, and its frames must be held
-/// until that position is durable. `None` means no write: flush the frames.
-pub struct WsDispatch {
-    pub frames: Vec<(u64, WsOut)>,
-    pub write_position: Option<u64>,
-}
-
-/// One inbound event on a socket the ISOLATE polls, rather than one the host
-/// pushes into a cell.
-///
-/// A Durable Object socket must survive between events and wake a hibernated
-/// cell, so its frames arrive as `CellJob`s. A Worker socket cannot work that
-/// way: the stateless pool has no addressable isolate, and `asyncrt`'s region
-/// aborts every pending op when the request ends. That is not a limitation to
-/// route around — it is exactly the lifetime Cloudflare gives a Worker socket,
-/// which lives and dies with its `IoContext`. So the isolate pulls, the same
-/// way it already pulls a streamed response body.
-pub enum WsPull {
-    Open(String),
-    Text(String),
-    Binary(Vec<u8>),
-    Close(u16, String, bool),
-}
-
-/// Tags for the byte frame `__ws_next` resolves with. A tagged buffer keeps a
-/// binary message on its fast path instead of base64 through a JSON envelope.
-const WS_PULL_TAG_TEXT: u8 = 0;
-const WS_PULL_TAG_BINARY: u8 = 1;
-const WS_PULL_TAG_OPEN: u8 = 2;
-const WS_PULL_TAG_CLOSE: u8 = 3;
-
-impl WsPull {
-    fn encode(self) -> Vec<u8> {
-        let (tag, mut body) = match self {
-            WsPull::Text(text) => (WS_PULL_TAG_TEXT, text.into_bytes()),
-            WsPull::Binary(bytes) => (WS_PULL_TAG_BINARY, bytes),
-            WsPull::Open(protocol) => (WS_PULL_TAG_OPEN, protocol.into_bytes()),
-            WsPull::Close(code, reason, was_clean) => (
-                WS_PULL_TAG_CLOSE,
-                serde_json::json!({
-                    "code": code,
-                    "reason": reason,
-                    "wasClean": was_clean,
-                })
-                .to_string()
-                .into_bytes(),
-            ),
-        };
-        let mut framed = Vec::with_capacity(body.len() + 1);
-        framed.push(tag);
-        framed.append(&mut body);
-        framed
-    }
-}
-
-pub type WsPullReceiver = tokio::sync::mpsc::UnboundedReceiver<WsPull>;
-pub type WsPullSender = tokio::sync::mpsc::UnboundedSender<WsPull>;
-
-/// One socket's inbound queue. Shared so an op can await it without holding
-/// the registry lock; one isolate polls a given socket serially.
-type WsPullQueue = Arc<tokio::sync::Mutex<WsPullReceiver>>;
-type WsPullRegistry = std::sync::Mutex<HashMap<u64, WsPullQueue>>;
-
-/// Inbound queues for isolate-polled sockets, keyed by wsId.
-static WS_PULL: OnceLock<WsPullRegistry> = OnceLock::new();
-
-fn ws_pull() -> &'static WsPullRegistry {
-    WS_PULL.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
-}
-
-pub fn ws_pull_register(id: u64, rx: WsPullReceiver) {
-    ws_pull()
-        .lock()
-        .unwrap()
-        .insert(id, Arc::new(tokio::sync::Mutex::new(rx)));
-}
-
-pub fn ws_pull_unregister(id: u64) {
-    ws_pull().lock().unwrap().remove(&id);
-}
-
-thread_local! {
-    /// Sockets opened by the region currently running on this thread, one
-    /// frame per nested region. `asyncrt` aborts a region's pending ops on
-    /// exit; these are the host-side resources that abort cannot reach, so
-    /// the region closes them itself.
-    static WS_PULL_REGION: RefCell<Vec<Vec<u64>>> = const { RefCell::new(Vec::new()) };
-    /// Sockets opened before the region exists. A handler runs synchronously
-    /// up to its first await BEFORE its run loop is entered, so a socket
-    /// constructed at the top of a handler is created with no frame to belong
-    /// to. The loop adopts these when it starts.
-    static WS_PULL_PENDING: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
-}
-
-pub fn ws_region_enter() {
-    let adopted =
-        WS_PULL_PENDING.with(|pending| pending.borrow_mut().drain(..).collect::<Vec<_>>());
-    WS_PULL_REGION.with(|regions| regions.borrow_mut().push(adopted));
-}
-
-/// Close every isolate-polled socket the closing region opened. A Worker
-/// socket lives and dies with its request, exactly as it does on Cloudflare.
-pub fn ws_region_exit() {
-    let opened = WS_PULL_REGION.with(|regions| regions.borrow_mut().pop().unwrap_or_default());
-    for id in opened {
-        ws_emit(id, WsOut::Close(1001, "request ended".into()));
-        ws_pull_unregister(id);
-        ws_unregister(id);
-    }
-}
-
-fn ws_region_track(id: u64) {
-    WS_PULL_REGION.with(|regions| {
-        if let Some(current) = regions.borrow_mut().last_mut() {
-            current.push(id);
-            return;
-        }
-        WS_PULL_PENDING.with(|pending| pending.borrow_mut().push(id));
-    });
-}
-pub enum WsIn {
-    Text(String),
-    Binary(Vec<u8>),
-}
-struct WsMeta {
-    scope: String,
-    hibernatable: bool,
-    tags: Vec<String>,
-    attachment: Option<String>,
-    pending: Vec<WsOut>,
-}
-#[derive(Default)]
-struct WsRegistry {
-    outputs: HashMap<u64, tokio::sync::mpsc::UnboundedSender<WsOut>>,
-    metadata: HashMap<u64, WsMeta>,
-}
-impl WsRegistry {
-    fn register(&mut self, id: u64, tx: tokio::sync::mpsc::UnboundedSender<WsOut>) {
-        if let Some(meta) = self.metadata.get_mut(&id) {
-            for pending in meta.pending.drain(..) {
-                let _ = tx.send(pending);
-            }
-        }
-        self.outputs.insert(id, tx);
-    }
-
-    fn unregister(&mut self, id: u64) -> Option<WsMeta> {
-        self.outputs.remove(&id);
-        self.metadata.remove(&id)
-    }
-
-    fn emit(&mut self, id: u64, out: WsOut) {
-        if let Some(tx) = self.outputs.get(&id) {
-            tracing::debug!(ws_id = id, "queued outbound WebSocket frame");
-            let _ = tx.send(out);
-        } else if let Some(meta) = self.metadata.get_mut(&id) {
-            tracing::debug!(ws_id = id, "buffered pre-upgrade WebSocket frame");
-            meta.pending.push(out);
-        } else {
-            // The socket is gone and the frame has nowhere to go. Silence here
-            // is what made a held frame indistinguishable from a sent one.
-            tracing::warn!(ws_id = id, "dropped a frame for a closed WebSocket");
+impl CellJob {
+    /// The cell this event addresses, which is also the realm it runs in.
+    pub fn scope(&self) -> &str {
+        match self {
+            CellJob::Fetch { scope, .. }
+            | CellJob::Rpc { scope, .. }
+            | CellJob::WsOpen { scope, .. }
+            | CellJob::WsMessage { scope, .. }
+            | CellJob::WsClosed { scope, .. }
+            | CellJob::Alarm { scope, .. } => scope,
         }
     }
-}
-static WS_REGISTRY: OnceLock<std::sync::Mutex<WsRegistry>> = OnceLock::new();
-static REGULAR_WS_COUNTS: OnceLock<std::sync::Mutex<HashMap<String, usize>>> = OnceLock::new();
-static NEXT_WS_ID: AtomicU64 = AtomicU64::new(1);
-fn ws_registry() -> &'static std::sync::Mutex<WsRegistry> {
-    WS_REGISTRY.get_or_init(|| std::sync::Mutex::new(WsRegistry::default()))
-}
-fn regular_ws_counts() -> &'static std::sync::Mutex<HashMap<String, usize>> {
-    REGULAR_WS_COUNTS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
-}
-fn increment_regular_ws(scope: &str) {
-    *regular_ws_counts()
-        .lock()
-        .unwrap()
-        .entry(scope.to_string())
-        .or_default() += 1;
-}
-fn decrement_regular_ws(scope: &str) {
-    let mut counts = regular_ws_counts().lock().unwrap();
-    let Some(count) = counts.get_mut(scope) else {
-        return;
-    };
-    *count = count.saturating_sub(1);
-    if *count == 0 {
-        counts.remove(scope);
-    }
-}
-pub fn has_regular_websocket(scope: &str) -> bool {
-    regular_ws_counts()
-        .lock()
-        .unwrap()
-        .get(scope)
-        .is_some_and(|count| *count > 0)
-}
-pub fn ws_hibernatable(id: u64) -> Option<bool> {
-    ws_registry()
-        .lock()
-        .unwrap()
-        .metadata
-        .get(&id)
-        .map(|meta| meta.hibernatable)
-}
-pub fn ws_next_id() -> u64 {
-    NEXT_WS_ID.fetch_add(1, Ordering::Relaxed)
-}
-pub fn ws_register(id: u64, tx: tokio::sync::mpsc::UnboundedSender<WsOut>) {
-    ws_registry().lock().unwrap().register(id, tx);
-}
-pub fn ws_register_outbound(id: u64, scope: &str) {
-    let inserted = {
-        let mut registry = ws_registry().lock().unwrap();
-        if let std::collections::hash_map::Entry::Vacant(entry) = registry.metadata.entry(id) {
-            entry.insert(WsMeta {
-                scope: scope.to_string(),
-                hibernatable: false,
-                tags: Vec::new(),
-                attachment: None,
-                pending: Vec::new(),
-            });
-            true
-        } else {
-            false
+
+    /// This event's place in its caller's order, taken out so the drive can
+    /// wait on it and then release the call behind it.
+    pub fn take_order(&mut self) -> Option<CallOrder> {
+        match self {
+            CellJob::Fetch { order, .. } => order.take(),
+            _ => None,
         }
-    };
-    if inserted {
-        increment_regular_ws(scope);
     }
-}
-pub fn ws_unregister(id: u64) {
-    let meta = ws_registry().lock().unwrap().unregister(id);
-    if let Some(meta) = meta.filter(|meta| !meta.hibernatable) {
-        decrement_regular_ws(&meta.scope);
-    }
-}
-thread_local! {
-    // Output-gate capture. While a `webSocketMessage` runs, its outbound frames
-    // are collected here instead of hitting the wire, so the shell can hold them
-    // until the message's write is durable. A stack: a reentrant event pushes
-    // its own buffer, and frames nested inside a capturing event land on top.
-    //
-    // What may be captured is decided per socket, by `ws_gate_may_hold`, and
-    // that check is what keeps this from deadlocking. Delivering a message runs
-    // the isolate's event loop, which drives every ready task on this thread,
-    // not just this handler -- so anything captured here is withheld for as
-    // long as that loop runs.
-    static WS_CAPTURE: RefCell<Vec<Vec<(u64, WsOut)>>> = const { RefCell::new(Vec::new()) };
-}
 
-fn ws_capture_begin() {
-    WS_CAPTURE.with(|c| c.borrow_mut().push(Vec::new()));
-}
-
-fn ws_capture_take() -> Vec<(u64, WsOut)> {
-    WS_CAPTURE.with(|c| c.borrow_mut().pop().unwrap_or_default())
-}
-
-/// Whether a socket is one the output gate may hold frames for: a hibernatable
-/// transport, whose messages the host pushes into the cell.
-///
-/// A socket the isolate opened and polls itself is not. Its handler runs inside
-/// the isolate's event loop, and that loop is what a held frame would be
-/// waiting on: the reply to a frame the gate is withholding never arrives, so
-/// the loop never finishes, so the frame is never released. Frames from those
-/// sockets go straight out, as they did before the gate existed.
-fn ws_gate_may_hold(id: u64) -> bool {
-    let registry = ws_registry().lock().unwrap();
-    registry
-        .metadata
-        .get(&id)
-        .is_some_and(|meta| meta.hibernatable)
-}
-
-fn ws_emit(id: u64, out: WsOut) {
-    let capturing = WS_CAPTURE.with(|c| !c.borrow().is_empty());
-    if capturing && ws_gate_may_hold(id) {
-        WS_CAPTURE.with(|c| c.borrow_mut().last_mut().unwrap().push((id, out)));
-        return;
-    }
-    ws_registry().lock().unwrap().emit(id, out);
-}
-
-/// Flush frames the output gate held: send each to its socket's task. Called
-/// from the actor thread once the gating write is proved durable.
-pub fn ws_emit_batch(frames: Vec<(u64, WsOut)>) {
-    let mut registry = ws_registry().lock().unwrap();
-    for (id, out) in frames {
-        registry.emit(id, out);
-    }
-}
-
-/// Break a cell's sockets: the output gate could not prove a write durable, so
-/// close every socket the cell owns rather than let a client keep a connection
-/// whose acknowledged effects may not have persisted (a reset DO).
-pub fn ws_close_scope(scope: &str, code: u16, reason: &str) {
-    tracing::warn!(scope, code, "PROBE close_scope");
-    let mut registry = ws_registry().lock().unwrap();
-    let ids: Vec<u64> = registry
-        .metadata
-        .iter()
-        .filter(|(_, meta)| meta.scope == scope)
-        .map(|(id, _)| *id)
-        .collect();
-    for id in ids {
-        registry.emit(id, WsOut::Close(code, reason.to_string()));
+    /// Fail this event without running it.
+    pub fn fail(self, error: anyhow::Error) {
+        match self {
+            CellJob::Fetch { reply, .. } => drop(reply.send(Err(error))),
+            CellJob::Rpc { reply, .. } => drop(reply.send(Err(error))),
+            CellJob::WsOpen { reply, .. } => drop(reply.send(Err(error))),
+            CellJob::WsMessage { reply, .. } => drop(reply.send(Err(error))),
+            CellJob::WsClosed { reply, .. } => drop(reply.send(Err(error))),
+            CellJob::Alarm { reply, .. } => drop(reply.send(Err(error))),
+        }
     }
 }
 
 thread_local! {
-    // JS promise resolvers awaiting an async op, keyed by the op's id.
-    static PROMISES: RefCell<HashMap<u64, v8::Global<v8::PromiseResolver>>> =
-        RefCell::new(HashMap::new());
     // One outbound HTTP client per JS thread — building it per fetch rebuilds
     // the TLS stack every call (async-op-hazards.md).
     static HTTP: reqwest::Client = reqwest::Client::new();
     static HTTP_MANUAL: reqwest::Client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none()).build().unwrap();
     static DO_ID_KEYS: RefCell<HashMap<String, [u8; 32]>> = RefCell::new(HashMap::new());
-    static CANCELLED_REQUESTS: RefCell<HashSet<RequestId>> = RefCell::new(HashSet::new());
 }
-fn promise_store(id: u64, r: v8::Global<v8::PromiseResolver>) {
-    PROMISES.with(|p| {
-        p.borrow_mut().insert(id, r);
-    });
+
+mod websocket;
+pub use websocket::*;
+use websocket::{ws_capture_begin, ws_capture_take};
+
+/// Held for the duration of one cell event; pops on every exit path.
+pub struct EgressGateScope;
+
+impl Drop for EgressGateScope {
+    fn drop(&mut self) {
+        current_context().egress.lock().unwrap().pop();
+    }
+}
+
+pub fn egress_gate_enter(cell: &str, position: Option<u64>) -> EgressGateScope {
+    current_context()
+        .egress
+        .lock()
+        .unwrap()
+        .push((cell.to_string(), position.unwrap_or(0)));
+    EgressGateScope
+}
+
+/// What an outbound effect must wait for, if the running handler has written
+/// anything this event. `None` means there is nothing outstanding and the
+/// effect may go straight out -- the ordinary read-only case, which must not
+/// pay a durability round trip.
+fn egress_gate_pending() -> Option<(String, u64)> {
+    let context = current_context();
+    let stack = context.egress.lock().unwrap();
+    let (cell, before) = stack.last()?;
+    let position = storage::write_position(cell)?;
+    (position > *before).then(|| (cell.clone(), position))
+}
+
+/// Wait for the cell's outstanding write to be proven durable before an
+/// outbound effect leaves the process.
+///
+/// This is the output gate applied to egress rather than to the response.
+/// It cannot deadlock the handler that is awaiting it: the ticket is served by
+/// `dispatch_gate` on the host's own loop and resolved by the replicator's
+/// independent task, neither of which needs the isolate's event loop to run.
+async fn await_egress_gate(pending: Option<(String, u64)>) -> std::result::Result<(), String> {
+    let Some((cell, position)) = pending else {
+        return Ok(());
+    };
+    let (tx, receive) = tokio::sync::oneshot::channel();
+    let sent = GATE_TX
+        .get()
+        .map(|gate| {
+            gate.send(GateReq {
+                scope: cell,
+                position,
+                reply: tx,
+            })
+            .is_ok()
+        })
+        .unwrap_or(false);
+    if !sent {
+        return Err("no output-gate channel".into());
+    }
+    match receive.await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(format!(
+            "refusing to send: the write this request follows is not durable ({error:?})"
+        )),
+        Err(_) => Err("output gate dropped".into()),
+    }
+}
+
+/// Hold an outbound request until the write it follows is durable, then hand
+/// it to the host.
+///
+/// The send moves inside the future deliberately. These channels dispatch as
+/// soon as `send` is called, so gating anywhere after it would let the effect
+/// leave first -- the request would already be on its way while the caller
+/// waited for a durability answer that no longer decides anything.
+async fn gated_channel_send<T>(
+    gate: Option<(String, u64)>,
+    channel: &'static OnceLock<tokio::sync::mpsc::UnboundedSender<T>>,
+    request: T,
+    missing: &'static str,
+) -> std::result::Result<(), String> {
+    await_egress_gate(gate).await?;
+    match channel.get() {
+        Some(tx) if tx.send(request).is_ok() => Ok(()),
+        _ => Err(missing.to_string()),
+    }
+}
+
+/// One `celld_logic::gate::InputGate` per cell.
+///
+/// The logic decides; this is only the map and the ids. It replaces the
+/// promise chain that used to live in `harness.js`, which serialised blocks
+/// against each other but did nothing about *delivery* — so a second event
+/// could arrive mid-block, and under real concurrency that wedged the cell.
+///
+/// Keyed by cell scope rather than held on the isolate, because a gate
+/// belongs to a cell and cells share isolates.
+static CELL_GATES: OnceLock<Mutex<HashMap<String, celld_logic::gate::InputGate>>> = OnceLock::new();
+static NEXT_GATE_EVENT: AtomicU64 = AtomicU64::new(1);
+
+fn cell_gates() -> &'static Mutex<HashMap<String, celld_logic::gate::InputGate>> {
+    CELL_GATES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// What a waiting event is told when the gate finally opens: nothing, or
+/// the reason the holder failed.
+type GateWake = tokio::sync::oneshot::Sender<Result<(), String>>;
+
+static GATE_WAITERS: OnceLock<Mutex<HashMap<String, Vec<GateWake>>>> = OnceLock::new();
+
+/// Events waiting for a cell's input gate to open, in arrival order.
+///
+/// Step 6 deleted this queue, correctly at the time: an event the gate
+/// refused stayed on the cell's job channel until a later delivery point
+/// took it, so the channel *was* the queue and a second one could disagree
+/// with it. Drives have no channel, so a refused event needs somewhere to
+/// wait, and workerd keeps the same structure for the same reason
+/// (`io-gate.h`, `kj::List<Waiter, &Waiter::link> waiters`).
+///
+/// In the shell rather than in `celld_logic::gate`, because what waits is a
+/// tokio task and the core is sans-IO. The core still owns the decision —
+/// `is_open` — and this owns only the waking.
+fn gate_waiters() -> &'static Mutex<HashMap<String, Vec<GateWake>>> {
+    GATE_WAITERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Take a ticket to be woken when `cell`'s gate opens, or `None` if it is
+/// open now.
+///
+/// The gate's lock is held across the check and the enqueue, so a release
+/// that lands between the two cannot leave an event waiting on a gate that
+/// is already open.
+pub fn cell_gate_wait(cell: &str) -> Option<tokio::sync::oneshot::Receiver<Result<(), String>>> {
+    let gates = cell_gates().lock().unwrap();
+    if gates.get(cell).is_none_or(|gate| gate.is_open()) {
+        return None;
+    }
+    let (wake, waiter) = tokio::sync::oneshot::channel();
+    gate_waiters()
+        .lock()
+        .unwrap()
+        .entry(cell.to_string())
+        .or_default()
+        .push(wake);
+    drop(gates);
+    Some(waiter)
+}
+
+/// Wake everything waiting on `cell`'s gate. Each re-checks and re-queues if
+/// another block took the gate first, so waking all of them is correct and
+/// the order they resume in is theirs to lose, not this function's to keep.
+fn wake_gate_waiters(cell: &str, outcome: Result<(), String>) {
+    let waiters = gate_waiters().lock().unwrap().remove(cell);
+    for wake in waiters.into_iter().flatten() {
+        let _ = wake.send(outcome.clone());
+    }
+}
+
+/// The event holding this cell's gate died without releasing it.
+///
+/// Only execution termination reaches here: every other exit from a block
+/// runs the `finally` in `harness.js`. Without it a cell whose blocking
+/// request was killed would refuse every later event forever.
+fn cell_gate_abandon(scope: &str) {
+    if let Some(gate) = cell_gates().lock().unwrap().get_mut(scope) {
+        gate.abandon();
+    }
+    // The holder died without running its `finally`, so nobody can say why.
+    // Refuse the waiters anyway: the cell it queued behind is gone.
+    wake_gate_waiters(
+        scope,
+        Err("the cell's critical section ended without releasing".to_string()),
+    );
+}
+
+/// JS promise resolvers awaiting an async op, keyed by the op's id.
+///
+/// **Per isolate, and shared across threads.** Under D1 a request's turns run
+/// on whichever tokio worker picks them up, so a resolver registered on one
+/// thread is resolved from another; a thread-local map loses it, and
+/// `resolve_res` fails to find the resolver and returns silently, leaving the
+/// handler awaiting a promise nothing will ever settle. The `Mutex` is what
+/// makes that safe, not the map's location.
+///
+/// It lives on `ActorRuntimeState` — one per isolate, reached from a scope —
+/// so a resolver is only ever looked up in the heap that owns it. One map for
+/// the whole process would also work, because op ids come from a single
+/// counter (`asyncrt::NEXT_ID`) and an id names exactly one resolver. But that
+/// makes an id-allocation bug into cross-isolate handle confusion, where this
+/// makes it a miss.
+type PromiseMap = HashMap<u64, v8::Global<v8::PromiseResolver>>;
+
+/// Requests cancelled by a reentrant `AbortFetch`. Global for the same reason
+/// as [`promises`]: the turn that observes a cancellation need not be on the
+/// thread that recorded it.
+static CANCELLED_REQUESTS: OnceLock<Mutex<HashSet<RequestId>>> = OnceLock::new();
+
+fn cancelled_requests() -> &'static Mutex<HashSet<RequestId>> {
+    CANCELLED_REQUESTS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn promise_store(scope: &mut v8::PinScope, id: u64, r: v8::Global<v8::PromiseResolver>) {
+    actor_runtime_state(scope)
+        .promises
+        .lock()
+        .unwrap()
+        .insert(id, r);
 }
 
 /// Resolve or reject op `id`'s promise with its outcome.
 fn resolve_res(tc: &mut v8::PinScope, id: u64, res: Result<asyncrt::OpOut, String>) {
-    let g = match PROMISES.with(|p| p.borrow_mut().remove(&id)) {
+    let g = match actor_runtime_state(tc).promises.lock().unwrap().remove(&id) {
         Some(g) => g,
         None => return,
     };
@@ -887,24 +963,20 @@ fn bytes_value<'s>(scope: &mut v8::PinScope<'s, '_>, bytes: Vec<u8>) -> v8::Loca
     v8::Uint8Array::new(scope, buffer, 0, len).unwrap().into()
 }
 
-fn handler_budget() -> Duration {
+pub fn handler_budget() -> Duration {
     static BUDGET: OnceLock<Duration> = OnceLock::new();
     *BUDGET.get_or_init(|| {
         Duration::from_secs(
-            std::env::var("CELLD_HANDLER_BUDGET_S")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .filter(|seconds| *seconds > 0)
-                .unwrap_or(300),
+            crate::env_vars::positive_or("CELLD_HANDLER_BUDGET_S", 300)
+                .expect("validated CELLD_HANDLER_BUDGET_S"),
         )
     })
 }
 
-/// Aborts raised on another thread — an HTTP or service-binding caller
-/// disconnecting while the target runs in a worker pool. Durable Object aborts
-/// also arrive as a reentrant `CellJob::AbortFetch` when a cell thread can
-/// service its own channel; a pool worker is blocked inside its handler, so
-/// the abort has to be visible from wherever the loop happens to be.
+/// Aborts raised by an HTTP or service-binding caller disconnecting while the
+/// target runs in the stateless isolate pool. Durable Object aborts can also
+/// arrive as a reentrant `CellJob::AbortFetch`, so the abort has to be visible
+/// from whichever turn observes it.
 ///
 /// The counter keeps the common path to one relaxed atomic load per loop turn:
 /// with nothing pending, the mutex is never taken.
@@ -938,300 +1010,10 @@ fn take_pending_abort(request_id: RequestId) -> bool {
     false
 }
 
-fn take_request_cancellation(request_id: Option<RequestId>) -> bool {
+pub fn take_request_cancellation(request_id: Option<RequestId>) -> bool {
     request_id.is_some_and(|request_id| {
-        CANCELLED_REQUESTS.with(|requests| requests.borrow_mut().remove(&request_id))
-            || take_pending_abort(request_id)
+        cancelled_requests().lock().unwrap().remove(&request_id) || take_pending_abort(request_id)
     })
-}
-
-enum RunLoopOutcome<T> {
-    Complete(T),
-    RequestCancelled,
-}
-
-/// Drive a promise and apply `on_fulfilled` as soon as it settles. The callback
-/// may return a composite waitUntil promise after publishing its response.
-/// Top-level fetches retain only registered waitUntil work; Durable Object
-/// events additionally drain I/O started by the handler because libraries
-/// commonly launch that work from synchronous callbacks.
-///
-/// Every exit path drops the region and purges unresolved host promises. A
-/// panicked/aborted op is rejected into JS rather than hanging the isolate.
-fn run_loop_then<'s, T, F>(
-    tc: &mut v8::PinScope<'s, '_>,
-    promise: v8::Local<v8::Promise>,
-    cell_rx: Option<&std::sync::mpsc::Receiver<CellJob>>,
-    actor_scope: Option<&str>,
-    request_id: Option<RequestId>,
-    drain_spawned_ops: bool,
-    on_fulfilled: F,
-) -> Result<RunLoopOutcome<T>>
-where
-    F: FnOnce(
-        &mut v8::PinScope<'s, '_>,
-        v8::Local<'s, v8::Value>,
-    ) -> Result<(T, Option<v8::Local<'s, v8::Promise>>)>,
-{
-    let mut region: JoinSet<(u64, Result<asyncrt::OpOut, String>)> = JoinSet::new();
-    ws_region_enter();
-    // Paired with `ws_region_exit` on the close path below, which every exit
-    // from this function reaches.
-    struct WsRegionGuard;
-    impl Drop for WsRegionGuard {
-        fn drop(&mut self) {
-            ws_region_exit();
-        }
-    }
-    let _ws_region = WsRegionGuard;
-    let mut idmap: HashMap<tokio::task::Id, u64> = HashMap::new();
-    let started = Instant::now();
-    let budget = handler_budget();
-    let mut on_fulfilled = Some(on_fulfilled);
-    let mut output = None;
-    let mut background = None;
-    let mut request_cancelled = false;
-    // Unknown until the handler first suspends. Cache the deadline so an actor
-    // with pending async I/O does not query SQLite on every 10 ms input-gate
-    // wakeup. Reentrant events invalidate it because they may change the alarm.
-    let mut next_alarm_at: Option<Option<i64>> = None;
-    let result = loop {
-        let mut published_this_turn = false;
-        if !request_cancelled && take_request_cancellation(request_id) {
-            request_cancelled = true;
-            if let Some(id) = request_id {
-                let _ = abort_incoming_request(tc, id);
-            }
-            background = end_event_context(tc)?;
-        }
-        for (id, fut) in asyncrt::drain_spawns() {
-            let h = region.spawn_on(async move { (id, fut.await) }, &asyncrt::op_handle());
-            idmap.insert(h.id(), id);
-        }
-        tc.perform_microtask_checkpoint(); // fire .then chains; they may enqueue ops
-        if let Some(error) = take_execution_termination(tc) {
-            break Err(error);
-        }
-        for (id, fut) in asyncrt::drain_spawns() {
-            let h = region.spawn_on(async move { (id, fut.await) }, &asyncrt::op_handle());
-            idmap.insert(h.id(), id);
-        }
-        if !request_cancelled && output.is_none() {
-            match promise.state() {
-                v8::PromiseState::Fulfilled => {
-                    let callback = on_fulfilled.take().expect("handler callback used once");
-                    let (value, wait_until) = callback(tc, promise.result(tc))?;
-                    published_this_turn = wait_until.is_some();
-                    output = Some(value);
-                    background = wait_until;
-                }
-                v8::PromiseState::Rejected => {
-                    break Err(anyhow!("rejected: {}", reject_reason(tc, promise)))
-                }
-                v8::PromiseState::Pending => {}
-            }
-        }
-        // Reentrant jobs are serviced before AND after the response publishes:
-        // post-response waitUntil work may call back into this cell (A→A), and
-        // a pending job would otherwise stall until the handler budget.
-        if let Some(rx) = cell_rx {
-            let mut serviced_event = false;
-            while service_reentrant(tc, rx)? {
-                serviced_event = true;
-                // Adopt ops the job just enqueued (an AbortFetch's abort
-                // listener registering waitUntil work, say) BEFORE the next
-                // job runs: a reentrant dispatch drains the shared spawn
-                // queue into its own region and aborts the survivors on
-                // exit, so an op left queued here would be silently killed
-                // and its promise purged — this event then waits on it
-                // forever.
-                for (id, fut) in asyncrt::drain_spawns() {
-                    let h = region.spawn_on(async move { (id, fut.await) }, &asyncrt::op_handle());
-                    idmap.insert(h.id(), id);
-                }
-            }
-            if output.is_none() && !request_cancelled && take_request_cancellation(request_id) {
-                request_cancelled = true;
-                if let Some(id) = request_id {
-                    let _ = abort_incoming_request(tc, id);
-                }
-                background = end_event_context(tc)?;
-            }
-            if serviced_event {
-                next_alarm_at = None;
-            }
-            tc.perform_microtask_checkpoint();
-            if let Some(error) = take_execution_termination(tc) {
-                break Err(error);
-            }
-            if !request_cancelled && output.is_none() {
-                match promise.state() {
-                    v8::PromiseState::Fulfilled => {
-                        let callback = on_fulfilled.take().expect("handler callback used once");
-                        let (value, wait_until) = callback(tc, promise.result(tc))?;
-                        published_this_turn = wait_until.is_some();
-                        output = Some(value);
-                        background = wait_until;
-                    }
-                    v8::PromiseState::Rejected => {
-                        break Err(anyhow!("rejected: {}", reject_reason(tc, promise)))
-                    }
-                    v8::PromiseState::Pending => {}
-                }
-            }
-        }
-        // Response marshalling can start a bounded JS-to-host body pump and
-        // register it with waitUntil. Drive the pump once and move its native
-        // ops into this event region before checking whether the region is
-        // empty. Pending handlers pay only the branch above.
-        if published_this_turn {
-            tc.perform_microtask_checkpoint();
-            if let Some(error) = take_execution_termination(tc) {
-                break Err(error);
-            }
-            for (id, fut) in asyncrt::drain_spawns() {
-                let h = region.spawn_on(async move { (id, fut.await) }, &asyncrt::op_handle());
-                idmap.insert(h.id(), id);
-            }
-        }
-        if request_cancelled || output.is_some() {
-            let event_done = match background {
-                None => true,
-                Some(wait_until) => match wait_until.state() {
-                    v8::PromiseState::Fulfilled => true,
-                    v8::PromiseState::Rejected => {
-                        tracing::warn!(
-                            error = %reject_reason(tc, wait_until),
-                            "waitUntil aggregate rejected",
-                        );
-                        true
-                    }
-                    v8::PromiseState::Pending => false,
-                },
-            };
-            if event_done && (request_cancelled || !drain_spawned_ops || region.is_empty()) {
-                if request_cancelled {
-                    break Ok(RunLoopOutcome::RequestCancelled);
-                }
-                break Ok(RunLoopOutcome::Complete(output.take().unwrap()));
-            }
-        }
-        if !request_cancelled && output.is_none() {
-            if let Some(scope) = actor_scope {
-                let alarm_at = *next_alarm_at.get_or_insert_with(|| storage::get_alarm(scope));
-                if alarm_at.is_some_and(|alarm_at| alarm_at <= unix_now_ms()) {
-                    service_due_alarm(tc, scope, cell_rx.expect("actor events have a receiver"))?;
-                    next_alarm_at = None;
-                    continue;
-                }
-            }
-        }
-        if region.is_empty() {
-            if request_cancelled {
-                tracing::warn!("request-cancellation waitUntil stalled with no pending op");
-                break Ok(RunLoopOutcome::RequestCancelled);
-            }
-            if output.is_none() {
-                if let (Some(rx), Some(Some(alarm_at))) = (cell_rx, next_alarm_at) {
-                    let elapsed = started.elapsed();
-                    if elapsed >= budget {
-                        break Err(anyhow!("handler exceeded {}s budget", budget.as_secs()));
-                    }
-                    let until_alarm =
-                        Duration::from_millis(alarm_at.saturating_sub(unix_now_ms()).max(0) as u64);
-                    let wait = (budget - elapsed).min(until_alarm);
-                    match rx.recv_timeout(wait) {
-                        Ok(job) => {
-                            if !handle_reentrant_job(tc, rx, job)? {
-                                break Err(anyhow!("cell shutting down"));
-                            }
-                            next_alarm_at = None;
-                        }
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                            break Err(anyhow!("cell channel disconnected"));
-                        }
-                    }
-                    continue;
-                }
-            }
-            break match output.take() {
-                Some(_) => Err(anyhow!("waitUntil stalled with no pending op")),
-                None => Err(anyhow!("handler stalled: awaited work with no pending op")),
-            };
-        }
-        let elapsed = started.elapsed();
-        if elapsed >= budget {
-            if request_cancelled {
-                tracing::warn!("request-cancellation waitUntil exceeded handler budget");
-                break Ok(RunLoopOutcome::RequestCancelled);
-            }
-            break Err(anyhow!("handler exceeded {}s budget", budget.as_secs()));
-        }
-        // block until one op completes (or the remaining budget elapses). The
-        // timeout must be built INSIDE the runtime context, hence the async {}.
-        let remaining = budget - elapsed;
-        // An abortable ingress or service-binding request has to notice a
-        // cancellation raised on another thread, so its wait is bounded the
-        // same way an actor's is. Non-abortable internal fetches retain the
-        // uncapped wait.
-        let mut wait = if cell_rx.is_some() || request_id.is_some() {
-            remaining.min(Duration::from_millis(10))
-        } else {
-            remaining
-        };
-        if let Some(Some(alarm_at)) = next_alarm_at {
-            wait = wait.min(Duration::from_millis(
-                alarm_at.saturating_sub(unix_now_ms()).max(0) as u64,
-            ));
-        }
-        let joined = asyncrt::block_on(async {
-            tokio::time::timeout(wait, region.join_next_with_id()).await
-        });
-        match joined {
-            Ok(Some(Ok((tid, (id, res))))) => {
-                idmap.remove(&tid);
-                resolve_res(tc, id, res);
-                next_alarm_at = None;
-            }
-            Ok(Some(Err(je))) => {
-                // op panicked/aborted → reject its promise
-                if let Some(id) = idmap.remove(&je.id()) {
-                    resolve_res(tc, id, Err("op aborted".into()));
-                    next_alarm_at = None;
-                }
-            }
-            Ok(None) => {} // region drained concurrently; loop re-checks
-            Err(_) if cell_rx.is_some() || request_id.is_some() => continue,
-            Err(_) => break Err(anyhow!("handler exceeded {}s budget", budget.as_secs())),
-        }
-    };
-    // region close: `region` drops here (aborts survivors); purge resolvers for
-    // anything still pending or enqueued-but-unspawned so PROMISES can't leak.
-    for id in idmap.values() {
-        PROMISES.with(|p| {
-            p.borrow_mut().remove(id);
-        });
-    }
-    for (id, _) in asyncrt::drain_spawns() {
-        PROMISES.with(|p| {
-            p.borrow_mut().remove(&id);
-        });
-    }
-    result
-}
-
-fn run_loop<'s>(
-    tc: &mut v8::PinScope<'s, '_>,
-    promise: v8::Local<v8::Promise>,
-    cell_rx: Option<&std::sync::mpsc::Receiver<CellJob>>,
-) -> Result<v8::Local<'s, v8::Value>> {
-    match run_loop_then(tc, promise, cell_rx, None, None, false, |_tc, value| {
-        Ok((value, None))
-    })? {
-        RunLoopOutcome::Complete(value) => Ok(value),
-        RunLoopOutcome::RequestCancelled => Err(anyhow!("The client has disconnected")),
-    }
 }
 
 fn resolved_promise<'s>(
@@ -1242,243 +1024,6 @@ fn resolved_promise<'s>(
         v8::PromiseResolver::new(tc).ok_or_else(|| anyhow!("could not create event promise"))?;
     resolver.resolve(tc, value);
     Ok(resolver.get_promise(tc))
-}
-
-/// Publish a fetch response when the handler settles, then keep driving the
-/// event region so waitUntil work can complete without delaying headers or a
-/// streaming body.
-fn complete_fetch_event<'s>(
-    tc: &mut v8::PinScope<'s, '_>,
-    ret: v8::Local<'s, v8::Value>,
-    cell_rx: Option<&std::sync::mpsc::Receiver<CellJob>>,
-    critical_scope: Option<&str>,
-    // The cell's committed-write position sampled before the handler ran. The
-    // response's `write_position` is set only if the handler advanced it, so
-    // the output gate sees a per-request write and ignores celld's own
-    // activation-time writes (the DO actor name, alarm bookkeeping).
-    writes_before: Option<u64>,
-    request_id: Option<RequestId>,
-    reply: tokio::sync::oneshot::Sender<Result<HttpResponse>>,
-) {
-    let promise = match ret.try_cast::<v8::Promise>() {
-        Ok(promise) => Ok(promise),
-        Err(_) => resolved_promise(tc, ret),
-    };
-    let mut reply = Some(reply);
-    let result = promise.and_then(|promise| {
-        run_loop_then(
-            tc,
-            promise,
-            cell_rx,
-            critical_scope,
-            request_id,
-            false,
-            |tc, value| {
-                if let Some(error) = critical_scope.and_then(storage::sql_critical_error) {
-                    return Err(anyhow!(error));
-                }
-                let mut response = read_response(tc, value, cell_rx)?;
-                // Gate on durability only if this handler advanced the cell's
-                // committed-write position past where it was before the handler
-                // ran -- a per-request write, not celld's activation writes.
-                response.write_position = match (
-                    writes_before,
-                    critical_scope.and_then(storage::write_position),
-                ) {
-                    (Some(before), Some(after)) if after > before => Some(after),
-                    _ => None,
-                };
-                let wait_until = end_event_context(tc)?;
-                if let Some(reply) = reply.take() {
-                    let _ = reply.send(Ok(response));
-                }
-                Ok(((), wait_until))
-            },
-        )
-    });
-    let result = match critical_scope.and_then(storage::sql_critical_error) {
-        Some(error) => Err(anyhow!(error)),
-        None => result,
-    };
-    match result {
-        Ok(RunLoopOutcome::Complete(())) => {}
-        Ok(RunLoopOutcome::RequestCancelled) => {
-            if let Some(reply) = reply.take() {
-                let _ = reply.send(Err(anyhow!("The client has disconnected")));
-            }
-        }
-        Err(error) => {
-            let _ = end_event_context(tc);
-            if let Some(reply) = reply.take() {
-                let _ = reply.send(Err(error));
-            } else {
-                tracing::warn!(%error, "post-response event work failed");
-            }
-        }
-    }
-}
-
-fn run_event_value<'s>(
-    tc: &mut v8::PinScope<'s, '_>,
-    ret: v8::Local<'s, v8::Value>,
-    cell_rx: Option<&std::sync::mpsc::Receiver<CellJob>>,
-    actor_scope: Option<&str>,
-    request_id: Option<RequestId>,
-) -> Result<v8::Local<'s, v8::Value>> {
-    let promise = match ret.try_cast::<v8::Promise>() {
-        Ok(promise) => promise,
-        Err(_) => resolved_promise(tc, ret)?,
-    };
-    let result = run_loop_then(
-        tc,
-        promise,
-        cell_rx,
-        actor_scope,
-        request_id,
-        true,
-        |tc, value| Ok((value, end_event_context(tc)?)),
-    );
-    match result {
-        Ok(RunLoopOutcome::Complete(value)) => Ok(value),
-        Ok(RunLoopOutcome::RequestCancelled) => Err(anyhow!("The client has disconnected")),
-        Err(error) => {
-            let _ = end_event_context(tc);
-            Err(error)
-        }
-    }
-}
-
-fn handle_reentrant_job(
-    tc: &mut v8::PinScope,
-    rx: &std::sync::mpsc::Receiver<CellJob>,
-    job: CellJob,
-) -> Result<bool> {
-    match job {
-        CellJob::Fetch {
-            request_id,
-            scope,
-            name,
-            url,
-            method,
-            body,
-            headers,
-            reply,
-        } => {
-            let result = register_actor_name(tc, &scope, name.as_deref()).and_then(|()| {
-                call_dispatch_to(
-                    tc,
-                    &scope,
-                    FetchRequest {
-                        url: &url,
-                        method: &method,
-                        body: &body,
-                        headers: &headers,
-                        request_id,
-                    },
-                    rx,
-                )
-            });
-            let _ = reply.send(result);
-        }
-        CellJob::Rpc {
-            scope,
-            name,
-            method,
-            args,
-            reply,
-        } => {
-            let result = register_actor_name(tc, &scope, name.as_deref())
-                .and_then(|()| call_dispatch_rpc(tc, &scope, &method, args, rx));
-            let _ = reply.send(result);
-        }
-        CellJob::WsOpen {
-            scope,
-            ws_id,
-            protocol,
-            reply,
-        } => {
-            let result = call_dispatch_ws_open(tc, &scope, ws_id, &protocol, rx);
-            let _ = reply.send(result);
-        }
-        CellJob::WsMessage {
-            scope,
-            ws_id,
-            data,
-            reply,
-        } => {
-            let result = call_dispatch_ws(tc, &scope, ws_id, data, rx);
-            let _ = reply.send(result);
-        }
-        CellJob::WsClosed {
-            scope,
-            ws_id,
-            code,
-            reason,
-            was_clean,
-            reply,
-        } => {
-            let result = call_dispatch_ws_closed(tc, &scope, ws_id, code, &reason, was_clean, rx);
-            let _ = reply.send(result);
-        }
-        // Two top-level Worker events cannot run concurrently in one isolate.
-        // The idle reservation normally prevents this path, but a queued job
-        // can be observed by a nested actor event under enough overlap. Move
-        // it to the stateless pool; any call back to this cell then arrives as
-        // an ordinary reentrant CellJob::Fetch, which is supported above.
-        CellJob::WorkerFetch {
-            request_id,
-            url,
-            method,
-            body,
-            headers,
-            inline_activity: _inline_activity,
-            fallback_workers,
-            reply,
-        } => {
-            // The reentrant pump implies this isolate is running an actor event,
-            // so the sans-IO routing is fixed: a Worker event never runs nested
-            // — reschedule to the pool carrying the request identity.
-            debug_assert_eq!(
-                celld_logic::schedule::route_worker_fetch(true),
-                celld_logic::schedule::Route::RescheduleToPool,
-            );
-            let _ = fallback_workers.send(crate::WorkerJob::Fetch {
-                queued_at: Instant::now(),
-                url,
-                method,
-                body,
-                headers,
-                request_id: Some(request_id),
-                reply,
-            });
-        }
-        CellJob::AbortFetch { request_id } => match abort_incoming_request(tc, request_id) {
-            Ok(true) => {
-                CANCELLED_REQUESTS.with(|requests| {
-                    requests.borrow_mut().insert(request_id);
-                });
-            }
-            Ok(false) => {}
-            Err(error) => {
-                tracing::warn!(%error, request_id, "incoming request abort listener failed");
-            }
-        },
-        CellJob::Alarm {
-            scope,
-            scheduled_ms,
-            reply,
-        } => {
-            let now = unix_now_ms();
-            let result = if now < scheduled_ms {
-                Err(anyhow!("alarm dispatched before its deadline"))
-            } else {
-                service_due_alarm(tc, &scope, rx).map(|()| storage::get_alarm(&scope))
-            };
-            let _ = reply.send(result);
-        }
-        CellJob::Shutdown => return Ok(false),
-    }
-    Ok(true)
 }
 
 fn abort_incoming_request(tc: &mut v8::PinScope, request_id: RequestId) -> Result<bool> {
@@ -1495,320 +1040,6 @@ fn abort_incoming_request(tc: &mut v8::PinScope, request_id: RequestId) -> Resul
         .call(tc, recv, &[request_id.into()])
         .ok_or_else(|| anyhow!("__abortIncomingRequest threw"))?;
     Ok(result.boolean_value(tc))
-}
-
-fn service_reentrant(
-    tc: &mut v8::PinScope,
-    rx: &std::sync::mpsc::Receiver<CellJob>,
-) -> Result<bool> {
-    let job = match rx.try_recv() {
-        Ok(job) => job,
-        Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(false),
-        Err(std::sync::mpsc::TryRecvError::Disconnected) => return Ok(false),
-    };
-    handle_reentrant_job(tc, rx, job)
-}
-
-fn unix_now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(i64::MAX as u128) as i64
-}
-
-fn call_fire_alarm(
-    tc: &mut v8::PinScope,
-    scope: &str,
-    scheduled_time: i64,
-    retry: i64,
-    rx: &std::sync::mpsc::Receiver<CellJob>,
-) -> std::result::Result<(), AlarmRunError> {
-    let context = tc.get_current_context();
-    let global = context.global(tc);
-    let key = v8::String::new(tc, "__fireAlarm").unwrap();
-    let function: v8::Local<v8::Function> = global
-        .get(tc, key.into())
-        .ok_or_else(|| AlarmRunError::infrastructure(anyhow!("no __fireAlarm")))?
-        .try_into()
-        .map_err(|_| AlarmRunError::infrastructure(anyhow!("__fireAlarm is not a function")))?;
-    let scope = v8::String::new(tc, scope).unwrap();
-    let scheduled_time = v8::Number::new(tc, scheduled_time as f64);
-    let retry = v8::Number::new(tc, retry as f64);
-    let recv = v8::undefined(tc).into();
-    begin_event_context(tc).map_err(AlarmRunError::infrastructure)?;
-    let Some(ret) = function.call(
-        tc,
-        recv,
-        &[scope.into(), scheduled_time.into(), retry.into()],
-    ) else {
-        let _ = end_event_context(tc);
-        return Err(AlarmRunError::user(anyhow!("alarm threw")));
-    };
-    run_event_value(tc, ret, Some(rx), None, None).map_err(AlarmRunError::user)?;
-    Ok(())
-}
-
-fn service_due_alarm(
-    tc: &mut v8::PinScope,
-    scope: &str,
-    rx: &std::sync::mpsc::Receiver<CellJob>,
-) -> Result<()> {
-    let now = unix_now_ms();
-    let Some((scheduled_time, retry)) = storage::due_alarm_entry(scope, now) else {
-        return Ok(());
-    };
-    storage::begin_alarm_handler(scope, scheduled_time);
-    match call_fire_alarm(tc, scope, scheduled_time, retry, rx) {
-        Ok(()) => {
-            storage::finish_alarm_handler(scope, true, now);
-            tracing::info!(cell = %scope, scheduled_time, "alarm fired reentrantly");
-        }
-        Err(error) => {
-            let counts_against_limit = error.counts_against_limit();
-            storage::finish_alarm_handler_with_retry_policy(
-                scope,
-                false,
-                now,
-                counts_against_limit,
-            );
-            tracing::warn!(
-                %error,
-                cell = %scope,
-                scheduled_time,
-                counts_against_limit,
-                "reentrant alarm failed; backing off",
-            );
-        }
-    }
-    Ok(())
-}
-
-fn call_dispatch_to(
-    tc: &mut v8::PinScope,
-    scope: &str,
-    request: FetchRequest<'_>,
-    rx: &std::sync::mpsc::Receiver<CellJob>,
-) -> Result<HttpResponse> {
-    let context = tc.get_current_context();
-    let global = context.global(tc);
-    let key = v8::String::new(tc, "__dispatchTo").unwrap();
-    let f: v8::Local<v8::Function> = global
-        .get(tc, key.into())
-        .ok_or_else(|| anyhow!("no __dispatchTo"))?
-        .try_into()
-        .map_err(|_| anyhow!("not fn"))?;
-    let sc = v8::String::new(tc, scope).unwrap();
-    let u = v8::String::new(tc, request.url).unwrap();
-    let m = v8::String::new(tc, request.method).unwrap();
-    let b = bytes_value(tc, request.body.to_vec());
-    let h = v8::String::new(tc, &serde_json::to_string(request.headers)?).unwrap();
-    let request_id_value: v8::Local<v8::Value> = match request.request_id {
-        Some(request_id) => v8::String::new(tc, &request_id_string(request_id))
-            .unwrap()
-            .into(),
-        None => v8::null(tc).into(),
-    };
-    let recv = v8::undefined(tc).into();
-    begin_event_context(tc)?;
-    let Some(ret) = f.call(
-        tc,
-        recv,
-        &[sc.into(), u.into(), m.into(), b, h.into(), request_id_value],
-    ) else {
-        let _ = end_event_context(tc);
-        return Err(anyhow!("dispatchTo threw"));
-    };
-    let ret = run_event_value(tc, ret, Some(rx), Some(scope), request.request_id);
-    if let Some(error) = storage::sql_critical_error(scope) {
-        return Err(anyhow!(error));
-    }
-    let ret = ret?;
-    read_response(tc, ret, Some(rx))
-}
-
-/// An `RpcData` payload as the JS argument `__dispatchRpc` expects: a string
-/// for the JSON flavor, a `Uint8Array` for structured clone.
-fn rpc_data_value<'s>(scope: &mut v8::PinScope<'s, '_>, data: RpcData) -> v8::Local<'s, v8::Value> {
-    match data {
-        RpcData::Json(json) => v8::String::new(scope, &json).unwrap().into(),
-        RpcData::V8(bytes) => bytes_value(scope, bytes),
-    }
-}
-
-/// The inverse: `__dispatchRpc` answers in the flavor it was asked in.
-fn rpc_data_ret(scope: &mut v8::PinScope, ret: v8::Local<v8::Value>) -> RpcData {
-    match view_bytes(ret) {
-        Some(bytes) => RpcData::V8(bytes),
-        None => RpcData::Json(ret.to_rust_string_lossy(scope)),
-    }
-}
-
-fn call_dispatch_rpc(
-    tc: &mut v8::PinScope,
-    scope: &str,
-    method: &str,
-    args: RpcData,
-    rx: &std::sync::mpsc::Receiver<CellJob>,
-) -> Result<RpcData> {
-    let context = tc.get_current_context();
-    let global = context.global(tc);
-    let key = v8::String::new(tc, "__dispatchRpc").unwrap();
-    let f: v8::Local<v8::Function> = global
-        .get(tc, key.into())
-        .ok_or_else(|| anyhow!("no __dispatchRpc"))?
-        .try_into()
-        .map_err(|_| anyhow!("not fn"))?;
-    let sc = v8::String::new(tc, scope).unwrap();
-    let method = v8::String::new(tc, method).unwrap();
-    let args = rpc_data_value(tc, args);
-    let recv = v8::undefined(tc).into();
-    begin_event_context(tc)?;
-    let Some(ret) = f.call(tc, recv, &[sc.into(), method.into(), args]) else {
-        let _ = end_event_context(tc);
-        return Err(anyhow!("dispatchRpc threw"));
-    };
-    let ret = run_event_value(tc, ret, Some(rx), Some(scope), None);
-    if let Some(error) = storage::sql_critical_error(scope) {
-        return Err(anyhow!(error));
-    }
-    let ret = ret?;
-    Ok(rpc_data_ret(tc, ret))
-}
-
-fn call_dispatch_ws(
-    tc: &mut v8::PinScope,
-    scope: &str,
-    ws_id: u64,
-    data: WsIn,
-    rx: &std::sync::mpsc::Receiver<CellJob>,
-) -> Result<WsDispatch> {
-    let context = tc.get_current_context();
-    let global = context.global(tc);
-    let (key, data) = match data {
-        WsIn::Text(text) => ("__wsMessage", v8::String::new(tc, &text).unwrap().into()),
-        WsIn::Binary(bytes) => ("__wsBinary", bytes_value(tc, bytes)),
-    };
-    let key = v8::String::new(tc, key).unwrap();
-    let f: v8::Local<v8::Function> = global
-        .get(tc, key.into())
-        .ok_or_else(|| anyhow!("no WebSocket message dispatcher"))?
-        .try_into()
-        .map_err(|_| anyhow!("not fn"))?;
-    let sc = v8::String::new(tc, scope).unwrap();
-    let id = v8::Number::new(tc, ws_id as f64);
-    let recv = v8::undefined(tc).into();
-    // Sample the committed-write position and capture outbound frames across the
-    // handler: the output gate holds a message's frames until its write proves
-    // durable (the same delta discipline as the fetch path).
-    let before = storage::write_position(scope);
-    ws_capture_begin();
-    begin_event_context(tc)?;
-    let Some(ret) = f.call(tc, recv, &[sc.into(), id.into(), data]) else {
-        let _ = end_event_context(tc);
-        let _ = ws_capture_take();
-        return Err(anyhow!("WebSocket message dispatch threw"));
-    };
-    let result = run_event_value(tc, ret, Some(rx), Some(scope), None);
-    let frames = ws_capture_take();
-    if let Some(error) = storage::sql_critical_error(scope) {
-        return Err(anyhow!(error));
-    }
-    result?;
-    let write_position = match (before, storage::write_position(scope)) {
-        (Some(before), Some(after)) if after > before => Some(after),
-        _ => None,
-    };
-    // A handler that did not write has nothing to hold its frames behind, so
-    // send them here rather than shipping them to the actor and back. That
-    // detour is not free: it races the socket's own teardown, and a frame that
-    // arrives after `ws_unregister` is discarded -- the handler's send silently
-    // never happens. Only a write's frames take the barrier path.
-    if write_position.is_none() {
-        ws_emit_batch(frames);
-        return Ok(WsDispatch {
-            frames: Vec::new(),
-            write_position,
-        });
-    }
-    Ok(WsDispatch {
-        frames,
-        write_position,
-    })
-}
-
-fn call_dispatch_ws_open(
-    tc: &mut v8::PinScope,
-    scope: &str,
-    ws_id: u64,
-    protocol: &str,
-    rx: &std::sync::mpsc::Receiver<CellJob>,
-) -> Result<()> {
-    let context = tc.get_current_context();
-    let global = context.global(tc);
-    let key = v8::String::new(tc, "__wsOpen").unwrap();
-    let f: v8::Local<v8::Function> = global
-        .get(tc, key.into())
-        .ok_or_else(|| anyhow!("no __wsOpen"))?
-        .try_into()
-        .map_err(|_| anyhow!("not fn"))?;
-    let sc = v8::String::new(tc, scope).unwrap();
-    let id = v8::Number::new(tc, ws_id as f64);
-    let protocol = v8::String::new(tc, protocol).unwrap();
-    let recv = v8::undefined(tc).into();
-    begin_event_context(tc)?;
-    let Some(ret) = f.call(tc, recv, &[sc.into(), id.into(), protocol.into()]) else {
-        let _ = end_event_context(tc);
-        return Err(anyhow!("wsOpen threw"));
-    };
-    run_event_value(tc, ret, Some(rx), Some(scope), None)?;
-    Ok(())
-}
-
-fn call_dispatch_ws_closed(
-    tc: &mut v8::PinScope,
-    scope: &str,
-    ws_id: u64,
-    code: u16,
-    reason: &str,
-    was_clean: bool,
-    rx: &std::sync::mpsc::Receiver<CellJob>,
-) -> Result<()> {
-    let context = tc.get_current_context();
-    let global = context.global(tc);
-    let key = v8::String::new(tc, "__wsClosed").unwrap();
-    let f: v8::Local<v8::Function> = global
-        .get(tc, key.into())
-        .ok_or_else(|| anyhow!("no __wsClosed"))?
-        .try_into()
-        .map_err(|_| anyhow!("not fn"))?;
-    let sc = v8::String::new(tc, scope).unwrap();
-    let id = v8::Number::new(tc, ws_id as f64);
-    let code = v8::Number::new(tc, f64::from(code));
-    let reason = v8::String::new(tc, reason).unwrap();
-    let was_clean = v8::Boolean::new(tc, was_clean);
-    let recv = v8::undefined(tc).into();
-    begin_event_context(tc)?;
-    let Some(ret) = f.call(
-        tc,
-        recv,
-        &[
-            sc.into(),
-            id.into(),
-            code.into(),
-            reason.into(),
-            was_clean.into(),
-        ],
-    ) else {
-        let _ = end_event_context(tc);
-        return Err(anyhow!("wsClosed threw"));
-    };
-    let result = run_event_value(tc, ret, Some(rx), Some(scope), None);
-    if let Some(error) = storage::sql_critical_error(scope) {
-        return Err(anyhow!(error));
-    }
-    result?;
-    Ok(())
 }
 
 /// The rejection reason of a settled-rejected promise, with a little stack.
@@ -1873,16 +1104,32 @@ pub struct Compat {
     pub websocket_standard_binary_type: bool,
 }
 
+/// A non-main module the worker's main module may import, tagged by how the
+/// runtime materializes it.
+pub enum ModuleSource {
+    /// UTF-8 content served as `export default "<content>"` (wrangler's Text
+    /// rule), registered under the given specifier verbatim.
+    Text(String),
+    /// JS source compiled as a sibling ES module (Worker Loader multi-module
+    /// bundles), registered under both `name` and `./name`.
+    EsModule(String),
+    /// Wasm bytes served as a module whose default export is the compiled
+    /// `WebAssembly.Module` (Wrangler's `CompiledWasm` rule), registered
+    /// under both `name` and `./name`.
+    Wasm(bytes::Bytes),
+}
+
 pub struct WorkerConfig {
     src: String,
-    script_name: String,
+    pub script_name: String,
     do_classes: Vec<String>,
     bindings: Vec<(String, String)>,
     r2_bindings: Vec<String>,
     ai_binding: Option<String>,
     vars: Vec<(String, String)>,
     node: String,
-    text: Vec<(String, String)>,
+    /// The worker's non-main modules, so the main module can import siblings.
+    modules: Vec<(String, ModuleSource)>,
     compat: Compat,
     /// `[[services]]`: (binding name, target script, optional entrypoint).
     /// The target runs in this process; see [[service-bindings]].
@@ -1896,9 +1143,6 @@ pub struct WorkerConfig {
     /// Extra `env` values a loaded worker was handed, as a JSON object string
     /// merged onto its `env`. Loader-only; empty for normal workers.
     loader_env: Option<String>,
-    /// A loaded worker's non-main modules as (name, source), so the main module
-    /// can import siblings. Loader-only; empty for normal single-file bundles.
-    loader_modules: Vec<(String, String)>,
 }
 
 pub struct WorkerConfigOptions {
@@ -1910,7 +1154,7 @@ pub struct WorkerConfigOptions {
     pub ai_binding: Option<String>,
     pub vars: Vec<(String, String)>,
     pub node: String,
-    pub text: Vec<(String, String)>,
+    pub modules: Vec<(String, ModuleSource)>,
     pub compat: Compat,
 }
 
@@ -1925,7 +1169,7 @@ impl WorkerConfig {
             ai_binding,
             vars,
             node,
-            text,
+            modules,
             compat,
         } = options;
         Self {
@@ -1937,14 +1181,13 @@ impl WorkerConfig {
             ai_binding,
             vars,
             node,
-            text,
+            modules,
             compat,
             services: Vec::new(),
             asset_binding: None,
             loader_binding: None,
             egress: EgressPolicy::Allow,
             loader_env: None,
-            loader_modules: Vec::new(),
         }
     }
 
@@ -1966,12 +1209,6 @@ impl WorkerConfig {
         self
     }
 
-    /// Non-main modules a loaded worker's main module may import.
-    fn with_loader_modules(mut self, modules: Vec<(String, String)>) -> Self {
-        self.loader_modules = modules;
-        self
-    }
-
     /// Declare the service bindings this Worker may call.
     pub fn with_services(mut self, services: Vec<(String, String, Option<String>)>) -> Self {
         self.services = services;
@@ -1986,16 +1223,82 @@ impl WorkerConfig {
 
 pub struct Worker {
     inner: Option<WorkerIsolate>,
-    config: Arc<WorkerConfig>,
-    owned: Arc<[String]>,
 }
 
 pub struct WorkerIsolate {
-    isolate: v8::OwnedIsolate,
+    /// Shared rather than owned: under D1 an isolate belongs to no thread,
+    /// and a worker enters it by taking its `v8::Locker`
+    /// (wiki/designs/isolate-threading.md).
+    ///
+    /// Every `lock()` below blocks until the current holder releases. That is
+    /// only safe because the pool takes an async permit for this isolate
+    /// first, so the lock is uncontended by construction; a `lock()` reached
+    /// without that permit would be a blocking call on a tokio worker.
+    isolate: v8::SharedIsolate,
+    /// The one realm this isolate has: its context, and the entry `fetch`
+    /// that lives in it.
+    ///
+    /// It was a `HashMap` keyed by cell, on the premise that a cell needs a
+    /// realm of its own. It does not, and nothing ever put a second one in.
+    /// The harness already keys instances by scope (`__cell.instances`), and
+    /// Durable Objects **share** a context per script rather than getting one
+    /// each — a context per cell would also duplicate the compiled module per
+    /// cell, which is most of what sharing an isolate saves.
+    realm: Realm,
+    original_heap_limit: usize,
+    /// The storage of the cells this isolate hosts.
+    ///
+    /// It lives here, and not in a thread-local, because a driven cell's
+    /// turns run on whatever tokio worker holds the isolate. See
+    /// `storage::Cells`.
+    cells: storage::Cells,
+}
+
+/// An isolate's context and the entry `fetch` that lives in it.
+///
+/// `fetch` is here rather than beside the isolate because a function is a
+/// value in the realm that created it.
+struct Realm {
     context: v8::Global<v8::Context>,
     fetch: v8::Global<v8::Function>,
-    original_heap_limit: usize,
-    runtime_state: Arc<ActorRuntimeState>,
+}
+
+impl WorkerIsolate {
+    /// Take the isolate for one turn, and make the cells it hosts reachable
+    /// while it is held.
+    ///
+    /// The two belong together. The lock is what makes this thread the only
+    /// one that can touch the isolate, and a cell's SQLite handles are part
+    /// of what it may touch — so a locker taken without installing them
+    /// would let a turn reach no storage at all, or another isolate's.
+    /// Pairing them here is why no call site has to remember.
+    fn lock(&self) -> (v8::Locker<'_>, storage::Installed) {
+        (self.isolate.lock(), self.cells.install())
+    }
+
+    /// Localise the realm for one turn.
+    ///
+    /// **Taking the scope is the point.** Reaching a realm means touching
+    /// `Global` handles, which on a shared isolate is only legal while its
+    /// `Locker` is held — and there is no scope to pass until the isolate is
+    /// locked. So the requirement is structural rather than a comment asking
+    /// callers to remember it. It was a comment, and the one call site that
+    /// forgot cloned two `Global`s a line too early; the panic happened
+    /// inside a spawned request task, where tokio swallowed it and it
+    /// surfaced only as a poisoned mutex on every later request.
+    fn realm<'s>(&self, hs: &mut v8::PinScope<'s, '_, ()>) -> Entered<'s> {
+        Entered {
+            context: v8::Local::new(hs, &self.realm.context),
+            fetch: v8::Local::new(hs, &self.realm.fetch),
+        }
+    }
+}
+
+/// One realm, entered. Valid only for the scope that produced it, which is
+/// what ties it to the isolate being locked.
+struct Entered<'s> {
+    context: v8::Local<'s, v8::Context>,
+    fetch: v8::Local<'s, v8::Function>,
 }
 
 impl std::ops::Deref for Worker {
@@ -2036,9 +1339,9 @@ enum EgressPolicy {
 
 #[derive(Default)]
 struct ActorRuntimeState {
+    promises: std::sync::Mutex<PromiseMap>,
     termination: std::sync::Mutex<Option<ExecutionTermination>>,
     pending_puts: std::sync::Mutex<PendingPuts>,
-    worker_exit_requested: AtomicBool,
     egress: EgressPolicy,
 }
 
@@ -2048,6 +1351,10 @@ struct ExecutionTermination {
 }
 
 fn finish_terminated_actor_event(scope: &mut v8::PinScope, actor_scope: &str) {
+    // The one exit from a block that runs no JS, so the `finally` in
+    // harness.js never releases. Leave it and the cell refuses everything
+    // from here on.
+    cell_gate_abandon(actor_scope);
     let global = scope.get_current_context().global(scope);
     let key = v8::String::new(scope, "__endTerminatedActorEvent").unwrap();
     let Some(value) = global.get(scope, key.into()) else {
@@ -2059,6 +1366,41 @@ fn finish_terminated_actor_event(scope: &mut v8::PinScope, actor_scope: &str) {
     let actor_scope = v8::String::new(scope, actor_scope).unwrap();
     let recv = v8::undefined(scope).into();
     let _ = function.call(scope, recv, &[actor_scope.into()]);
+}
+
+/// Compile and run a JS expression that evaluates to a function.
+fn compile_fn<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    src: &str,
+) -> Result<v8::Local<'s, v8::Function>> {
+    let code = v8::String::new(scope, src).unwrap();
+    let script =
+        v8::Script::compile(scope, code, None).ok_or_else(|| anyhow!("compile shim: {src}"))?;
+    let value = script
+        .run(scope)
+        .ok_or_else(|| anyhow!("run shim: {src}"))?;
+    value
+        .try_into()
+        .map_err(|_| anyhow!("shim is not a function: {src}"))
+}
+
+/// Whether `register_entrypoints` put `name` in the `__cell.<registry>`
+/// object (e.g. `entrypoints`, `doExports`).
+fn cell_registry_has(scope: &mut v8::PinScope, registry: &str, name: &str) -> Result<bool> {
+    let context = scope.get_current_context();
+    let global = context.global(scope);
+    let cell_key = v8::String::new(scope, "__cell").unwrap();
+    let registry_key = v8::String::new(scope, registry).unwrap();
+    let registry_obj = global
+        .get(scope, cell_key.into())
+        .and_then(|value| value.to_object(scope))
+        .and_then(|cell| cell.get(scope, registry_key.into()))
+        .and_then(|value| value.to_object(scope))
+        .ok_or_else(|| anyhow!("missing __cell.{registry} registry"))?;
+    let name_key = v8::String::new(scope, name).unwrap();
+    Ok(registry_obj
+        .has_own_property(scope, name_key.into())
+        .unwrap_or(false))
 }
 
 fn take_execution_termination(scope: &mut v8::PinScope) -> Option<anyhow::Error> {
@@ -2092,57 +1434,1253 @@ extern "C" fn near_heap_limit(
 }
 
 fn v8_heap_limit_bytes() -> usize {
-    std::env::var("CELLD_V8_HEAP_LIMIT_MB")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .and_then(|megabytes| megabytes.checked_mul(1024 * 1024))
-        .filter(|bytes| *bytes > 0)
+    crate::env_vars::positive::<usize>("CELLD_V8_HEAP_LIMIT_MB")
+        .expect("validated CELLD_V8_HEAP_LIMIT_MB")
+        .map(|megabytes| {
+            megabytes
+                .checked_mul(1024 * 1024)
+                .expect("validated CELLD_V8_HEAP_LIMIT_MB range")
+        })
         .unwrap_or(DEFAULT_V8_HEAP_LIMIT_BYTES)
 }
 
 impl Drop for WorkerIsolate {
     fn drop(&mut self) {
-        self.isolate
-            .remove_near_heap_limit_callback(near_heap_limit, self.original_heap_limit);
+        let limit = self.original_heap_limit;
+        let (mut locker, _cells) = self.lock();
+        locker.remove_near_heap_limit_callback(near_heap_limit, limit);
     }
 }
 
-#[derive(Debug)]
-pub struct AlarmRunError {
-    source: anyhow::Error,
-    counts_against_limit: bool,
+/// One in-flight request inside a shared isolate.
+///
+/// Owned by the request's own tokio task, which is why every field is
+/// `Send`: the task suspends between turns and can resume on any worker,
+/// then re-enters the isolate it is affiliated with.
+/// Where a finished handler's result goes, and in what shape.
+///
+/// A fetch answers an `HttpResponse` and an entrypoint RPC answers bytes.
+/// Everything between — the turn loop, the op region, cancellation, the
+/// budget — is identical, so the difference lives here rather than in two
+/// copies of `drive`.
+pub enum Answer {
+    Fetch(tokio::sync::oneshot::Sender<Result<HttpResponse>>),
+    Rpc(tokio::sync::oneshot::Sender<Result<Vec<u8>>>),
+    /// A DO method call, which answers a value rather than a response.
+    CellRpc(tokio::sync::oneshot::Sender<Result<RpcOutcome>>),
+    /// A `webSocketMessage`, which answers the frames the output gate held
+    /// and the write they are gated on.
+    WsMessage(tokio::sync::oneshot::Sender<Result<WsDispatch>>),
+    /// An event whose result is that it finished: `webSocketOpen`,
+    /// `webSocketClose`.
+    Ack(tokio::sync::oneshot::Sender<Result<()>>),
+    /// An alarm, which answers whatever alarm the handler left armed.
+    Alarm(tokio::sync::oneshot::Sender<Result<(Option<i64>, Option<u64>)>>),
 }
 
-impl AlarmRunError {
-    fn infrastructure(source: anyhow::Error) -> Self {
-        Self {
-            source,
-            counts_against_limit: false,
+impl Answer {
+    /// Send an error, whichever shape the caller is waiting for.
+    fn fail(self, error: anyhow::Error) {
+        match self {
+            Answer::Fetch(reply) => drop(reply.send(Err(error))),
+            Answer::Rpc(reply) => drop(reply.send(Err(error))),
+            Answer::CellRpc(reply) => drop(reply.send(Err(error))),
+            Answer::WsMessage(reply) => drop(reply.send(Err(error))),
+            Answer::Ack(reply) => drop(reply.send(Err(error))),
+            Answer::Alarm(reply) => drop(reply.send(Err(error))),
+        }
+    }
+}
+
+pub struct InFlight {
+    /// The handler's promise. A `Global` because it outlives the turn that
+    /// created it: Locals never cross a turn, exactly as workerd's
+    /// `Worker::Lock` never does.
+    promise: v8::Global<v8::Promise>,
+    context: Arc<IoContext>,
+    /// The cell this event belongs to, and `None` for stateless work.
+    ///
+    /// It is what the storage-shaped parts of settling — the durability
+    /// position, a fatal SQL error — are read against.
+    scope: Option<String>,
+    /// The cell's committed-write position before the handler ran.
+    ///
+    /// The answer carries a write position only if the handler advanced it,
+    /// so the output gate sees a write this event made and ignores celld's
+    /// own activation writes (the actor name, alarm bookkeeping).
+    writes_before: Option<u64>,
+    request_id: Option<RequestId>,
+    active_request_id: Option<RequestId>,
+    reply: Option<Answer>,
+    /// `waitUntil` work still running after the response was sent. The
+    /// request stays in flight until it settles, as the single-request loop
+    /// keeps driving it.
+    background: Option<v8::Global<v8::Promise>>,
+    /// Ops this request is waiting on, so a completion can be attributed to
+    /// the request whose context must be current while its continuation runs.
+    ops: std::collections::HashSet<u64>,
+    /// The alarm bookkeeping this entry still owes, if it is one.
+    alarm: Option<AlarmClaim>,
+    started: Instant,
+    /// The sampled trace this entry records into, `None` when telemetry
+    /// is off or the trace was not sampled. Installed into the isolate's
+    /// CPED slot for every turn, so promise continuations carry it.
+    trace: Option<crate::telemetry::TraceIds>,
+    /// Why a handler that did not finish failed, captured for the span's
+    /// `error` so a query sees the reason, not only that it failed. Set
+    /// only when a trace is sampled.
+    failure: Option<String>,
+    /// The isolate this entry's ops belong to, so `abandon` can drop their
+    /// resolvers without a scope to reach the isolate through.
+    runtime_state: Arc<ActorRuntimeState>,
+}
+
+impl InFlight {
+    /// Read the handler's settled value in the shape this entry answers, end
+    /// the event, and reply.
+    ///
+    /// Every shape ends the event exactly once, whether it produced a value
+    /// or an error — ending it is what yields the `waitUntil` work the entry
+    /// keeps driving afterwards, and a shape that skipped it on the error
+    /// path would leave the context open.
+    fn answer_settled<'s>(
+        &mut self,
+        tc: &mut v8::PinScope<'s, '_>,
+        value: v8::Local<'s, v8::Value>,
+    ) {
+        let Some(reply) = self.reply.take() else {
+            return;
+        };
+        // A cell whose SQL failed fatally cannot answer whatever the handler
+        // returned: the storage the handler read may not be what the cell
+        // has.
+        if let Some(error) = self.scope.as_deref().and_then(storage::sql_critical_error) {
+            let _ = end_event_context(tc);
+            if self.trace.is_some() {
+                self.failure = Some(crate::telemetry::cap_error(error.to_string()));
+            }
+            reply.fail(anyhow!(error));
+            return;
+        }
+        self.background = match reply {
+            Answer::Fetch(reply) => {
+                let read = read_response(tc, value).map(|mut response| {
+                    response.write_position = self.write_delta();
+                    response
+                });
+                send_and_end(tc, reply, read)
+            }
+            Answer::Rpc(reply) => {
+                let read =
+                    view_bytes(value).ok_or_else(|| anyhow!("entrypoint RPC answered non-bytes"));
+                send_and_end(tc, reply, read)
+            }
+            Answer::CellRpc(reply) => {
+                let outcome = RpcOutcome {
+                    data: rpc_data_ret(tc, value),
+                    write_position: self.write_delta(),
+                };
+                send_and_end(tc, reply, Ok(outcome))
+            }
+            Answer::WsMessage(reply) => {
+                let dispatch = WsDispatch {
+                    frames: ws_capture_take(),
+                    write_position: self.write_delta(),
+                };
+                send_and_end(tc, reply, Ok(dispatch))
+            }
+            Answer::Ack(reply) => send_and_end(tc, reply, Ok(())),
+            Answer::Alarm(reply) => {
+                // The handler ran and returned, so close the claim as a
+                // success. This is the only path that does: every other
+                // `settle_alarm` call site records a failure, and without
+                // this one a *successful* alarm was recorded as one to
+                // retry — which re-armed it forever, kept the cell busy,
+                // and meant an eviction waiting for the cell to go quiet
+                // never got its turn.
+                self.settle_alarm(true, false);
+                // Read what stands *after* that cleanup, and take the delta
+                // last so it covers the cleanup's own commit — which is the
+                // write the core must prove durable before it settles the
+                // alarm.
+                let alarm = self
+                    .scope
+                    .as_deref()
+                    .map(storage::get_alarm)
+                    .unwrap_or(None);
+                send_and_end(tc, reply, Ok((alarm, self.write_delta())))
+            }
+        };
+    }
+
+    /// The write position to gate this answer on: `None` unless the handler
+    /// advanced the cell's committed writes past where they were.
+    fn write_delta(&self) -> Option<u64> {
+        write_delta(
+            self.writes_before,
+            self.scope.as_deref().and_then(storage::write_position),
+        )
+    }
+
+    /// Fail whichever shape is waiting, without knowing which.
+    ///
+    /// An alarm that fails here failed for a reason that is not the
+    /// handler's — a budget overrun, a disconnect — so it does not count
+    /// against the retry limit. A handler that threw is recorded by
+    /// `settle`, which knows that it did, before it reaches this.
+    fn fail(&mut self, error: anyhow::Error) {
+        if let Some(reply) = self.reply.take() {
+            self.settle_alarm(false, false);
+            if self.trace.is_some() {
+                self.failure = Some(crate::telemetry::cap_error(error.to_string()));
+            }
+            reply.fail(error);
         }
     }
 
-    fn user(source: anyhow::Error) -> Self {
-        Self {
-            source,
-            counts_against_limit: true,
+    /// Record how a claimed alarm ended. Runs once; later calls do nothing.
+    fn settle_alarm(&mut self, ok: bool, counts_against_limit: bool) {
+        let (Some(scope), Some(claim)) = (self.scope.as_deref(), self.alarm.take()) else {
+            return;
+        };
+        if ok {
+            storage::finish_alarm_handler(scope, true, claim.now_ms);
+        } else {
+            storage::finish_alarm_handler_with_retry_policy(
+                scope,
+                false,
+                claim.now_ms,
+                counts_against_limit,
+            );
         }
     }
 
-    pub fn counts_against_limit(&self) -> bool {
-        self.counts_against_limit
+    /// Whether a claimed alarm's outcome is still unrecorded. True only
+    /// where the event ended without ever entering the isolate again.
+    pub fn owes_alarm(&self) -> bool {
+        self.alarm.is_some()
+    }
+
+    /// Done when the response has been sent and nothing is left running.
+    pub fn finished(&self) -> bool {
+        self.reply.is_none() && self.background.is_none() && self.ops.is_empty()
+    }
+
+    /// Why the handler failed, when a sampled trace captured it.
+    pub fn failure(&self) -> Option<&str> {
+        self.failure.as_deref()
+    }
+
+    /// How long this handler may still run, or `None` once it has answered.
+    ///
+    /// The budget bounds the *response*, not the request: `waitUntil` work
+    /// continues after the client has been served and is not charged for the
+    /// time the handler already spent.
+    pub fn remaining(&self, budget: Duration) -> Option<Duration> {
+        self.reply
+            .is_some()
+            .then(|| budget.saturating_sub(self.started.elapsed()))
+    }
+
+    /// Give up on a handler that will not settle.
+    pub fn time_out(&mut self, budget: Duration) {
+        self.fail(anyhow!("handler exceeded {}s budget", budget.as_secs()));
+    }
+
+    /// Nothing this request awaits can move it, so it will never settle on
+    /// its own. Reachable when a handler awaits a promise only some *other*
+    /// request could resolve — which the pump concealed, because it settled
+    /// every entry on every turn whoever the turn belonged to.
+    pub fn stuck(&mut self) {
+        self.fail(anyhow!("handler is waiting on nothing"));
+        self.background = None;
+    }
+
+    /// Has the client been answered? `waitUntil` work can still be running.
+    pub fn answered(&self) -> bool {
+        self.reply.is_none()
+    }
+
+    /// Whether a client can still disconnect from this request. A request
+    /// with no id is internal and has no client to hang up.
+    pub fn cancellable(&self) -> bool {
+        self.reply.is_some() && self.request_id.is_some()
+    }
+
+    pub fn request_id(&self) -> Option<RequestId> {
+        self.request_id
+    }
+
+    /// The request is over and its remaining ops are being dropped. Purge
+    /// their resolvers.
+    ///
+    /// An op that never completes would otherwise leave its
+    /// `Global<PromiseResolver>` in the isolate's map for as long as the
+    /// isolate lives. A request that drives itself has to purge them on its
+    /// own way out.
+    pub fn abandon(&mut self) {
+        if self.ops.is_empty() {
+            return;
+        }
+        let mut promises = self.runtime_state.promises.lock().unwrap();
+        for id in self.ops.drain() {
+            promises.remove(&id);
+        }
     }
 }
 
-impl std::fmt::Display for AlarmRunError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.source.fmt(formatter)
+/// The CPED slot carries two riders in one immutable record: the
+/// harness's async-context frame (`__als_get`/`__als_set` — ALS and
+/// request-context confinement) and telemetry's trace context. Each
+/// write builds a fresh two-element array preserving the other rider,
+/// so V8's per-reaction snapshots restore both atomically and neither
+/// feature can stomp the other — the collision the trace-join test
+/// caught when telemetry first took the whole slot.
+///
+/// The empty state stays *empty*: when both riders are absent the slot
+/// is undefined, which V8 fast-paths, and "off is structural" holds.
+fn cped_parts<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+) -> (v8::Local<'s, v8::Value>, v8::Local<'s, v8::Value>) {
+    let data = scope.get_continuation_preserved_embedder_data();
+    if let Ok(record) = v8::Local::<v8::Array>::try_from(data) {
+        if record.length() == 2 {
+            let undefined = v8::undefined(scope).into();
+            return (
+                record.get_index(scope, 0).unwrap_or(undefined),
+                record.get_index(scope, 1).unwrap_or(undefined),
+            );
+        }
+    }
+    // Any non-record value is a bare frame from before this scheme, or
+    // the empty slot.
+    (data, v8::undefined(scope).into())
+}
+
+fn cped_frame<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::Value> {
+    cped_parts(scope).0
+}
+
+fn cped_trace<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::Value> {
+    cped_parts(scope).1
+}
+
+fn set_cped(scope: &mut v8::PinScope, frame: v8::Local<v8::Value>, trace: v8::Local<v8::Value>) {
+    if frame.is_undefined() && trace.is_undefined() {
+        let undefined = v8::undefined(scope).into();
+        scope.set_continuation_preserved_embedder_data(undefined);
+        return;
+    }
+    let record = v8::Array::new(scope, 2);
+    record.set_index(scope, 0, frame);
+    record.set_index(scope, 1, trace);
+    scope.set_continuation_preserved_embedder_data(record.into());
+}
+
+/// Install a trace context into the isolate's CPED slot for one turn.
+///
+/// V8 snapshots continuation-preserved embedder data when a promise
+/// reaction is registered and restores it while the reaction runs. That
+/// is the exactness `console.log` correlation needs: a continuation
+/// belonging to a *different* entry that runs during this turn's
+/// microtask checkpoint carries its own context, not this turn's
+/// (wiki/designs/otel.md). The layout is 16 trace-id bytes then 8
+/// span-id bytes in one 24-byte ArrayBuffer, fresh per turn — cheap at
+/// sampled rates, and nothing outlives V8's own snapshots.
+///
+/// Returns the previous slot value *only when something was installed*;
+/// the caller restores it before releasing the isolate. An untraced
+/// turn touches CPED not at all — every traced turn restores what it
+/// found, so the ambient slot between turns is always empty, and "off
+/// is structural" stays true at the V8 boundary too (the -13% the
+/// always-read version cost at 1% sampling was measured, not guessed).
+fn install_trace<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    trace: Option<&crate::telemetry::TraceIds>,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let ids = trace?;
+    let previous = scope.get_continuation_preserved_embedder_data();
+    let buffer = v8::ArrayBuffer::new(scope, 24);
+    let data = buffer.get_backing_store().data()?;
+    let bytes = data.as_ptr() as *mut u8;
+    // SAFETY: a freshly created 24-byte buffer, written before any JS
+    // can see it.
+    unsafe {
+        std::ptr::copy_nonoverlapping(ids.trace_id.as_ptr(), bytes, 16);
+        std::ptr::copy_nonoverlapping(ids.span_id.as_ptr(), bytes.add(16), 8);
+    }
+    let frame = cped_frame(scope);
+    set_cped(scope, frame, buffer.into());
+    Some(previous)
+}
+
+fn restore_trace(scope: &mut v8::PinScope, previous: Option<v8::Local<v8::Value>>) {
+    if let Some(previous) = previous {
+        scope.set_continuation_preserved_embedder_data(previous);
     }
 }
 
-impl std::error::Error for AlarmRunError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.source.source()
+/// The trace context current at this exact point of JS execution, read
+/// from CPED — the running turn's, or the running continuation's if V8
+/// restored one. `None` when telemetry is off, the trace was unsampled,
+/// or execution is outside any entry.
+pub(crate) fn current_trace_ids(scope: &mut v8::PinScope) -> Option<crate::telemetry::TraceIds> {
+    if !crate::telemetry::active() {
+        return None;
     }
+    let data = cped_trace(scope);
+    let buffer = v8::Local::<v8::ArrayBuffer>::try_from(data).ok()?;
+    if buffer.byte_length() != 24 {
+        return None;
+    }
+    let data = buffer.get_backing_store().data()?;
+    let bytes = data.as_ptr() as *const u8;
+    let mut trace_id = [0u8; 16];
+    let mut span_id = [0u8; 8];
+    // SAFETY: length checked; the buffer is alive for this scope.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes, trace_id.as_mut_ptr(), 16);
+        std::ptr::copy_nonoverlapping(bytes.add(16), span_id.as_mut_ptr(), 8);
+    }
+    Some(crate::telemetry::TraceIds { trace_id, span_id })
+}
+
+/// The isolate, entered for one turn. Everything a request does to a shared
+/// isolate goes through one of these, and none of them may be held across an
+/// await: the caller takes the pool's async permit first, runs a turn, and
+/// leaves. See `wiki/designs/isolate-threading.md`.
+impl Worker {
+    /// Run a request's first turn.
+    ///
+    /// Returns what is now in flight — `None` when nothing is, the reply
+    /// already carrying the error — and the ops the handler enqueued, which
+    /// the caller awaits with no isolate held.
+    pub fn turn_begin(
+        &mut self,
+        job: crate::WorkerJob,
+        trace: Option<crate::telemetry::TraceIds>,
+    ) -> (Option<InFlight>, Vec<Op>) {
+        let Some(inner) = self.inner.as_mut() else {
+            return (None, Vec::new());
+        };
+        let (mut locker, _cells) = inner.lock();
+        v8::scope!(let hs, &mut *locker);
+        let realm = inner.realm(hs);
+        let context = realm.context;
+        let cs = &mut v8::ContextScope::new(hs, context);
+        let tc = std::pin::pin!(v8::TryCatch::new(cs));
+        let tc = &mut tc.init();
+
+        let previous = install_trace(tc, trace.as_ref());
+        let out = match begin(tc, realm.fetch, job) {
+            Begun::Running(mut entry) => {
+                entry.trace = trace;
+                // A handler that returned an already-resolved promise is
+                // finished before it ever suspends, and must not wait for an
+                // op it will never start.
+                let ops = finish_turn(tc, &mut entry);
+                (Some(*entry), ops)
+            }
+            Begun::Threw(answer) => {
+                answer.fail(anyhow!("fetch threw: {}", exc!(tc)));
+                (None, Vec::new())
+            }
+            Begun::Nothing => (None, Vec::new()),
+        };
+        restore_trace(tc, previous);
+        out
+    }
+
+    /// Enter the isolate solely to end a request whose client has hung up.
+    ///
+    /// A suspended request notices the disconnect without any isolate — the
+    /// flag is host state — so this is reached only when it has actually
+    /// fired, rather than on a timer as the blocking run loop did.
+    pub fn turn_cancel(&mut self, entry: &mut InFlight) -> Vec<Op> {
+        let Some(inner) = self.inner.as_mut() else {
+            return Vec::new();
+        };
+        let (mut locker, _cells) = inner.lock();
+        v8::scope!(let hs, &mut *locker);
+        let realm = inner.realm(hs);
+        let context = realm.context;
+        let cs = &mut v8::ContextScope::new(hs, context);
+        let tc = std::pin::pin!(v8::TryCatch::new(cs));
+        let tc = &mut tc.init();
+
+        let previous = install_trace(tc, entry.trace.as_ref());
+        cancel(tc, entry);
+        let ops = finish_turn(tc, entry);
+        restore_trace(tc, previous);
+        ops
+    }
+
+    /// Run a later turn: resolve one of this request's ops, drain the
+    /// microtasks that follow, and answer if the handler settled.
+    pub fn turn_deliver(
+        &mut self,
+        entry: &mut InFlight,
+        op: u64,
+        res: Result<asyncrt::OpOut, String>,
+    ) -> Vec<Op> {
+        let Some(inner) = self.inner.as_mut() else {
+            return Vec::new();
+        };
+        let (mut locker, _cells) = inner.lock();
+        v8::scope!(let hs, &mut *locker);
+        let realm = inner.realm(hs);
+        let context = realm.context;
+        let cs = &mut v8::ContextScope::new(hs, context);
+        let tc = std::pin::pin!(v8::TryCatch::new(cs));
+        let tc = &mut tc.init();
+
+        let previous = install_trace(tc, entry.trace.as_ref());
+        deliver(tc, entry, op, res);
+        cancelled(tc, entry);
+        let ops = finish_turn(tc, entry);
+        restore_trace(tc, previous);
+        ops
+    }
+}
+
+/// Close a turn, whatever the turn did.
+///
+/// Every step earns its place and the order is the whole point:
+///
+/// 1. **settle** — the handler's promise may have resolved, so marshal the
+///    response and answer. Marshalling can start a JS-to-host body pump and
+///    register it with `waitUntil`.
+/// 2. **checkpoint** — that pump's native ops exist only once the microtasks
+///    which create them run.
+/// 3. **settle again** — the checkpoint may itself have settled the promise,
+///    or the `waitUntil` aggregate.
+/// 4. **adopt** — only now is the set of ops this request waits on complete.
+///
+/// Draining before step 2 is the bug that made a streaming handler answer
+/// with nothing outstanding and conclude it was waiting on nothing.
+/// The checkpoint before adoption is what makes response-body pumps visible.
+fn finish_turn(tc: &mut v8::PinScope, entry: &mut InFlight) -> Vec<Op> {
+    settle(tc, entry);
+    tc.perform_microtask_checkpoint();
+    // `abort()` and `process.exit()` terminate execution without settling
+    // the handler's promise, so an entry that only watched the promise would
+    // wait on it forever and then report that it was waiting on nothing.
+    // The blocking loop broke out of its loop here; an entry fails here.
+    if let Some(error) = take_execution_termination(tc) {
+        entry.fail(error);
+        entry.background = None;
+        entry.abandon();
+        return Vec::new();
+    }
+    settle(tc, entry);
+    adopt(entry)
+}
+
+/// An op the JS enqueued, and the id whose promise it resolves.
+pub type Op = (u64, asyncrt::OpFuture);
+
+/// Take the ops this turn enqueued, recording them as the request's own.
+///
+/// Drained after `settle`, not before: ending an event runs JS, and anything
+/// that starts there belongs to this request too. The pump drained first and
+/// so could attribute those to whichever entry it settled next.
+fn adopt(entry: &mut InFlight) -> Vec<Op> {
+    let spawns = asyncrt::drain_spawns();
+    for (id, _) in &spawns {
+        entry.ops.insert(*id);
+    }
+    spawns
+}
+
+/// What starting a request produced.
+enum Begun {
+    /// In flight. Its ops must be adopted and its promise driven.
+    Running(Box<InFlight>),
+    /// The handler threw before it could suspend, so nothing is in flight.
+    /// The exception belongs to the caller's `TryCatch` — an unnameable type
+    /// no signature here can take — so the caller reads it and answers.
+    Threw(Answer),
+    /// Nothing started: the job was not a fetch, or the reply already
+    /// carries the error.
+    Nothing,
+}
+
+/// Start a request: build it, call the Worker's `fetch`, and hand back what
+/// is now in flight.
+///
+/// The half of a turn that runs *before* anything can suspend.
+fn begin<'s>(
+    tc: &mut v8::PinScope<'s, '_>,
+    fetch: v8::Local<'s, v8::Function>,
+    job: crate::WorkerJob,
+) -> Begun {
+    let job = match job {
+        crate::WorkerJob::Rpc {
+            entrypoint,
+            method,
+            args,
+            reply,
+        } => return begin_entrypoint_rpc(tc, &entrypoint, &method, args, reply),
+        job => job,
+    };
+    let crate::WorkerJob::Fetch {
+        url,
+        method,
+        body,
+        headers,
+        request_id,
+        reply,
+        ..
+    } = job
+    else {
+        return Begun::Nothing;
+    };
+
+    let context = IoContext::new();
+    let guard = CurrentGuard::enter(context.clone());
+    let started = start_fetch(tc, fetch, &url, &method, &body, &headers, request_id);
+    let promise = match started {
+        Ok(Started::Running(ret, active)) => match ret.try_cast::<v8::Promise>() {
+            Ok(promise) => Ok((promise, active)),
+            Err(_) => resolved_promise(tc, ret).map(|promise| (promise, active)),
+        },
+        Ok(Started::Threw) => {
+            drop(guard);
+            return Begun::Threw(Answer::Fetch(reply));
+        }
+        Err(error) => Err(error),
+    };
+    match promise {
+        Ok((promise, active_request_id)) => {
+            tc.perform_microtask_checkpoint();
+            let entry = InFlight {
+                runtime_state: actor_runtime_state(tc),
+                promise: v8::Global::new(tc, promise),
+                context,
+                scope: None,
+                writes_before: None,
+                request_id,
+                active_request_id,
+                reply: Some(Answer::Fetch(reply)),
+                background: None,
+                ops: std::collections::HashSet::new(),
+                alarm: None,
+                started: Instant::now(),
+                trace: None,
+                failure: None,
+            };
+            drop(guard);
+            Begun::Running(Box::new(entry))
+        }
+        Err(error) => {
+            drop(guard);
+            let _ = reply.send(Err(error));
+            Begun::Nothing
+        }
+    }
+}
+
+/// Start an entrypoint RPC's first turn.
+///
+/// The same shape as a fetch and deliberately so: call the handler, keep the
+/// promise, and let `drive` pump it with no isolate held across the awaits.
+/// The old dispatcher blocked until the promise settled, which is why RPC
+/// needed a thread of its own and why `WorkerPool` outlived the fetch path.
+fn begin_entrypoint_rpc(
+    tc: &mut v8::PinScope,
+    entrypoint: &str,
+    method: &str,
+    args: Vec<u8>,
+    reply: tokio::sync::oneshot::Sender<Result<Vec<u8>>>,
+) -> Begun {
+    let context = IoContext::new();
+    let guard = CurrentGuard::enter(context.clone());
+    let global = tc.get_current_context().global(tc);
+    let started = (|| {
+        let key = v8::String::new(tc, "__dispatchEntrypointRpc").unwrap();
+        let f: v8::Local<v8::Function> = global
+            .get(tc, key.into())
+            .ok_or_else(|| anyhow!("no __dispatchEntrypointRpc"))?
+            .try_into()
+            .map_err(|_| anyhow!("__dispatchEntrypointRpc is not a function"))?;
+        let entrypoint = v8::String::new(tc, entrypoint).unwrap();
+        let method = v8::String::new(tc, method).unwrap();
+        let args = bytes_value(tc, args);
+        let recv = v8::undefined(tc).into();
+        begin_event_context(tc)?;
+        let ret = f
+            .call(tc, recv, &[entrypoint.into(), method.into(), args])
+            .ok_or_else(|| anyhow!("entrypoint RPC threw"))?;
+        match ret.try_cast::<v8::Promise>() {
+            Ok(promise) => Ok(promise),
+            Err(_) => resolved_promise(tc, ret),
+        }
+    })();
+    match started {
+        Ok(promise) => {
+            tc.perform_microtask_checkpoint();
+            let entry = InFlight {
+                runtime_state: actor_runtime_state(tc),
+                promise: v8::Global::new(tc, promise),
+                context,
+                scope: None,
+                writes_before: None,
+                request_id: None,
+                active_request_id: None,
+                reply: Some(Answer::Rpc(reply)),
+                background: None,
+                ops: std::collections::HashSet::new(),
+                alarm: None,
+                started: Instant::now(),
+                trace: None,
+                failure: None,
+            };
+            drop(guard);
+            Begun::Running(Box::new(entry))
+        }
+        Err(error) => {
+            let _ = end_event_context(tc);
+            drop(guard);
+            let _ = reply.send(Err(error));
+            Begun::Nothing
+        }
+    }
+}
+
+/// for the JSON flavor, a `Uint8Array` for structured clone.
+fn rpc_data_value<'s>(scope: &mut v8::PinScope<'s, '_>, data: RpcData) -> v8::Local<'s, v8::Value> {
+    match data {
+        RpcData::Json(json) => v8::String::new(scope, &json).unwrap().into(),
+        RpcData::V8(bytes) => bytes_value(scope, bytes),
+    }
+}
+
+/// The inverse: `__dispatchRpc` answers in the flavor it was asked in.
+fn rpc_data_ret(scope: &mut v8::PinScope, ret: v8::Local<v8::Value>) -> RpcData {
+    match view_bytes(ret) {
+        Some(bytes) => RpcData::V8(bytes),
+        None => RpcData::Json(ret.to_rust_string_lossy(scope)),
+    }
+}
+
+fn unix_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
+}
+
+/// End the event, then answer with what the handler produced.
+///
+/// Ending it is what yields the `waitUntil` aggregate the entry keeps
+/// driving after the caller has been served, so it happens for every answer
+/// shape and on the error path too.
+fn send_and_end<T>(
+    tc: &mut v8::PinScope,
+    reply: tokio::sync::oneshot::Sender<Result<T>>,
+    value: Result<T>,
+) -> Option<v8::Global<v8::Promise>> {
+    let background = end_event_context(tc).ok().flatten();
+    let _ = reply.send(value);
+    background.map(|promise| v8::Global::new(tc, promise))
+}
+
+/// A committed-write position only counts when the handler advanced it; celld's
+/// own activation writes are already below `before`.
+pub(crate) fn write_delta(before: Option<u64>, after: Option<u64>) -> Option<u64> {
+    match (before, after) {
+        (Some(before), Some(after)) if after > before => Some(after),
+        _ => None,
+    }
+}
+
+/// What a Durable Object RPC method returned, plus the position its writes
+/// reached, so the caller can hold the reply behind durability.
+pub struct RpcOutcome {
+    pub data: RpcData,
+    pub write_position: Option<u64>,
+}
+
+/// What a claimed alarm still owes its bookkeeping.
+///
+/// `finish_alarm_handler` must run exactly once however the event ends, and
+/// an event can now end without running JS at all — a budget overrun, a
+/// handler waiting on nothing — so the entry carries the claim rather than
+/// the caller that made it.
+struct AlarmClaim {
+    /// The instant the dispatch was judged due against, so the outcome is
+    /// recorded against the same one.
+    now_ms: i64,
+}
+
+/// Start one cell event: the half that runs before the handler can suspend.
+///
+/// Every cell event does the same four things — name the cell it belongs to,
+/// sample the writes its answer will be gated on, open an event context, and
+/// keep the promise the dispatcher returned. Only the call and the shape of
+/// the answer differ, which is what the arguments say.
+fn start_cell_event<'s>(
+    tc: &mut v8::PinScope<'s, '_>,
+    scope: &str,
+    answer: Answer,
+    request_id: Option<RequestId>,
+    capture_frames: bool,
+    call: impl FnOnce(&mut v8::PinScope<'s, '_>) -> Result<v8::Local<'s, v8::Value>>,
+) -> Begun {
+    let context = IoContext::new();
+    let guard = CurrentGuard::enter(context.clone());
+    // Sampled before the handler runs so the output gate can tell a write
+    // this event made from celld's own activation writes.
+    let writes_before = storage::write_position(scope);
+    // No guard: this frame is the context's outermost one and the context
+    // ends with the event, so there is nothing to pop it before.
+    context
+        .egress
+        .lock()
+        .unwrap()
+        .push((scope.to_string(), writes_before.unwrap_or(0)));
+    if capture_frames {
+        ws_capture_begin();
+    }
+    let started = (|| {
+        begin_event_context(tc)?;
+        let ret = call(tc)?;
+        match ret.try_cast::<v8::Promise>() {
+            Ok(promise) => Ok(promise),
+            Err(_) => resolved_promise(tc, ret),
+        }
+    })();
+    match started {
+        Ok(promise) => {
+            tc.perform_microtask_checkpoint();
+            let entry = InFlight {
+                runtime_state: actor_runtime_state(tc),
+                promise: v8::Global::new(tc, promise),
+                context,
+                scope: Some(scope.to_string()),
+                writes_before,
+                request_id,
+                // A cell's dispatcher registers the incoming request itself,
+                // so there is nothing for the shell to finish; `cancel`
+                // aborts by the job's own id.
+                active_request_id: None,
+                reply: Some(answer),
+                background: None,
+                ops: std::collections::HashSet::new(),
+                alarm: None,
+                started: Instant::now(),
+                trace: None,
+                failure: None,
+            };
+            drop(guard);
+            Begun::Running(Box::new(entry))
+        }
+        Err(error) => {
+            let _ = end_event_context(tc);
+            drop(guard);
+            answer.fail(error);
+            Begun::Nothing
+        }
+    }
+}
+
+/// Look one of the harness dispatchers up on the current realm's global.
+fn dispatcher<'s>(
+    tc: &mut v8::PinScope<'s, '_>,
+    name: &str,
+) -> Result<v8::Local<'s, v8::Function>> {
+    let global = tc.get_current_context().global(tc);
+    let key = v8::String::new(tc, name).unwrap();
+    global
+        .get(tc, key.into())
+        .ok_or_else(|| anyhow!("no {name}"))?
+        .try_into()
+        .map_err(|_| anyhow!("{name} is not a function"))
+}
+
+/// Start a cell event's first turn.
+///
+/// The counterpart of `begin` for the events a cell receives. Where the
+/// blocking loop ran each of these to completion inside one call — and
+/// serviced other cells' events inside *that* — each is now an entry a tokio
+/// task drives, so two events of one cell interleave by suspending rather
+/// than by nesting. See `wiki/designs/deleting-the-pump.md`.
+fn begin_cell(tc: &mut v8::PinScope, job: CellJob) -> Begun {
+    match job {
+        CellJob::Fetch {
+            request_id,
+            scope,
+            name,
+            url,
+            method,
+            body,
+            headers,
+            reply,
+            order: _,
+        } => {
+            if let Err(error) = register_actor_name(tc, &scope, name.as_deref()) {
+                let _ = reply.send(Err(error));
+                return Begun::Nothing;
+            }
+            start_cell_event(tc, &scope, Answer::Fetch(reply), request_id, false, |tc| {
+                let f = dispatcher(tc, "__dispatchTo")?;
+                let arguments = [
+                    v8::String::new(tc, &scope).unwrap().into(),
+                    v8::String::new(tc, &url).unwrap().into(),
+                    v8::String::new(tc, &method).unwrap().into(),
+                    bytes_value(tc, body),
+                    v8::String::new(tc, &serde_json::to_string(&headers)?)
+                        .unwrap()
+                        .into(),
+                    match request_id {
+                        Some(id) => v8::String::new(tc, &request_id_string(id)).unwrap().into(),
+                        None => v8::null(tc).into(),
+                    },
+                ];
+                let recv = v8::undefined(tc).into();
+                f.call(tc, recv, &arguments)
+                    .ok_or_else(|| anyhow!("dispatchTo threw"))
+            })
+        }
+        CellJob::Rpc {
+            scope,
+            name,
+            method,
+            args,
+            reply,
+        } => {
+            if let Err(error) = register_actor_name(tc, &scope, name.as_deref()) {
+                let _ = reply.send(Err(error));
+                return Begun::Nothing;
+            }
+            start_cell_event(tc, &scope, Answer::CellRpc(reply), None, false, |tc| {
+                let f = dispatcher(tc, "__dispatchRpc")?;
+                let arguments = [
+                    v8::String::new(tc, &scope).unwrap().into(),
+                    v8::String::new(tc, &method).unwrap().into(),
+                    rpc_data_value(tc, args),
+                ];
+                let recv = v8::undefined(tc).into();
+                f.call(tc, recv, &arguments)
+                    .ok_or_else(|| anyhow!("dispatchRpc threw"))
+            })
+        }
+        CellJob::WsOpen {
+            scope,
+            ws_id,
+            protocol,
+            reply,
+        } => start_cell_event(tc, &scope, Answer::Ack(reply), None, false, |tc| {
+            let f = dispatcher(tc, "__wsOpen")?;
+            let arguments = [
+                v8::String::new(tc, &scope).unwrap().into(),
+                v8::Number::new(tc, ws_id as f64).into(),
+                v8::String::new(tc, &protocol).unwrap().into(),
+            ];
+            let recv = v8::undefined(tc).into();
+            f.call(tc, recv, &arguments)
+                .ok_or_else(|| anyhow!("wsOpen threw"))
+        }),
+        CellJob::WsMessage {
+            scope,
+            ws_id,
+            data,
+            reply,
+        } => start_cell_event(tc, &scope, Answer::WsMessage(reply), None, true, |tc| {
+            let (name, data) = match data {
+                WsIn::Text(text) => ("__wsMessage", v8::String::new(tc, &text).unwrap().into()),
+                WsIn::Binary(bytes) => ("__wsBinary", bytes_value(tc, bytes)),
+            };
+            let f = dispatcher(tc, name)?;
+            let arguments = [
+                v8::String::new(tc, &scope).unwrap().into(),
+                v8::Number::new(tc, ws_id as f64).into(),
+                data,
+            ];
+            let recv = v8::undefined(tc).into();
+            f.call(tc, recv, &arguments)
+                .ok_or_else(|| anyhow!("WebSocket message dispatch threw"))
+        }),
+        CellJob::WsClosed {
+            scope,
+            ws_id,
+            code,
+            reason,
+            was_clean,
+            reply,
+        } => start_cell_event(tc, &scope, Answer::Ack(reply), None, false, |tc| {
+            let f = dispatcher(tc, "__wsClosed")?;
+            let arguments = [
+                v8::String::new(tc, &scope).unwrap().into(),
+                v8::Number::new(tc, ws_id as f64).into(),
+                v8::Number::new(tc, f64::from(code)).into(),
+                v8::String::new(tc, &reason).unwrap().into(),
+                v8::Boolean::new(tc, was_clean).into(),
+            ];
+            let recv = v8::undefined(tc).into();
+            f.call(tc, recv, &arguments)
+                .ok_or_else(|| anyhow!("wsClosed threw"))
+        }),
+        CellJob::Alarm {
+            scope,
+            scheduled_ms,
+            claim,
+            reply,
+        } => begin_alarm(tc, &scope, scheduled_ms, claim, reply),
+    }
+}
+
+/// Start an alarm, claiming the due entry so nothing else fires it.
+///
+/// The claim is recorded on the entry rather than closed here, because the
+/// handler has not run yet: the outcome is known only when the event ends,
+/// which is now many turns away.
+fn begin_alarm(
+    tc: &mut v8::PinScope,
+    scope: &str,
+    scheduled_ms: i64,
+    claim: AlarmDispatch,
+    reply: tokio::sync::oneshot::Sender<Result<(Option<i64>, Option<u64>)>>,
+) -> Begun {
+    let now = unix_now_ms();
+    if now < scheduled_ms {
+        let _ = reply.send(Err(anyhow!("alarm dispatched before its deadline")));
+        return Begun::Nothing;
+    }
+    if let AlarmDispatch::Claimed(retry) = claim {
+        let Some(scheduled_at) = storage::active_alarm_scheduled_time(scope) else {
+            let _ = reply.send(Err(anyhow!("alarm dispatched without a claim")));
+            return Begun::Nothing;
+        };
+        return fire_alarm_handler(tc, scope, scheduled_at, retry, None, reply);
+    }
+    let due_by = match claim {
+        AlarmDispatch::Armed => i64::MAX,
+        _ => now,
+    };
+    let Some((scheduled_at, retry)) = storage::due_alarm_entry(scope, due_by) else {
+        // Nothing is due: another dispatch already ran it, or the handler
+        // that armed it cleared it. Answer what stands now, with no delta —
+        // no handler ran, so there is nothing written to prove.
+        let _ = reply.send(Ok((storage::get_alarm(scope), None)));
+        return Begun::Nothing;
+    };
+    storage::begin_alarm_handler(scope, scheduled_at);
+    fire_alarm_handler(
+        tc,
+        scope,
+        scheduled_at,
+        retry,
+        Some(AlarmClaim { now_ms: now }),
+        reply,
+    )
+}
+
+/// Call `alarm()`, carrying whatever claim its outcome must close.
+fn fire_alarm_handler(
+    tc: &mut v8::PinScope,
+    scope: &str,
+    scheduled_at: i64,
+    retry: i64,
+    claim: Option<AlarmClaim>,
+    reply: tokio::sync::oneshot::Sender<Result<(Option<i64>, Option<u64>)>>,
+) -> Begun {
+    let begun = start_cell_event(tc, scope, Answer::Alarm(reply), None, false, |tc| {
+        let f = dispatcher(tc, "__fireAlarm")?;
+        let arguments = [
+            v8::String::new(tc, scope).unwrap().into(),
+            v8::Number::new(tc, scheduled_at as f64).into(),
+            v8::Number::new(tc, retry as f64).into(),
+        ];
+        let recv = v8::undefined(tc).into();
+        f.call(tc, recv, &arguments)
+            .ok_or_else(|| anyhow!("alarm threw"))
+    });
+    match begun {
+        Begun::Running(mut entry) => {
+            entry.alarm = claim;
+            Begun::Running(entry)
+        }
+        // The dispatcher never ran, so nothing can have changed the alarm.
+        // Give the claim back as a failure that does not count against the
+        // retry limit: the handler is not what failed.
+        begun => {
+            if let Some(claim) = claim {
+                storage::finish_alarm_handler_with_retry_policy(scope, false, claim.now_ms, false);
+            }
+            begun
+        }
+    }
+}
+
+/// Resolve one completed op and run the microtasks that follow, with the
+/// owning request's context current.
+///
+/// The half of a turn that resumes a suspended request. It knows nothing
+/// about any other request: the caller has already established that this op
+/// is `entry`'s.
+fn deliver(
+    tc: &mut v8::PinScope,
+    entry: &mut InFlight,
+    op: u64,
+    res: Result<asyncrt::OpOut, String>,
+) {
+    entry.ops.remove(&op);
+    let guard = CurrentGuard::enter(entry.context.clone());
+    resolve_res(tc, op, res);
+    tc.perform_microtask_checkpoint();
+    drop(guard);
+}
+
+/// End a request whose client has hung up, so its handler stops running.
+fn cancelled(tc: &mut v8::PinScope, entry: &mut InFlight) {
+    if entry.reply.is_none() || !take_request_cancellation(entry.request_id) {
+        return;
+    }
+    cancel(tc, entry);
+}
+
+/// End a request whose cancellation has already been taken.
+///
+/// Split from [`cancelled`] because a suspended request observes the
+/// cancellation *outside* the isolate — the flag is host state and costs no
+/// V8 — and only then enters to act on it.
+fn cancel(tc: &mut v8::PinScope, entry: &mut InFlight) {
+    let guard = CurrentGuard::enter(entry.context.clone());
+    // The id that names this request to the JS side. A stateless handler is
+    // registered by the shell, and only once it suspends, so the shell holds
+    // the id; a cell's dispatcher registers the request itself, so the job's
+    // own id is the one to abort. Aborting the wrong one — or neither —
+    // leaves the target's `request.signal` unfired while the caller is told
+    // the client has gone.
+    if let Some(id) = entry.active_request_id.or(entry.request_id) {
+        let _ = abort_incoming_request(tc, id);
+    }
+    // Finishing is the shell's to undo only where the shell registered.
+    if let Some(id) = entry.active_request_id {
+        finish_incoming_request(tc, id);
+    }
+    let background = end_event_context(tc).ok().flatten();
+    entry.background = background.map(|promise| v8::Global::new(tc, promise));
+    drop(guard);
+    entry.fail(anyhow!("The client has disconnected"));
+    // A cancelled handler with no waitUntil work has nothing left to drive.
+    // Drop its host ops now, so their guards cancel routed work. Explicit
+    // waitUntil work keeps its ops and continues after the client disconnects.
+    if entry.background.is_none() {
+        entry.abandon();
+    }
+}
+
+/// Answer a request whose handler promise has settled, and retire its
+/// `waitUntil` work once that settles too.
+fn settle(tc: &mut v8::PinScope, entry: &mut InFlight) {
+    if entry.reply.is_some() {
+        let promise = v8::Local::new(tc, &entry.promise);
+        match promise.state() {
+            v8::PromiseState::Pending => {}
+            v8::PromiseState::Fulfilled => {
+                let guard = CurrentGuard::enter(entry.context.clone());
+                let value = promise.result(tc);
+                entry.answer_settled(tc, value);
+                if let Some(request_id) = entry.active_request_id {
+                    finish_incoming_request(tc, request_id);
+                }
+                drop(guard);
+            }
+            v8::PromiseState::Rejected => {
+                let guard = CurrentGuard::enter(entry.context.clone());
+                let reason = reject_reason(tc, promise);
+                // The handler is what failed, so an alarm's failure here
+                // counts against its retry limit — unlike a budget overrun
+                // or a disconnect, which `fail` records as not counting.
+                entry.settle_alarm(false, true);
+                let _ = end_event_context(tc);
+                if let Some(request_id) = entry.active_request_id {
+                    finish_incoming_request(tc, request_id);
+                }
+                drop(guard);
+                entry.fail(anyhow!("rejected: {reason}"));
+            }
+        }
+    }
+    if let Some(background) = &entry.background {
+        let promise = v8::Local::new(tc, background);
+        if !matches!(promise.state(), v8::PromiseState::Pending) {
+            entry.background = None;
+        }
+    }
+}
+
+/// Begin a stateless request: build it, call the Worker's `fetch`, and hand
+/// back the promise it returned.
+///
+/// The half of a request that runs *before* it can suspend. Split out from
+/// driving it to completion so a caller can start several and drive them
+/// together; the single-request path starts one and drives it immediately,
+/// which is what it always did.
+///
+/// The caller owns the `IoContext` and must have it current: `__beginEvent`
+/// runs here, and the frame it pushes belongs to this request.
+fn start_fetch<'s>(
+    tc: &mut v8::PinScope<'s, '_>,
+    fetch: v8::Local<'s, v8::Function>,
+    url: &str,
+    method: &str,
+    body: &[u8],
+    headers: &[(String, String)],
+    request_id: Option<RequestId>,
+) -> Result<Started<'s>> {
+    let req = match request_id {
+        Some(_) => make_incoming_request(tc, url, method, body, headers),
+        None => make_request(tc, url, method, body, headers),
+    }?;
+    let env = harness_env(tc)?;
+    let recv = v8::undefined(tc).into();
+    let f = fetch;
+    let execution_ctx = begin_event_context(tc)?;
+    let Some(ret) = f.call(tc, recv, &[req, env, execution_ctx]) else {
+        // The handler threw synchronously. Termination carries its own error;
+        // otherwise the pending exception is on the caller's TryCatch, which
+        // is the only scope that can read it, so it formats the message.
+        let error = take_execution_termination(tc);
+        let _ = end_event_context(tc);
+        return match error {
+            Some(error) => Err(error),
+            None => Ok(Started::Threw),
+        };
+    };
+    // A handler that suspends must be reachable by an abort: register it as an
+    // incoming request so a client disconnect can cancel it. One that already
+    // settled cannot be cancelled, so its registration is cleared instead.
+    let active_request_id = match request_id {
+        Some(request_id)
+            if ret
+                .try_cast::<v8::Promise>()
+                .is_ok_and(|promise| promise.state() == v8::PromiseState::Pending) =>
+        {
+            if let Err(error) = register_incoming_request(tc, request_id, req) {
+                clear_request_cancellation(request_id);
+                let _ = end_event_context(tc);
+                return Err(error);
+            }
+            Some(request_id)
+        }
+        Some(request_id) => {
+            clear_request_cancellation(request_id);
+            None
+        }
+        None => None,
+    };
+    Ok(Started::Running(ret, active_request_id))
+}
+
+/// What `start_fetch` produced: a running handler, or a synchronous throw
+/// whose exception only the caller's `TryCatch` can read.
+enum Started<'s> {
+    Running(v8::Local<'s, v8::Value>, Option<RequestId>),
+    Threw,
 }
 
 impl Worker {
@@ -2167,7 +2705,6 @@ impl Worker {
         let script_name = config.script_name.as_str();
         let do_classes = config.do_classes.as_slice();
         let node = config.node.as_str();
-        let text = config.text.as_slice();
         let compat = config.compat;
         let params = v8::CreateParams::default().heap_limits(0, v8_heap_limit_bytes());
         let mut isolate = v8::Isolate::new(params);
@@ -2176,6 +2713,7 @@ impl Worker {
         let original_heap_limit = isolate.get_heap_statistics().heap_size_limit();
         let heap_limit_state = Arc::new(HeapLimitState::default());
         let runtime_state = Arc::new(ActorRuntimeState {
+            promises: std::sync::Mutex::new(PromiseMap::new()),
             egress: config.egress,
             ..Default::default()
         });
@@ -2183,6 +2721,7 @@ impl Worker {
             Arc::as_ptr(&heap_limit_state) as *mut HeapLimitState as *mut std::ffi::c_void;
         isolate.set_slot(heap_limit_state);
         isolate.set_slot(runtime_state.clone());
+        isolate.set_slot(Arc::new(ModuleRegistry::default()));
         isolate.add_near_heap_limit_callback(near_heap_limit, heap_limit_state_ptr);
         let (context, fetch) = {
             v8::scope!(let hs, &mut isolate);
@@ -2204,10 +2743,9 @@ impl Worker {
                 Some(m) => m,
                 None => return Err(anyhow!("compile: {}", exc!(scope))),
             };
-            register_stubs(scope, src, text); // cloudflare:*/node:* + text modules
-            if !config.loader_modules.is_empty() {
-                register_loader_modules(scope, &config.loader_modules);
-            }
+            register_stubs(scope, src, &config.modules); // cloudflare:*/node:* + text modules
+            register_wasm_modules(scope, &config.modules);
+            register_loader_modules(scope, &config.modules);
             module
                 .instantiate_module(scope, resolve_external)
                 .ok_or_else(|| anyhow!("instantiate: {}", exc!(scope)))?;
@@ -2271,11 +2809,31 @@ impl Worker {
                 .to_object(scope)
                 .ok_or_else(|| anyhow!("default not object"))?;
             let fk = v8::String::new(scope, "fetch").unwrap();
-            let f: v8::Local<v8::Function> = default
+            let fetch_value = default
                 .get(scope, fk.into())
-                .ok_or_else(|| anyhow!("no fetch"))?
-                .try_into()
-                .map_err(|_| anyhow!("fetch not fn"))?;
+                .ok_or_else(|| anyhow!("no fetch"))?;
+            let default_is_entrypoint =
+                default.is_function() && cell_registry_has(scope, "entrypoints", "default")?;
+            let f: v8::Local<v8::Function> = if fetch_value.is_function() {
+                fetch_value.try_into().expect("function casts to Function")
+            } else if default_is_entrypoint {
+                // A class-based default entrypoint (extends WorkerEntrypoint)
+                // keeps fetch on the prototype, so route through the
+                // harness's cached instance like a named entrypoint. Only a
+                // registered entrypoint dispatches that way — any other
+                // callable would load fine and then 500 on every request.
+                compile_fn(
+                    scope,
+                    "(req) => globalThis.__dispatchEntrypointFetch('default', req)",
+                )?
+            } else if default.is_function() && cell_registry_has(scope, "doExports", "default")? {
+                return Err(anyhow!(
+                    "the default export is a Durable Object class; export a fetch \
+                     handler or a WorkerEntrypoint class as the default"
+                ));
+            } else {
+                return Err(anyhow!("fetch not fn"));
+            };
 
             // Lets a self-targeted service binding invoke the handler in
             // this isolate instead of crossing to a pool thread.
@@ -2291,10 +2849,27 @@ impl Worker {
                     // Optional scheduled handler, reached by a self-targeted
                     // service binding's scheduled().
                     let sk = v8::String::new(scope, "scheduled").unwrap();
-                    if let Some(handler) = default.get(scope, sk.into()) {
-                        if handler.is_function() {
-                            let key_ = v8::String::new(scope, "selfScheduled").unwrap();
-                            cell.set(scope, key_.into(), handler);
+                    let key_ = v8::String::new(scope, "selfScheduled").unwrap();
+                    let own = default
+                        .get(scope, sk.into())
+                        .filter(|handler| handler.is_function());
+                    if let Some(handler) = own {
+                        cell.set(scope, key_.into(), handler);
+                    } else if default_is_entrypoint {
+                        // A class-based default entrypoint keeps scheduled on
+                        // the prototype; dispatch through the cached instance
+                        // like fetch above.
+                        let pk = v8::String::new(scope, "prototype").unwrap();
+                        let proto_scheduled = default
+                            .get(scope, pk.into())
+                            .and_then(|proto| proto.to_object(scope))
+                            .and_then(|proto| proto.get(scope, sk.into()));
+                        if proto_scheduled.is_some_and(|handler| handler.is_function()) {
+                            let shim = compile_fn(
+                                scope,
+                                "(ctrl) => globalThis.__dispatchEntrypointScheduled('default', ctrl)",
+                            )?;
+                            cell.set(scope, key_.into(), shim.into());
                         }
                     }
                 }
@@ -2303,536 +2878,169 @@ impl Worker {
         };
         Ok(Worker {
             inner: Some(WorkerIsolate {
-                isolate,
-                context,
-                fetch,
+                // Every setup scope above has closed, so nothing is entered
+                // on top of this isolate and it can be handed over.
+                // SAFETY: `into_shared` requires every piece of embedder
+                // state hanging off this isolate to be `Send`, because it
+                // migrates between threads and is dropped on whichever one
+                // holds the lock last. This isolate carries exactly:
+                //
+                // - three slots, whose types the assertion below pins as
+                //   `Send + Sync`;
+                // - `near_heap_limit`, a bare fn pointer whose only captured
+                //   state is a raw pointer into the `HeapLimitState` above;
+                // - `host_import_module_dynamically`, a bare fn pointer that
+                //   captures nothing;
+                // - a default `CreateParams` allocator, owned by V8.
+                //
+                // Nothing else is attached, and the assertion fails the build
+                // if a slot type ever stops being thread-safe.
+                //
+                // 152.1.0 made this fallible. None of the four refusals can
+                // hold here — this isolate is entered, is not a snapshot
+                // creator, has no C++ heap, and has taken no weak handles —
+                // so a refusal is a bug in the setup above, not a condition
+                // to recover from. It panics with the reason named.
+                isolate: unsafe { isolate.try_into_shared() }
+                    .unwrap_or_else(|error| panic!("cell isolate cannot be shared: {error}")),
+                realm: Realm { context, fetch },
                 original_heap_limit,
-                runtime_state,
+                cells: storage::Cells::default(),
             }),
-            config,
-            owned,
         })
-    }
-
-    fn reload_after_process_exit(&mut self) -> Result<()> {
-        if !self
-            .runtime_state
-            .worker_exit_requested
-            .load(Ordering::Relaxed)
-        {
-            return Ok(());
-        }
-        let config = self.config.clone();
-        let owned = self.owned.clone();
-        drop(self.inner.take());
-        let replacement = Self::load_config_owned(config, owned)
-            .map_err(|error| anyhow!("reload after process.exit: {error:#}"))?;
-        self.inner = replacement.inner;
-        Ok(())
     }
 
     /// Restore an idFromName() actor's human-readable identity before its
     /// constructor runs. The host calls this on activation and before a named
     /// request is dispatched.
+    /// Record whether this isolate hosts `cell`, so the harness can dispatch
+    /// to it in-isolate instead of going back out through the host.
+    ///
+    /// Baked in at load time until cells shared isolates, when an isolate
+    /// served exactly one cell for its whole life and the list could not
+    /// change. Now a cell arrives at an isolate that already exists, so the
+    /// list has to move with placement.
+    ///
+    /// Getting this wrong is not symmetric. A cell missing from the list
+    /// still works: the dispatch goes out to the host, which routes it
+    /// straight back here, costing a round trip. A cell wrongly *in* the
+    /// list is a cell this isolate would try to serve without hosting it, so
+    /// the shell sets it when it takes a residency and clears it when the
+    /// residency ends.
+    pub fn own_cell(
+        &mut self,
+        cell: &str,
+        db_path: Option<&str>,
+        owned: bool,
+    ) -> Result<Option<i64>> {
+        let (mut locker, _cells) = self.lock();
+        v8::scope!(let hs, &mut *locker);
+        let realm = self.realm(hs);
+        let context = realm.context;
+        let cs = &mut v8::ContextScope::new(hs, context);
+        let tc = std::pin::pin!(v8::TryCatch::new(cs));
+        adopt_cell(&mut tc.init(), cell, db_path, owned)
+    }
+
+    /// Drain the alarm moves the last turn committed in this isolate.
+    ///
+    /// An alarm move is a turn output, exactly like the ops a turn starts:
+    /// the drive that ran the turn reports it to the host, so a handler
+    /// that arms an alarm and then awaits it is schedulable immediately,
+    /// not when the request ends. A separate call rather than part of the
+    /// turn methods' return because stateless turns cannot move an alarm
+    /// and never pay for it.
+    pub fn take_alarm_moves(&mut self) -> Vec<(String, i64)> {
+        let Some(inner) = self.inner.as_mut() else {
+            return Vec::new();
+        };
+        let (_locker, _cells) = inner.lock();
+        storage::take_alarm_moves()
+    }
+
     pub fn set_id_name(&mut self, scope: &str, name: &str) -> Result<()> {
-        let context_g = self.context.clone();
-        v8::scope!(let hs, &mut self.isolate);
-        let context = v8::Local::new(hs, context_g);
+        let (mut locker, _cells) = self.lock();
+        v8::scope!(let hs, &mut *locker);
+        let realm = self.realm(hs);
+        let context = realm.context;
         let cs = &mut v8::ContextScope::new(hs, context);
         let tc = std::pin::pin!(v8::TryCatch::new(cs));
         register_actor_name(&mut tc.init(), scope, Some(name))
     }
 
-    /// Fire the DO's alarm() handler for `scope`. Returns Ok on success, Err if
-    /// the handler threw (caller retries per the at-least-once contract).
-    pub fn fire_alarm(
+    /// Start a cell event's first turn.
+    ///
+    /// The cell counterpart of `turn_begin`: it hands back what is now in
+    /// flight for `runtime::drive_cell` to pump.
+    pub fn turn_begin_cell(
         &mut self,
-        scope: &str,
-        retry: i64,
-        rx: &std::sync::mpsc::Receiver<CellJob>,
-    ) -> std::result::Result<(), AlarmRunError> {
-        let scheduled_time = storage::active_alarm_scheduled_time(scope).ok_or_else(|| {
-            AlarmRunError::infrastructure(anyhow!(
-                "alarm handler started without a scheduled alarm",
-            ))
-        })?;
-        let context_g = self.context.clone();
-        v8::scope!(let hs, &mut self.isolate);
-        let context = v8::Local::new(hs, context_g);
-        let cs = &mut v8::ContextScope::new(hs, context);
-        let tc = std::pin::pin!(v8::TryCatch::new(cs));
-        let result = call_fire_alarm(&mut tc.init(), scope, scheduled_time, retry, rx);
-        if let Some(error) = storage::sql_critical_error(scope) {
-            return Err(AlarmRunError::user(anyhow!(error)));
-        }
-        result
-    }
-
-    /// Run a specific DO instance's fetch, addressed by its scope — the target
-    /// of a cross-node proxy hop. Bypasses the Worker's default export (which
-    /// would re-route). Called on the owner node via the `/__do/<scope>` endpoint.
-    pub fn dispatch_to_and_reply(
-        &mut self,
-        scope: &str,
-        request: FetchRequest<'_>,
-        rx: &std::sync::mpsc::Receiver<CellJob>,
-        reply: tokio::sync::oneshot::Sender<Result<HttpResponse>>,
-    ) {
-        let context_g = self.context.clone();
-        v8::scope!(let hs, &mut self.isolate);
-        let context = v8::Local::new(hs, context_g);
+        job: CellJob,
+        trace: Option<crate::telemetry::TraceIds>,
+    ) -> (Option<InFlight>, Vec<Op>) {
+        let Some(inner) = self.inner.as_mut() else {
+            return (None, Vec::new());
+        };
+        let (mut locker, _cells) = inner.lock();
+        v8::scope!(let hs, &mut *locker);
+        let realm = inner.realm(hs);
+        let context = realm.context;
         let cs = &mut v8::ContextScope::new(hs, context);
         let tc = std::pin::pin!(v8::TryCatch::new(cs));
         let tc = &mut tc.init();
-        let global = context.global(tc);
-        let key = v8::String::new(tc, "__dispatchTo").unwrap();
-        let f: v8::Local<v8::Function> = match global
-            .get(tc, key.into())
-            .ok_or_else(|| anyhow!("no __dispatchTo"))
-            .and_then(|value| value.try_into().map_err(|_| anyhow!("not fn")))
-        {
-            Ok(f) => f,
-            Err(error) => {
-                let _ = reply.send(Err(error));
-                return;
+
+        let previous = install_trace(tc, trace.as_ref());
+        let out = match begin_cell(tc, job) {
+            Begun::Running(mut entry) => {
+                entry.trace = trace;
+                let ops = finish_turn(tc, &mut entry);
+                (Some(*entry), ops)
             }
-        };
-        let sc = v8::String::new(tc, scope).unwrap();
-        let u = v8::String::new(tc, request.url).unwrap();
-        let m = v8::String::new(tc, request.method).unwrap();
-        let b = bytes_value(tc, request.body.to_vec());
-        let headers = match serde_json::to_string(request.headers) {
-            Ok(headers) => v8::String::new(tc, &headers).unwrap(),
-            Err(error) => {
-                let _ = reply.send(Err(error.into()));
-                return;
+            Begun::Threw(answer) => {
+                answer.fail(anyhow!("cell event threw: {}", exc!(tc)));
+                (None, Vec::new())
             }
+            Begun::Nothing => (None, Vec::new()),
         };
-        let request_id_value: v8::Local<v8::Value> = match request.request_id {
-            Some(request_id) => v8::String::new(tc, &request_id_string(request_id))
-                .unwrap()
-                .into(),
-            None => v8::null(tc).into(),
+        restore_trace(tc, previous);
+        out
+    }
+
+    /// Enter the isolate solely to see whether another event settled this
+    /// one's promise.
+    ///
+    /// A promise resolved by a different entry has no waker pointing here,
+    /// so the driving task cannot be told and has to look. That is why this
+    /// is a poll and not an event, and it is the same reason the blocking
+    /// loop woke every 10 ms.
+    pub fn turn_poll(&mut self, entry: &mut InFlight) -> Vec<Op> {
+        let Some(inner) = self.inner.as_mut() else {
+            return Vec::new();
         };
-        let recv = v8::undefined(tc).into();
-        // Sample the committed-write position before the handler runs, so the
-        // output gate can tell an app write from celld's own activation writes.
-        let writes_before = storage::write_position(scope);
-        if let Err(error) = begin_event_context(tc) {
-            let _ = reply.send(Err(error));
-            return;
-        }
-        let Some(ret) = f.call(
-            tc,
-            recv,
-            &[
-                sc.into(),
-                u.into(),
-                m.into(),
-                b,
-                headers.into(),
-                request_id_value,
-            ],
-        ) else {
-            let _ = end_event_context(tc);
-            let _ = reply.send(Err(anyhow!("dispatchTo threw: {}", exc!(tc))));
+        let (mut locker, _cells) = inner.lock();
+        v8::scope!(let hs, &mut *locker);
+        let realm = inner.realm(hs);
+        let context = realm.context;
+        let cs = &mut v8::ContextScope::new(hs, context);
+        let tc = std::pin::pin!(v8::TryCatch::new(cs));
+        let tc = &mut tc.init();
+
+        let previous = install_trace(tc, entry.trace.as_ref());
+        let ops = finish_turn(tc, entry);
+        restore_trace(tc, previous);
+        ops
+    }
+
+    /// Enter the isolate solely to record how a claimed alarm ended.
+    ///
+    /// Reached only when the event ended without running JS again — a budget
+    /// overrun, or a handler waiting on nothing. The bookkeeping is storage
+    /// the isolate owns, so it cannot be done from the driving task.
+    pub fn turn_finish_alarm(&mut self, entry: &mut InFlight) {
+        let Some(inner) = self.inner.as_mut() else {
             return;
         };
-        complete_fetch_event(
-            tc,
-            ret,
-            Some(rx),
-            Some(scope),
-            writes_before,
-            request.request_id,
-            reply,
-        );
-    }
-
-    /// Invoke one public method on a DO instance (Cloudflare native RPC),
-    /// with arguments and result in either `RpcData` flavor.
-    pub fn dispatch_rpc_data(
-        &mut self,
-        scope: &str,
-        method: &str,
-        args: RpcData,
-        rx: &std::sync::mpsc::Receiver<CellJob>,
-    ) -> Result<RpcData> {
-        let context_g = self.context.clone();
-        v8::scope!(let hs, &mut self.isolate);
-        let context = v8::Local::new(hs, context_g);
-        let cs = &mut v8::ContextScope::new(hs, context);
-        let tc = std::pin::pin!(v8::TryCatch::new(cs));
-        let tc = &mut tc.init();
-        let global = context.global(tc);
-        let key = v8::String::new(tc, "__dispatchRpc").unwrap();
-        let f: v8::Local<v8::Function> = global
-            .get(tc, key.into())
-            .ok_or_else(|| anyhow!("no __dispatchRpc"))?
-            .try_into()
-            .map_err(|_| anyhow!("not fn"))?;
-        let sc = v8::String::new(tc, scope).unwrap();
-        let method = v8::String::new(tc, method).unwrap();
-        let args = rpc_data_value(tc, args);
-        let recv = v8::undefined(tc).into();
-        begin_event_context(tc)?;
-        let Some(ret) = f.call(tc, recv, &[sc.into(), method.into(), args]) else {
-            let _ = end_event_context(tc);
-            return Err(anyhow!("dispatchRpc threw: {}", exc!(tc)));
-        };
-        let ret = run_event_value(tc, ret, Some(rx), Some(scope), None);
-        if let Some(error) = storage::sql_critical_error(scope) {
-            return Err(anyhow!(error));
-        }
-        let ret = ret?;
-        Ok(rpc_data_ret(tc, ret))
-    }
-
-    /// JSON-flavored `dispatch_rpc_data`, the test harness's entry point.
-    #[cfg(test)]
-    pub fn dispatch_rpc(
-        &mut self,
-        scope: &str,
-        method: &str,
-        args: &str,
-        rx: &std::sync::mpsc::Receiver<CellJob>,
-    ) -> Result<String> {
-        let args = RpcData::Json(args.into());
-        match self.dispatch_rpc_data(scope, method, args, rx)? {
-            RpcData::Json(json) => Ok(json),
-            RpcData::V8(_) => Err(anyhow!("JSON RPC answered bytes")),
-        }
-    }
-
-    /// Invoke `method` on the named `WorkerEntrypoint`. The service-binding
-    /// counterpart of `dispatch_rpc_data`: no actor scope, so no cell
-    /// receiver and no SQL critical-error check. Arguments and result are V8
-    /// structured-clone bytes.
-    pub fn dispatch_entrypoint_rpc(
-        &mut self,
-        entrypoint: &str,
-        method: &str,
-        args: Vec<u8>,
-    ) -> Result<Vec<u8>> {
-        let context_g = self.context.clone();
-        v8::scope!(let hs, &mut self.isolate);
-        let context = v8::Local::new(hs, context_g);
-        let cs = &mut v8::ContextScope::new(hs, context);
-        let tc = std::pin::pin!(v8::TryCatch::new(cs));
-        let tc = &mut tc.init();
-        let global = context.global(tc);
-        let key = v8::String::new(tc, "__dispatchEntrypointRpc").unwrap();
-        let f: v8::Local<v8::Function> = global
-            .get(tc, key.into())
-            .ok_or_else(|| anyhow!("no __dispatchEntrypointRpc"))?
-            .try_into()
-            .map_err(|_| anyhow!("not fn"))?;
-        let entrypoint = v8::String::new(tc, entrypoint).unwrap();
-        let method = v8::String::new(tc, method).unwrap();
-        let args = bytes_value(tc, args);
-        let recv = v8::undefined(tc).into();
-        begin_event_context(tc)?;
-        let Some(ret) = f.call(tc, recv, &[entrypoint.into(), method.into(), args]) else {
-            let _ = end_event_context(tc);
-            return Err(anyhow!("entrypoint RPC threw: {}", exc!(tc)));
-        };
-        let ret = run_event_value(tc, ret, None, None, None)?;
-        view_bytes(ret).ok_or_else(|| anyhow!("entrypoint RPC answered non-bytes"))
-    }
-
-    pub fn dispatch_ws_open(
-        &mut self,
-        scope: &str,
-        ws_id: u64,
-        protocol: &str,
-        rx: &std::sync::mpsc::Receiver<CellJob>,
-    ) -> Result<()> {
-        let context_g = self.context.clone();
-        v8::scope!(let hs, &mut self.isolate);
-        let context = v8::Local::new(hs, context_g);
-        let cs = &mut v8::ContextScope::new(hs, context);
-        let tc = std::pin::pin!(v8::TryCatch::new(cs));
-        let tc = &mut tc.init();
-        call_dispatch_ws_open(tc, scope, ws_id, protocol, rx)
-    }
-
-    /// Deliver a WebSocket message to the cell's DO (`webSocketMessage`). The
-    /// socket lives in the host; `ws.send` inside the handler routes back out by
-    /// wsId. The isolate may have been hibernated between messages — the host
-    /// re-activates before calling this.
-    pub fn dispatch_ws(
-        &mut self,
-        scope: &str,
-        ws_id: u64,
-        data: WsIn,
-        rx: &std::sync::mpsc::Receiver<CellJob>,
-    ) -> Result<WsDispatch> {
-        let context_g = self.context.clone();
-        v8::scope!(let hs, &mut self.isolate);
-        let context = v8::Local::new(hs, context_g);
-        let cs = &mut v8::ContextScope::new(hs, context);
-        let tc = std::pin::pin!(v8::TryCatch::new(cs));
-        let tc = &mut tc.init();
-        call_dispatch_ws(tc, scope, ws_id, data, rx)
-    }
-
-    pub fn dispatch_ws_closed(
-        &mut self,
-        scope: &str,
-        ws_id: u64,
-        code: u16,
-        reason: &str,
-        was_clean: bool,
-        rx: &std::sync::mpsc::Receiver<CellJob>,
-    ) -> Result<()> {
-        let context_g = self.context.clone();
-        v8::scope!(let hs, &mut self.isolate);
-        let context = v8::Local::new(hs, context_g);
-        let cs = &mut v8::ContextScope::new(hs, context);
-        let tc = std::pin::pin!(v8::TryCatch::new(cs));
-        let tc = &mut tc.init();
-        let global = context.global(tc);
-        let key = v8::String::new(tc, "__wsClosed").unwrap();
-        let f: v8::Local<v8::Function> = global
-            .get(tc, key.into())
-            .ok_or_else(|| anyhow!("no __wsClosed"))?
-            .try_into()
-            .map_err(|_| anyhow!("not fn"))?;
-        let sc = v8::String::new(tc, scope).unwrap();
-        let id = v8::Number::new(tc, ws_id as f64);
-        let code = v8::Number::new(tc, f64::from(code));
-        let reason = v8::String::new(tc, reason).unwrap();
-        let was_clean = v8::Boolean::new(tc, was_clean);
-        let recv = v8::undefined(tc).into();
-        begin_event_context(tc)?;
-        let Some(ret) = f.call(
-            tc,
-            recv,
-            &[
-                sc.into(),
-                id.into(),
-                code.into(),
-                reason.into(),
-                was_clean.into(),
-            ],
-        ) else {
-            let _ = end_event_context(tc);
-            return Err(anyhow!("wsClosed threw: {}", exc!(tc)));
-        };
-        let result = run_event_value(tc, ret, Some(rx), Some(scope), None);
-        if let Some(error) = storage::sql_critical_error(scope) {
-            return Err(anyhow!(error));
-        }
-        result?;
-        Ok(())
-    }
-
-    /// Run the worker `fetch` and reply on the oneshot. Test-only: it drives
-    /// one request at a time and registers no signal, so the shipped binary
-    /// never needs it.
-    #[cfg(all(test, celld_internal_tests))]
-    pub fn fetch_and_reply(
-        &mut self,
-        url: &str,
-        method: &str,
-        body: &[u8],
-        headers: &[(String, String)],
-        reply: tokio::sync::oneshot::Sender<Result<HttpResponse>>,
-    ) -> Result<()> {
-        self.fetch_and_reply_id(url, method, body, headers, None, reply)
-    }
-
-    /// As `fetch_and_reply`, but the request's signal is registered under
-    /// `request_id` so an HTTP or service-binding caller that disconnects
-    /// reaches the target's `request.signal` mid-flight.
-    pub fn fetch_and_reply_id(
-        &mut self,
-        url: &str,
-        method: &str,
-        body: &[u8],
-        headers: &[(String, String)],
-        request_id: Option<RequestId>,
-        reply: tokio::sync::oneshot::Sender<Result<HttpResponse>>,
-    ) -> Result<()> {
-        self.fetch_and_reply_inner(url, method, body, headers, request_id, reply);
-        self.reload_after_process_exit()
-    }
-
-    fn fetch_and_reply_inner(
-        &mut self,
-        url: &str,
-        method: &str,
-        body: &[u8],
-        headers: &[(String, String)],
-        request_id: Option<RequestId>,
-        reply: tokio::sync::oneshot::Sender<Result<HttpResponse>>,
-    ) {
-        let context_g = self.context.clone();
-        let fetch = self.fetch.clone();
-        v8::scope!(let hs, &mut self.isolate);
-        let context = v8::Local::new(hs, context_g);
-        let cs = &mut v8::ContextScope::new(hs, context);
-        let tc = std::pin::pin!(v8::TryCatch::new(cs));
-        let tc = &mut tc.init();
-
-        let built = match request_id {
-            Some(_) => make_incoming_request(tc, url, method, body, headers),
-            None => make_request(tc, url, method, body, headers),
-        };
-        let req = match built {
-            Ok(req) => req,
-            Err(error) => {
-                let _ = reply.send(Err(error));
-                return;
-            }
-        };
-        // env comes from the harness (globalThis.__cell.env)
-        let env = match harness_env(tc) {
-            Ok(env) => env,
-            Err(error) => {
-                let _ = reply.send(Err(error));
-                return;
-            }
-        };
-        let recv = v8::undefined(tc).into();
-        let f = v8::Local::new(tc, fetch);
-        let execution_ctx = match begin_event_context(tc) {
-            Ok(execution_ctx) => execution_ctx,
-            Err(error) => {
-                let _ = reply.send(Err(error));
-                return;
-            }
-        };
-        let Some(ret) = f.call(tc, recv, &[req, env, execution_ctx]) else {
-            let error = take_execution_termination(tc)
-                .unwrap_or_else(|| anyhow!("fetch threw: {}", exc!(tc)));
-            let _ = end_event_context(tc);
-            let _ = reply.send(Err(error));
-            return;
-        };
-        let active_request_id = match request_id {
-            Some(request_id)
-                if ret
-                    .try_cast::<v8::Promise>()
-                    .is_ok_and(|promise| promise.state() == v8::PromiseState::Pending) =>
-            {
-                if let Err(error) = register_incoming_request(tc, request_id, req) {
-                    clear_request_cancellation(request_id);
-                    let _ = end_event_context(tc);
-                    let _ = reply.send(Err(error));
-                    return;
-                }
-                Some(request_id)
-            }
-            Some(request_id) => {
-                clear_request_cancellation(request_id);
-                None
-            }
-            None => None,
-        };
-        complete_fetch_event(tc, ret, None, None, None, active_request_id, reply);
-        if let Some(request_id) = active_request_id {
-            finish_incoming_request(tc, request_id);
-        }
-    }
-
-    /// Run the worker `fetch` in a CELL isolate, pumping this cell's job
-    /// receiver so an in-isolate `env.NS.get(ownScope).fetch()` resolves without
-    /// a host hop. Identical to `fetch_and_reply_id` except the event loop is
-    /// driven with `Some(rx)`.
-    pub fn worker_fetch_and_reply(
-        &mut self,
-        request: FetchRequest<'_>,
-        rx: &std::sync::mpsc::Receiver<CellJob>,
-        reply: tokio::sync::oneshot::Sender<Result<HttpResponse>>,
-    ) -> Result<()> {
-        self.worker_fetch_and_reply_inner(request, rx, reply);
-        self.reload_after_process_exit()
-    }
-
-    fn worker_fetch_and_reply_inner(
-        &mut self,
-        request: FetchRequest<'_>,
-        rx: &std::sync::mpsc::Receiver<CellJob>,
-        reply: tokio::sync::oneshot::Sender<Result<HttpResponse>>,
-    ) {
-        let context_g = self.context.clone();
-        let fetch = self.fetch.clone();
-        v8::scope!(let hs, &mut self.isolate);
-        let context = v8::Local::new(hs, context_g);
-        let cs = &mut v8::ContextScope::new(hs, context);
-        let tc = std::pin::pin!(v8::TryCatch::new(cs));
-        let tc = &mut tc.init();
-        let built = match request.request_id {
-            Some(_) => make_incoming_request(
-                tc,
-                request.url,
-                request.method,
-                request.body,
-                request.headers,
-            ),
-            None => make_request(
-                tc,
-                request.url,
-                request.method,
-                request.body,
-                request.headers,
-            ),
-        };
-        let req = match built {
-            Ok(req) => req,
-            Err(error) => {
-                let _ = reply.send(Err(error));
-                return;
-            }
-        };
-        let env = match harness_env(tc) {
-            Ok(env) => env,
-            Err(error) => {
-                let _ = reply.send(Err(error));
-                return;
-            }
-        };
-        let recv = v8::undefined(tc).into();
-        let f = v8::Local::new(tc, fetch);
-        let execution_ctx = match begin_event_context(tc) {
-            Ok(execution_ctx) => execution_ctx,
-            Err(error) => {
-                let _ = reply.send(Err(error));
-                return;
-            }
-        };
-        let Some(ret) = f.call(tc, recv, &[req, env, execution_ctx]) else {
-            let error = take_execution_termination(tc)
-                .unwrap_or_else(|| anyhow!("fetch threw: {}", exc!(tc)));
-            let _ = end_event_context(tc);
-            let _ = reply.send(Err(error));
-            return;
-        };
-        let active_request_id = match request.request_id {
-            Some(request_id)
-                if ret
-                    .try_cast::<v8::Promise>()
-                    .is_ok_and(|promise| promise.state() == v8::PromiseState::Pending) =>
-            {
-                if let Err(error) = register_incoming_request(tc, request_id, req) {
-                    clear_request_cancellation(request_id);
-                    let _ = end_event_context(tc);
-                    let _ = reply.send(Err(error));
-                    return;
-                }
-                Some(request_id)
-            }
-            Some(request_id) => {
-                clear_request_cancellation(request_id);
-                None
-            }
-            None => None,
-        };
-        complete_fetch_event(tc, ret, Some(rx), None, None, active_request_id, reply);
-        if let Some(request_id) = active_request_id {
-            finish_incoming_request(tc, request_id);
-        }
+        let (_locker, _cells) = inner.lock();
+        entry.settle_alarm(false, false);
     }
 }
 
@@ -2858,43 +3066,46 @@ fn install_ops(scope: &mut v8::PinScope, context: v8::Local<v8::Context>) {
     ops! { scope, global,
         "__heap_limit_excessively_exceeded" =>
             op_heap_limit_excessively_exceeded,
-        "__ws_send" => op_ws_send,
-        "__ws_send_binary" => op_ws_send_binary,
-        "__ws_close" => op_ws_close,
-        "__ws_alloc" => op_ws_alloc,
-        "__ws_accept" => op_ws_accept,
-        "__ws_accept_regular" => op_ws_accept_regular,
-        "__ws_list" => op_ws_list,
-        "__ws_attachment_set" => op_ws_attachment_set,
-        "__ws_connect" => op_ws_connect,
-        "__ws_next" => op_ws_next,
-        "__ws_upgrade" => op_ws_upgrade,
-        "__storage_get" => op_storage_get,
-        "__storage_get_many" => op_storage_get_many,
-        "__sql_exec" => op_sql_exec,
-        "__sql_ingest" => op_sql_ingest,
-        "__sql_cursor_start" => op_sql_cursor_start,
-        "__sql_cursor_next" => op_sql_cursor_next,
-        "__sql_cursor_close" => op_sql_cursor_close,
-        "__sql_database_size" => op_sql_database_size,
-        "__storage_transaction_control" => op_storage_transaction_control,
+        "__ws_send" => websocket::op_ws_send,
+        "__ws_send_binary" => websocket::op_ws_send_binary,
+        "__ws_close" => websocket::op_ws_close,
+        "__ws_alloc" => websocket::op_ws_alloc,
+        "__ws_accept" => websocket::op_ws_accept,
+        "__ws_accept_regular" => websocket::op_ws_accept_regular,
+        "__ws_list" => websocket::op_ws_list,
+        "__ws_attachment_set" => websocket::op_ws_attachment_set,
+        "__ws_auto_response_set" => websocket::op_ws_auto_response_set,
+        "__ws_auto_response_get" => websocket::op_ws_auto_response_get,
+        "__ws_auto_response_ts" => websocket::op_ws_auto_response_ts,
+        "__ws_connect" => websocket::op_ws_connect,
+        "__ws_next" => websocket::op_ws_next,
+        "__ws_upgrade" => websocket::op_ws_upgrade,
+        "__storage_get" => storage_ops::op_storage_get,
+        "__storage_get_many" => storage_ops::op_storage_get_many,
+        "__sql_exec" => storage_ops::op_sql_exec,
+        "__sql_ingest" => storage_ops::op_sql_ingest,
+        "__sql_cursor_start" => storage_ops::op_sql_cursor_start,
+        "__sql_cursor_next" => storage_ops::op_sql_cursor_next,
+        "__sql_cursor_close" => storage_ops::op_sql_cursor_close,
+        "__sql_database_size" => storage_ops::op_sql_database_size,
+        "__storage_transaction_control" => storage_ops::op_storage_transaction_control,
         "__log" => op_log,
-        "__storage_put" => op_storage_put,
-        "__storage_put_many" => op_storage_put_many,
-        "__storage_queue_put" => op_storage_queue_put,
-        "__storage_queue_put_many" => op_storage_queue_put_many,
-        "__storage_put_serialized" => op_storage_put_serialized,
-        "__storage_queue_put_serialized" => op_storage_queue_put_serialized,
-        "__storage_flush_pending_puts" => op_storage_flush_pending_puts,
-        "__storage_cancel_pending_puts" => op_storage_cancel_pending_puts,
+        "__storage_put" => storage_ops::op_storage_put,
+        "__storage_put_many" => storage_ops::op_storage_put_many,
+        "__storage_queue_put" => storage_ops::op_storage_queue_put,
+        "__storage_queue_put_many" => storage_ops::op_storage_queue_put_many,
+        "__storage_put_serialized" => storage_ops::op_storage_put_serialized,
+        "__storage_queue_put_serialized" => storage_ops::op_storage_queue_put_serialized,
+        "__storage_flush_pending_puts" => storage_ops::op_storage_flush_pending_puts,
+        "__storage_cancel_pending_puts" => storage_ops::op_storage_cancel_pending_puts,
         "__actor_abort" => op_actor_abort,
         "__process_exit" => op_process_exit,
-        "__storage_delete" => op_storage_delete,
-        "__storage_delete_many" => op_storage_delete_many,
-        "__storage_list" => op_storage_list,
-        "__storage_sync_list_start" => op_storage_sync_list_start,
-        "__storage_sync_list_next" => op_storage_sync_list_next,
-        "__storage_delete_all" => op_storage_delete_all,
+        "__storage_delete" => storage_ops::op_storage_delete,
+        "__storage_delete_many" => storage_ops::op_storage_delete_many,
+        "__storage_list" => storage_ops::op_storage_list,
+        "__storage_sync_list_start" => storage_ops::op_storage_sync_list_start,
+        "__storage_sync_list_next" => storage_ops::op_storage_sync_list_next,
+        "__storage_delete_all" => storage_ops::op_storage_delete_all,
         "$$urlParse" => op_url_parse,
         "$$urlPatternParse" => op_urlpattern_parse,
         "$$urlPatternMatchInput" => op_urlpattern_match_input,
@@ -2921,8 +3132,8 @@ fn install_ops(scope: &mut v8::PinScope, context: v8::Local<v8::Context>) {
         "__do_call_cancel" => op_do_call_cancel,
         "__do_id" => op_do_id,
         "__rpc_call" => op_rpc_call,
-        "__sc_encode" => op_sc_encode,
-        "__sc_decode" => op_sc_decode,
+        "__sc_encode" => storage_ops::op_sc_encode,
+        "__sc_decode" => storage_ops::op_sc_decode,
         "__op_fetch" => op_fetch,
         "__asset_fetch" => op_asset_fetch,
         "__http_stream_read" => op_http_stream_read,
@@ -2934,16 +3145,24 @@ fn install_ops(scope: &mut v8::PinScope, context: v8::Local<v8::Context>) {
         "__response_stream_close" => op_response_stream_close,
         "__op_timer" => op_timer,
         "__timer_alloc" => op_timer_alloc,
+        "__gate_acquire" => op_gate_acquire,
+        "__gate_wait" => op_gate_wait,
+        "__gate_release" => op_gate_release,
         "__timer_cancel" => op_timer_cancel,
-        "__crypto_operation" => op_crypto_operation,
-        "$$randomValues" => op_webcrypto_random,
-        "$$digest" => op_webcrypto_digest,
-        "$$hmacSign" => op_webcrypto_hmac_sign,
-        "$$hmacVerify" => op_webcrypto_hmac_verify,
-        "$$aesEncrypt" => op_webcrypto_aes_encrypt,
-        "$$aesDecrypt" => op_webcrypto_aes_decrypt,
-        "$$pbkdf2" => op_node_pbkdf2,
-        "$$hkdf" => op_node_hkdf,
+        "__crypto_operation" => crypto::op_crypto_operation,
+        "$$randomValues" => crypto::op_webcrypto_random,
+        "$$digest" => crypto::op_webcrypto_digest,
+        "$$hmacSign" => crypto::op_webcrypto_hmac_sign,
+        "$$hmacVerify" => crypto::op_webcrypto_hmac_verify,
+        "$$aesEncrypt" => crypto::op_webcrypto_aes_encrypt,
+        "$$aesDecrypt" => crypto::op_webcrypto_aes_decrypt,
+        "$$pbkdf2" => crypto::op_node_pbkdf2,
+        "$$hkdf" => crypto::op_node_hkdf,
+        "$$timingSafeEqual" => crypto::op_timing_safe_equal,
+        "__event_begin" => op_event_begin,
+        "__event_end" => op_event_end,
+        "__wait_until" => op_wait_until,
+        "__event_depth" => op_event_depth,
         "__als_get" => op_als_get,
         "__als_set" => op_als_set,
         "__util_type_flags" => op_util_type_flags,
@@ -2952,11 +3171,11 @@ fn install_ops(scope: &mut v8::PinScope, context: v8::Local<v8::Context>) {
         "__util_promise_details" => op_util_promise_details,
         "__util_preview_entries" => op_util_preview_entries,
         "__builtin_module" => op_builtin_module,
-        "__zlib" => op_zlib,
-        "__zlib_stream_new" => op_zlib_stream_new,
-        "__zlib_stream_push" => op_zlib_stream_push,
-        "__zlib_stream_end" => op_zlib_stream_end,
-        "__zlib_stream_drop" => op_zlib_stream_drop,
+        "__zlib" => zlib::op_zlib,
+        "__zlib_stream_new" => zlib::op_zlib_stream_new,
+        "__zlib_stream_push" => zlib::op_zlib_stream_push,
+        "__zlib_stream_end" => zlib::op_zlib_stream_end,
+        "__zlib_stream_drop" => zlib::op_zlib_stream_drop,
     }
     #[cfg(all(test, celld_internal_tests))]
     ops! { scope, global,
@@ -2965,13 +3184,13 @@ fn install_ops(scope: &mut v8::PinScope, context: v8::Local<v8::Context>) {
         "__test_set_heap_limit_excessively_exceeded" =>
             op_test_set_heap_limit_excessively_exceeded,
         "__sql_set_max_page_count_for_test" =>
-            op_sql_set_max_page_count_for_test,
-        "__sql_set_write_fault_for_test" => op_sql_set_write_fault_for_test,
-        "__sql_set_cache_size_for_test" => op_sql_set_cache_size_for_test,
+            storage_ops::op_sql_set_max_page_count_for_test,
+        "__sql_set_write_fault_for_test" => storage_ops::op_sql_set_write_fault_for_test,
+        "__sql_set_cache_size_for_test" => storage_ops::op_sql_set_cache_size_for_test,
         "__sql_set_interrupt_fault_for_test" =>
-            op_sql_set_interrupt_fault_for_test,
+            storage_ops::op_sql_set_interrupt_fault_for_test,
         "__sql_register_nomem_function_for_test" =>
-            op_sql_register_nomem_function_for_test,
+            storage_ops::op_sql_register_nomem_function_for_test,
     }
 }
 
@@ -2979,7 +3198,7 @@ fn install_ops(scope: &mut v8::PinScope, context: v8::Local<v8::Context>) {
 fn promise_for<'s>(scope: &mut v8::PinScope<'s, '_>, id: u64) -> v8::Local<'s, v8::Value> {
     let resolver = v8::PromiseResolver::new(scope).unwrap();
     let promise = resolver.get_promise(scope);
-    promise_store(id, v8::Global::new(scope, resolver));
+    promise_store(scope, id, v8::Global::new(scope, resolver));
     promise.into()
 }
 
@@ -2998,23 +3217,16 @@ fn op_svc_rpc(
     let method = args.get(2).to_rust_string_lossy(scope);
     let call_args = view_bytes(args.get(3)).unwrap_or_default();
     let (tx, rx) = tokio::sync::oneshot::channel();
-    let sent = SVC_RPC_TX
-        .get()
-        .map(|t| {
-            t.send(SvcRpcReq {
-                script,
-                entrypoint,
-                method,
-                args: call_args,
-                reply: tx,
-            })
-            .is_ok()
-        })
-        .unwrap_or(false);
+    let gate = egress_gate_pending();
+    let request = SvcRpcReq {
+        script,
+        entrypoint,
+        method,
+        args: call_args,
+        reply: tx,
+    };
     let id = asyncrt::enqueue(async move {
-        if !sent {
-            return Err("no service binding channel".into());
-        }
+        gated_channel_send(gate, &SVC_RPC_TX, request, "no service binding channel").await?;
         match rx.await {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(error)) => Err(format!("{error}")),
@@ -3068,36 +3280,33 @@ fn op_svc_call_impl(
         (
             Some(request_id),
             Some(cancel_receiver),
-            Some(DoCallCancelGuard(request_id)),
+            Some(DoCallCancelGuard::new(request_id)),
         )
     } else {
         (None, None, None)
     };
-    let sent = SVC_CALL_TX
-        .get()
-        .map(|t| {
-            t.send(SvcCallReq {
-                cancel,
-                script,
-                url,
-                method,
-                body,
-                headers,
-                reply: tx,
-            })
-            .is_ok()
-        })
-        .unwrap_or(false);
+    let gate = egress_gate_pending();
+    let request = SvcCallReq {
+        cancel,
+        script,
+        url,
+        method,
+        body,
+        headers,
+        reply: tx,
+    };
     let id = asyncrt::enqueue(async move {
-        let _cancel_guard = cancel_guard;
-        if !sent {
-            return Err("no service binding channel".into());
-        }
-        match rx.await {
+        let mut cancel_guard = cancel_guard;
+        gated_channel_send(gate, &SVC_CALL_TX, request, "no service binding channel").await?;
+        let result = match rx.await {
             Ok(Ok(response)) => Ok(encode_http_response(response, false)),
             Ok(Err(error)) => Err(format!("{error}")),
             Err(error) => Err(format!("service dropped: {error}")),
+        };
+        if let Some(cancel_guard) = cancel_guard.as_mut() {
+            cancel_guard.disarm();
         }
+        result
     });
     let promise = promise_for(scope, id);
     if let Some(request_id) = request_id {
@@ -3111,37 +3320,23 @@ fn op_svc_call_impl(
 }
 
 // --- Worker Loader: dynamic isolates for Code Mode ---
-// A running Worker spawns a fresh isolate from code it supplies at runtime and
-// invokes it. Walking skeleton: `env.LOADER.load(code)` -> stub;
-// `stub.getEntrypoint().fetch(req)` runs the loaded worker's default fetch,
-// reusing the co-hosted-worker thread model and `__svc_call` response
-// marshalling. Capability-scoped env, controlled outbound, named-entrypoint
-// RPC, and memoized `get(name, getCode)` are not yet wired.
+// A running Worker creates a fresh isolate from code it supplies at runtime
+// and invokes it. The loaded isolate uses the same turn driver as every
+// stateless Worker, so an awaited operation holds no thread or isolate.
 
 // Mirror the workerd dynamic-worker limits (worker-loader.c++): 64 MiB total
 // module bytes, 1 MiB env. Messages match so the conformance cases pass.
 const MAX_DYNAMIC_WORKER_CODE_SIZE: usize = 64 * 1024 * 1024;
 const MAX_DYNAMIC_WORKER_ENV_SIZE: usize = 1024 * 1024;
 
-enum LoaderJob {
-    Fetch {
-        url: String,
-        method: String,
-        body: Vec<u8>,
-        headers: Vec<(String, String)>,
-        reply: tokio::sync::oneshot::Sender<Result<HttpResponse>>,
-    },
-    // Named-entrypoint RPC: args and result are V8 structured-clone bytes,
-    // like the service-binding `__svc_rpc` path.
-    Rpc {
-        entrypoint: String,
-        method: String,
-        args: Vec<u8>,
-        reply: tokio::sync::oneshot::Sender<Result<Vec<u8>>>,
-    },
+#[derive(Clone)]
+enum LoaderState {
+    Loading,
+    Ready(Arc<crate::pool::Slot>),
+    Failed(Arc<str>),
 }
 
-type LoaderRegistry = HashMap<u64, std::sync::mpsc::Sender<LoaderJob>>;
+type LoaderRegistry = HashMap<u64, tokio::sync::watch::Receiver<LoaderState>>;
 static LOADER_REGISTRY: OnceLock<std::sync::Mutex<LoaderRegistry>> = OnceLock::new();
 static LOADER_NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -3155,11 +3350,26 @@ fn loader_throw(scope: &mut v8::PinScope, message: &str) {
     scope.throw_exception(exception);
 }
 
+async fn loaded_worker_slot(
+    mut state: tokio::sync::watch::Receiver<LoaderState>,
+) -> Result<Arc<crate::pool::Slot>, String> {
+    loop {
+        match state.borrow().clone() {
+            LoaderState::Ready(slot) => return Ok(slot),
+            LoaderState::Failed(error) => return Err(error.to_string()),
+            LoaderState::Loading => {}
+        }
+        state
+            .changed()
+            .await
+            .map_err(|_| "worker loader: load task dropped".to_string())?;
+    }
+}
+
 /// `__loader_load(codeJson)` -> stub id. Builds a WorkerConfig from the
-/// supplied modules, spawns a fresh isolate on its own thread (isolates are
-/// pinned per thread), and registers its job channel. The isolate compiles
-/// asynchronously; jobs queue until it is ready, and a load failure drains
-/// queued jobs with the error rather than dropping their reply channels.
+/// supplied modules and registers its asynchronous load state. Compilation
+/// runs on Tokio's blocking pool. Calls wait for that result and then use the
+/// normal stateless turn driver.
 fn op_loader_load(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -3185,25 +3395,67 @@ fn op_loader_load(
         );
     };
     // Every module other than the main one is a sibling the main module may
-    // import.
-    let loader_modules: Vec<(String, String)> = code
-        .get("modules")
-        .and_then(|m| m.as_object())
-        .map(|m| {
-            m.iter()
-                .filter(|(name, _)| name.as_str() != main)
-                .filter_map(|(name, v)| v.as_str().map(|s| (name.clone(), s.to_string())))
-                .collect()
-        })
-        .unwrap_or_default();
+    // import. JS modules arrive in the JSON as strings; anything else there is
+    // rejected — JSON.stringify would already have mangled it, and dropping it
+    // silently leaves the loaded worker failing instantiation with an
+    // unresolved specifier that never names the cause. Wasm modules arrive
+    // out of band as the second argument, an array of `[name, Uint8Array]`
+    // pairs, which keeps the blobs out of the JSON payload entirely.
+    let mut modules: Vec<(String, ModuleSource)> = Vec::new();
+    if let Some(map) = code.get("modules").and_then(|m| m.as_object()) {
+        for (name, value) in map.iter().filter(|(name, _)| name.as_str() != main) {
+            let Some(source) = value.as_str() else {
+                return loader_throw(
+                    scope,
+                    &format!("worker loader: module {name:?} must be a string or wasm bytes"),
+                );
+            };
+            modules.push((name.clone(), ModuleSource::EsModule(source.to_string())));
+        }
+    }
+    let sideband = args.get(1);
+    if !sideband.is_undefined() {
+        let Ok(entries) = v8::Local::<v8::Array>::try_from(sideband) else {
+            return loader_throw(scope, "worker loader: wasm modules must be an array");
+        };
+        for index in 0..entries.length() {
+            let entry = entries
+                .get_index(scope, index)
+                .and_then(|entry| v8::Local::<v8::Array>::try_from(entry).ok())
+                .and_then(|pair| Some((pair.get_index(scope, 0)?, pair.get_index(scope, 1)?)))
+                .filter(|(name, _)| name.is_string())
+                .and_then(|(name, value)| {
+                    let view = v8::Local::<v8::ArrayBufferView>::try_from(value).ok()?;
+                    Some((name.to_rust_string_lossy(scope), view))
+                });
+            let Some((name, view)) = entry else {
+                return loader_throw(scope, "worker loader: malformed wasm module entry");
+            };
+            // A name carried by both the JSON map and the side-band would
+            // silently shadow one module with the other in the registry;
+            // refuse it the way a non-string JSON module is refused.
+            if name == main || modules.iter().any(|(existing, _)| *existing == name) {
+                return loader_throw(
+                    scope,
+                    &format!("worker loader: duplicate module name {name:?}"),
+                );
+            }
+            let mut bytes = vec![0u8; view.byte_length()];
+            view.copy_contents(&mut bytes);
+            modules.push((name, ModuleSource::Wasm(bytes.into())));
+        }
+    }
     // Total module bytes, checked before compiling anything (the oversized
     // module is never parsed) — the extra modules are not yet loaded but do
     // count against the ceiling, as upstream.
-    let code_size: usize = code
-        .get("modules")
-        .and_then(|m| m.as_object())
-        .map(|m| m.values().filter_map(|v| v.as_str()).map(str::len).sum())
-        .unwrap_or(0);
+    let code_size: usize = src.len()
+        + modules
+            .iter()
+            .map(|(_, source)| match source {
+                ModuleSource::Text(source) | ModuleSource::EsModule(source) => source.len(),
+                ModuleSource::Wasm(bytes) => bytes.len(),
+            })
+            .sum::<usize>();
     if code_size > MAX_DYNAMIC_WORKER_CODE_SIZE {
         return loader_throw(
             scope,
@@ -3244,11 +3496,9 @@ fn op_loader_load(
         }
     };
     // Bound live loaded workers so a runaway agent loop cannot exhaust
-    // threads and isolates. Evicted workers (dropped stubs) free their slot.
-    let max = std::env::var("CELLD_MAX_LOADED_WORKERS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(256);
+    // isolates. Evicted workers (dropped stubs) free their slot.
+    let max = crate::env_vars::positive_or("CELLD_MAX_LOADED_WORKERS", 256)
+        .expect("validated CELLD_MAX_LOADED_WORKERS");
     if loader_registry().lock().unwrap().len() >= max {
         return loader_throw(
             scope,
@@ -3273,63 +3523,30 @@ fn op_loader_load(
             ai_binding: None,
             vars: Vec::new(),
             node: String::new(),
-            text: Vec::new(),
+            modules,
             compat,
         })
         .with_egress(egress)
-        .with_loader_env(loader_env)
-        .with_loader_modules(loader_modules),
+        .with_loader_env(loader_env),
     );
-    let (tx, rx) = std::sync::mpsc::channel::<LoaderJob>();
-    loader_registry().lock().unwrap().insert(id, tx);
-    std::thread::spawn(move || {
-        asyncrt::init();
-        let mut w = match Worker::load_config(config, &[]) {
-            Ok(w) => w,
-            Err(e) => return drain_loader_load_error(rx, &format!("{e}")),
-        };
-        for job in rx {
-            match job {
-                LoaderJob::Fetch {
-                    url,
-                    method,
-                    body,
-                    headers,
-                    reply,
-                } => {
-                    if w.fetch_and_reply_id(&url, &method, &body, &headers, None, reply)
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                LoaderJob::Rpc {
-                    entrypoint,
-                    method,
-                    args,
-                    reply,
-                } => {
-                    let _ = reply.send(w.dispatch_entrypoint_rpc(&entrypoint, &method, args));
-                }
-            }
-        }
+    let handle = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle,
+        Err(error) => return loader_throw(scope, &format!("worker loader: {error}")),
+    };
+    let (loaded, state) = tokio::sync::watch::channel(LoaderState::Loading);
+    loader_registry().lock().unwrap().insert(id, state);
+    handle.spawn(async move {
+        let state =
+            match tokio::task::spawn_blocking(move || Worker::load_config(config, &[])).await {
+                Ok(Ok(worker)) => LoaderState::Ready(crate::pool::Slot::standalone(worker)),
+                Ok(Err(error)) => LoaderState::Failed(Arc::from(format!("{error}"))),
+                Err(error) => LoaderState::Failed(Arc::from(format!(
+                    "worker loader: load task failed: {error}"
+                ))),
+            };
+        loaded.send_replace(state);
     });
     rv.set(v8::Number::new(scope, id as f64).into());
-}
-
-/// Reply to every queued job with the load error, so a worker that failed to
-/// compile rejects its callers cleanly instead of dropping their channels.
-fn drain_loader_load_error(rx: std::sync::mpsc::Receiver<LoaderJob>, error: &str) {
-    for job in rx {
-        match job {
-            LoaderJob::Fetch { reply, .. } => {
-                let _ = reply.send(Err(anyhow!("{error}")));
-            }
-            LoaderJob::Rpc { reply, .. } => {
-                let _ = reply.send(Err(anyhow!("{error}")));
-            }
-        }
-    }
 }
 
 /// `__loader_fetch(id, url, method, body, headersJson)` -> Promise<json>. The
@@ -3345,30 +3562,28 @@ fn op_loader_fetch(
     let body = view_bytes(args.get(3)).unwrap_or_default();
     let headers =
         serde_json::from_str(&args.get(4).to_rust_string_lossy(scope)).unwrap_or_default();
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let sent = loader_registry()
-        .lock()
-        .unwrap()
-        .get(&id)
-        .map(|s| {
-            s.send(LoaderJob::Fetch {
-                url,
-                method,
-                body,
-                headers,
-                reply: tx,
-            })
-            .is_ok()
-        })
-        .unwrap_or(false);
+    let loaded = loader_registry().lock().unwrap().get(&id).cloned();
     let async_id = asyncrt::enqueue(async move {
-        if !sent {
-            return Err("worker loader: unknown worker".into());
-        }
-        match rx.await {
+        let state = loaded.ok_or_else(|| "worker loader: unknown worker".to_string())?;
+        let slot = loaded_worker_slot(state).await?;
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        let job = crate::WorkerJob::Fetch {
+            queued_at: Instant::now(),
+            url,
+            method,
+            body,
+            headers,
+            request_id: None,
+            reply,
+        };
+        let driving = tokio::spawn(crate::runtime::drive(slot, job, None));
+        match receive.await {
             Ok(Ok(response)) => Ok(encode_http_response(response, false)),
             Ok(Err(error)) => Err(format!("{error}")),
-            Err(error) => Err(format!("loaded worker dropped: {error}")),
+            Err(_) => match driving.await {
+                Err(error) => Err(format!("loaded worker task died: {error}")),
+                Ok(()) => Err("loaded worker dropped response".to_string()),
+            },
         }
     });
     rv.set(promise_for(scope, async_id));
@@ -3386,46 +3601,47 @@ fn op_loader_rpc(
     let entrypoint = args.get(1).to_rust_string_lossy(scope);
     let method = args.get(2).to_rust_string_lossy(scope);
     let call_args = view_bytes(args.get(3)).unwrap_or_default();
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let sent = loader_registry()
-        .lock()
-        .unwrap()
-        .get(&id)
-        .map(|s| {
-            s.send(LoaderJob::Rpc {
-                entrypoint,
-                method,
-                args: call_args,
-                reply: tx,
-            })
-            .is_ok()
-        })
-        .unwrap_or(false);
+    let loaded = loader_registry().lock().unwrap().get(&id).cloned();
     let async_id = asyncrt::enqueue(async move {
-        if !sent {
-            return Err("worker loader: unknown worker".into());
-        }
-        match rx.await {
+        let state = loaded.ok_or_else(|| "worker loader: unknown worker".to_string())?;
+        let slot = loaded_worker_slot(state).await?;
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        let job = crate::WorkerJob::Rpc {
+            entrypoint,
+            method,
+            args: call_args,
+            reply,
+        };
+        let driving = tokio::spawn(crate::runtime::drive(slot, job, None));
+        match receive.await {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(error)) => Err(format!("{error}")),
-            Err(error) => Err(format!("loaded worker dropped: {error}")),
+            Err(_) => match driving.await {
+                Err(error) => Err(format!("loaded worker task died: {error}")),
+                Ok(()) => Err("loaded worker dropped RPC result".to_string()),
+            },
         }
     });
     rv.set(promise_for(scope, async_id));
 }
 
 /// `__loader_drop(id)` — evict a loaded worker. Called from a
-/// FinalizationRegistry when its stub is GC'd: removing the registry entry
-/// drops the job-channel Sender, so the worker thread's receive loop ends and
-/// the isolate is dropped on that thread. Without this every load() would leak
-/// a thread and isolate.
+/// FinalizationRegistry when its stub is GC'd. Removing the registry entry
+/// drops the isolate after any calls that already cloned its load state end.
 fn op_loader_drop(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue<v8::Value>,
 ) {
     let id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
-    loader_registry().lock().unwrap().remove(&id);
+    if let Some(state) = loader_registry().lock().unwrap().remove(&id) {
+        // This op runs while the parent isolate is entered. The load state can
+        // own the loaded isolate, and V8 forbids dropping one isolate while a
+        // different isolate is entered on the same thread. Hand the final
+        // reference to the host scheduler so destruction happens after this
+        // turn has left V8.
+        asyncrt::op_handle().spawn(async move { drop(state) });
+    }
 }
 
 /// `__loader_count()` -> live loaded-worker count, for eviction tests.
@@ -3526,51 +3742,46 @@ fn op_do_call_impl(
     let headers =
         serde_json::from_str(&args.get(5).to_rust_string_lossy(scope)).unwrap_or_default();
     let (tx, rx) = tokio::sync::oneshot::channel();
-    let (request_id, cancel, cancel_guard) = if cancellable {
-        let request_id = next_do_request_id();
-        let (cancel_sender, cancel_receiver) = tokio::sync::oneshot::channel();
-        do_call_cancels()
-            .lock()
-            .unwrap()
-            .insert(request_id, cancel_sender);
-        (
-            Some(request_id),
-            Some(cancel_receiver),
-            Some(DoCallCancelGuard(request_id)),
-        )
-    } else {
-        (None, None, None)
+    // Taken here and nowhere later: this is the last point that still runs
+    // in the order the script made the calls.
+    let order = Some(enter_call_order(current_context(), &cell));
+    // Every host op needs an internal cancellation channel. A caller without
+    // an AbortSignal cannot cancel from JavaScript, but its enclosing Worker
+    // can still disappear and drop this op before routing completes.
+    let request_id = next_do_request_id();
+    let (cancel_sender, cancel) = tokio::sync::oneshot::channel();
+    do_call_cancels()
+        .lock()
+        .unwrap()
+        .insert(request_id, cancel_sender);
+    let mut cancel_guard = DoCallCancelGuard::new(request_id);
+    let gate = egress_gate_pending();
+    let request = DoCallReq {
+        request_id: Some(request_id),
+        cancel: Some(cancel),
+        deliver_abort_to_handler: cancellable,
+        scope: cell,
+        name,
+        url,
+        method,
+        body,
+        headers,
+        reply: tx,
+        order,
+        parent: current_trace_ids(scope),
     };
-    let sent = DO_CALL_TX
-        .get()
-        .map(|t| {
-            t.send(DoCallReq {
-                request_id,
-                cancel,
-                scope: cell,
-                name,
-                url,
-                method,
-                body,
-                headers,
-                reply: tx,
-            })
-            .is_ok()
-        })
-        .unwrap_or(false);
     let id = asyncrt::enqueue(async move {
-        let _cancel_guard = cancel_guard;
-        if !sent {
-            return Err("no proxy channel".into());
-        }
-        match rx.await {
+        gated_channel_send(gate, &DO_CALL_TX, request, "no proxy channel").await?;
+        let result = match rx.await {
             Ok(Ok(response)) => Ok(encode_http_response(response, true)),
             Ok(Err(e)) => Err(format!("{e}")),
             Err(e) => Err(format!("proxy dropped: {e}")),
-        }
+        };
+        cancel_guard.disarm();
+        result
     });
     let p = promise_for(scope, id);
-    if let Some(request_id) = request_id {
+    if cancellable {
         if let Some(promise) = p.to_object(scope) {
             let key = v8::String::new(scope, "__celldCancelId").unwrap();
             let request_id = v8::String::new(scope, &request_id_string(request_id)).unwrap();
@@ -3607,23 +3818,16 @@ fn op_rpc_call(
     let method = args.get(2).to_rust_string_lossy(scope);
     let args = RpcData::V8(view_bytes(args.get(3)).unwrap_or_default());
     let (tx, rx) = tokio::sync::oneshot::channel();
-    let sent = RPC_CALL_TX
-        .get()
-        .map(|t| {
-            t.send(RpcCallReq {
-                scope: cell,
-                name,
-                method,
-                args,
-                reply: tx,
-            })
-            .is_ok()
-        })
-        .unwrap_or(false);
+    let gate = egress_gate_pending();
+    let request = RpcCallReq {
+        scope: cell,
+        name,
+        method,
+        args,
+        reply: tx,
+    };
     let id = asyncrt::enqueue(async move {
-        if !sent {
-            return Err("no RPC channel".into());
-        }
+        gated_channel_send(gate, &RPC_CALL_TX, request, "no RPC channel").await?;
         match rx.await {
             Ok(Ok(RpcData::V8(bytes))) => Ok(bytes),
             Ok(Ok(RpcData::Json(_))) => Err("RPC answered JSON to a structured-clone call".into()),
@@ -3660,7 +3864,7 @@ fn op_fetch(
     } else {
         serde_json::from_str(&b.to_rust_string_lossy(scope)).ok()
     };
-    let headers: Vec<(String, String)> =
+    let mut headers: Vec<(String, String)> =
         serde_json::from_str(&args.get(3).to_rust_string_lossy(scope)).unwrap_or_default();
     let redirect = args.get(4).to_rust_string_lossy(scope);
     let client = if redirect == "manual" {
@@ -3668,15 +3872,54 @@ fn op_fetch(
     } else {
         HTTP.with(|client| client.clone())
     };
+    // The creating context, read here while JS is still running: the op
+    // future resolves on whatever worker polls it, far from any CPED.
+    let trace = current_trace_ids(scope);
+    // The child's ids are minted before the request leaves so the
+    // traceparent header carries them: whatever this fetch reaches can
+    // join the trace celld is part of.
+    let child = trace.as_ref().map(crate::telemetry::child_ids);
+    if let Some(child) = child.as_ref() {
+        if !headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("traceparent"))
+        {
+            headers.push(("traceparent".into(), crate::telemetry::traceparent(child)));
+        }
+    }
+    let span_url = trace.as_ref().map(|_| url.clone());
+    // Whatever this handler has written must be durable before the request
+    // leaves: a third party that has acted on a write celld then loses cannot
+    // be told to un-act.
+    let gate = egress_gate_pending();
     let id = asyncrt::enqueue(async move {
+        let span_started = trace.as_ref().map(|_| crate::telemetry::now_unix_us());
+        let mut span = trace.as_ref().zip(child).map(|(parent, child)| {
+            let mut span =
+                crate::telemetry::Span::new(child, "fetch", crate::telemetry::KIND_CLIENT);
+            span.parent_span_id = Some(parent.span_id);
+            span.parent_remote = Some(false);
+            span.url = span_url;
+            span
+        });
+        let mut finish = |ok: bool, status: Option<u16>, error: Option<String>| {
+            if let Some(mut span) = span.take() {
+                span.start_unix_us = span_started.unwrap_or_default();
+                span.duration_us = crate::telemetry::now_unix_us() - span.start_unix_us;
+                span.ok = ok;
+                span.http_status = status;
+                span.error = error;
+                crate::telemetry::record(span);
+            }
+        };
+        await_egress_gate(gate).await.inspect_err(|error| {
+            finish(false, None, Some(error.clone()));
+        })?;
         let m = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
         // a timeout bounds a black-hole host: the future settles (Err) instead
         // of parking run_loop forever — the hang the Drop guard can't catch.
-        let fetch_timeout = std::env::var("CELLD_FETCH_TIMEOUT_S")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .filter(|seconds| *seconds > 0)
-            .unwrap_or(120);
+        let fetch_timeout = crate::env_vars::positive_or("CELLD_FETCH_TIMEOUT_S", 120)
+            .expect("validated CELLD_FETCH_TIMEOUT_S");
         let mut rb = client
             .request(m, &url)
             .timeout(std::time::Duration::from_secs(fetch_timeout));
@@ -3689,6 +3932,7 @@ fn op_fetch(
         match rb.send().await {
             Ok(resp) => {
                 let status = resp.status().as_u16();
+                finish(true, Some(status), None);
                 let headers = resp
                     .headers()
                     .iter()
@@ -3706,7 +3950,10 @@ fn op_fetch(
                 })
                 .to_string())
             }
-            Err(e) => Err(format!("fetch: {e}")),
+            Err(e) => {
+                finish(false, None, Some(format!("fetch: {e}")));
+                Err(format!("fetch: {e}"))
+            }
         }
     });
     let p = promise_for(scope, id);
@@ -3740,21 +3987,7 @@ fn op_asset_fetch(
             return Err("no asset resolver channel".to_string());
         }
         match rx.await {
-            Ok(Ok(response)) => {
-                let stream_id = NEXT_HTTP_STREAM_ID.fetch_add(1, Ordering::Relaxed);
-                let (body_tx, body_rx) = tokio::sync::mpsc::channel(1);
-                if !response.body.is_empty() {
-                    let _ = body_tx.send(Ok(response.body)).await;
-                }
-                drop(body_tx);
-                register_http_stream(stream_id, HttpStreamSource::Receiver(body_rx));
-                Ok(serde_json::json!({
-                    "status": response.status,
-                    "streamId": stream_id,
-                    "headers": response.headers,
-                })
-                .to_string())
-            }
+            Ok(Ok(response)) => Ok(encode_http_response(response, false)),
             Ok(Err(error)) => Err(format!("asset fetch: {error}")),
             Err(error) => Err(format!("asset resolver dropped: {error}")),
         }
@@ -4043,6 +4276,131 @@ fn op_timer(
     rv.set(p);
 }
 
+/// `__gate_acquire(scope)` — take the cell's input gate for a
+/// `blockConcurrencyWhile`, waiting if another block holds it.
+///
+/// Answers a promise of the event id, not the id itself. It was synchronous,
+/// and that was right while a cell's events came off one channel: only one
+/// ran at a time, a delivery point had already found the gate open, and
+/// yielding even one microtask reopened a window in which a nested delivery
+/// could wait on a gate nothing would release. Neither half holds now —
+/// events are independent tasks, several run at once, and nothing nests —
+/// so two blocks can meet and the second must queue.
+fn op_gate_acquire(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let cell = args.get(0).to_rust_string_lossy(scope);
+    let event = NEXT_GATE_EVENT.fetch_add(1, Ordering::Relaxed);
+    // Taken under the gates lock so the test and the take are one step: a
+    // release landing between them would leave this block queued behind a
+    // gate that is already open.
+    let taken = cell_gates()
+        .lock()
+        .unwrap()
+        .entry(cell.clone())
+        .or_default()
+        .acquire(event);
+    if taken {
+        let id = asyncrt::enqueue(async move { Ok(event.to_string()) });
+        rv.set(promise_for(scope, id));
+        return;
+    }
+    let id = asyncrt::enqueue(async move {
+        loop {
+            // Ask for a ticket first: `cell_gate_wait` tests and enqueues
+            // under the gates lock, so a release landing between the two
+            // cannot leave this waiter behind an open gate.
+            let waiting = cell_gate_wait(&cell);
+            let taken = cell_gates()
+                .lock()
+                .unwrap()
+                .entry(cell.clone())
+                .or_default()
+                .acquire(event);
+            if taken {
+                return Ok(event.to_string());
+            }
+            match waiting {
+                Some(open) => match open.await {
+                    Ok(Ok(())) => {}
+                    // The block ahead of this one failed and reset the cell,
+                    // so this block has nothing left to guard.
+                    Ok(Err(failure)) => return Err(failure),
+                    Err(_) => {
+                        return Err("cell stopped while waiting for its input gate".to_string())
+                    }
+                },
+                // The gate was open when we asked and shut before we took
+                // it: another block won the race. Yield rather than spin —
+                // this runs on a tokio worker, and a bare `continue` here
+                // starved the runtime.
+                None => tokio::task::yield_now().await,
+            }
+        }
+    });
+    rv.set(promise_for(scope, id));
+}
+
+/// `__gate_wait(scope)` — settle when the cell's input gate is open.
+///
+/// The gate's other side. `op_gate_acquire` is for something that wants to
+/// *hold* the gate; this is for something that only has to arrive after it,
+/// which is every event the gate exists to hold back. A drive does this in
+/// Rust before it begins a turn; an RPC stub op does it here, because it is
+/// dispatched inside the isolate and never becomes a drive.
+///
+/// Rejecting matters as much as resolving: a critical section that failed
+/// reset the cell, so what waited behind it is refused with the reason
+/// rather than run against state that no longer exists.
+fn op_gate_wait(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let cell = args.get(0).to_rust_string_lossy(scope);
+    let id = asyncrt::enqueue(async move {
+        loop {
+            match cell_gate_wait(&cell) {
+                None => return Ok(String::new()),
+                Some(open) => match open.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(failure)) => return Err(failure),
+                    Err(_) => {
+                        return Err("cell stopped while waiting for its input gate".to_string())
+                    }
+                },
+            }
+        }
+    });
+    rv.set(promise_for(scope, id));
+}
+
+/// `__gate_release(scope, event)` — the block is over. The next delivery
+/// point to run takes whatever queued behind it.
+fn op_gate_release(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let cell = args.get(0).to_rust_string_lossy(scope);
+    let event = args.get(1).number_value(scope).unwrap_or_default() as celld_logic::gate::EventId;
+    // A third argument means the block failed and the actor was reset, so
+    // what queued behind it is refused with that reason rather than
+    // delivered to a cell whose state is gone.
+    let failure = args.get(2);
+    let outcome = if failure.is_null_or_undefined() {
+        Ok(())
+    } else {
+        Err(failure.to_rust_string_lossy(scope))
+    };
+    if let Some(gate) = cell_gates().lock().unwrap().get_mut(&cell) {
+        gate.release(event);
+    }
+    wake_gate_waiters(&cell, outcome);
+}
+
 fn op_timer_alloc(
     scope: &mut v8::PinScope,
     _args: v8::FunctionCallbackArguments,
@@ -4083,8 +4441,35 @@ fn durable_object_id_hmac(key: &[u8; 32], input: &[u8]) -> hmac::Hmac<sha2::Sha2
     mac
 }
 
+/// Ids already derived on this thread, keyed by namespace and name.
+///
+/// `getByName` costs two HMAC-SHA256 rounds, and a profile of `/c/hello`
+/// found them among the largest terms the stateless path does not have —
+/// the same name resolving to the same id, recomputed on every request.
+///
+/// Per thread and unsynchronised, which is sound because the derivation is
+/// a pure function of its inputs: a worker that has not seen a name pays
+/// for it once, and no answer can differ between threads. Bounded because
+/// names come from the application, and cleared wholesale at the cap rather
+/// than evicted one at a time — a cache this cheap to refill does not earn
+/// an LRU.
+const DO_ID_CACHE_MAX: usize = 4096;
+
 fn durable_object_id_for_name(namespace_key: &str, name: &str) -> [u8; 32] {
     use hmac::Mac;
+
+    thread_local! {
+        static IDS: RefCell<HashMap<(String, String), [u8; 32]>> =
+            RefCell::new(HashMap::new());
+    }
+    let cached = IDS.with(|ids| {
+        ids.borrow()
+            .get(&(namespace_key.to_string(), name.to_string()))
+            .copied()
+    });
+    if let Some(id) = cached {
+        return id;
+    }
 
     let key = durable_object_id_key(namespace_key);
     let mut id = [0_u8; 32];
@@ -4096,6 +4481,14 @@ fn durable_object_id_for_name(namespace_key: &str, name: &str) -> [u8; 32] {
         .finalize()
         .into_bytes();
     id[16..].copy_from_slice(&digest[..16]);
+
+    IDS.with(|ids| {
+        let mut ids = ids.borrow_mut();
+        if ids.len() >= DO_ID_CACHE_MAX {
+            ids.clear();
+        }
+        ids.insert((namespace_key.to_string(), name.to_string()), id);
+    });
     id
 }
 
@@ -4263,146 +4656,6 @@ fn op_do_id(
     );
 }
 
-fn crypto_bytes(value: &serde_json::Value, name: &str) -> Result<Vec<u8>> {
-    serde_json::from_value(value.get(name).cloned().unwrap_or_default())
-        .map_err(|_| anyhow!("invalid {name} bytes"))
-}
-
-fn rsa_jwk_uint(value: &serde_json::Value, name: &str) -> Result<rsa::BigUint> {
-    use base64::Engine;
-    let encoded = value
-        .get(name)
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| anyhow!("RSA JWK missing {name}"))?;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(encoded)
-        .map_err(|_| anyhow!("invalid RSA JWK {name}"))?;
-    Ok(rsa::BigUint::from_bytes_be(&bytes))
-}
-
-fn rsa_jwk_encode(value: &rsa::BigUint) -> String {
-    use base64::Engine;
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value.to_bytes_be())
-}
-
-fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_json::Value> {
-    match operation {
-        "hmac-sign" => {
-            use hmac::Mac;
-            let key = crypto_bytes(args, "key")?;
-            let data = crypto_bytes(args, "data")?;
-            let hash = args
-                .get("hash")
-                .and_then(|value| value.as_str())
-                .unwrap_or("SHA-256");
-            if !hash.eq_ignore_ascii_case("SHA-256") && !hash.eq_ignore_ascii_case("SHA256") {
-                return Err(anyhow!("unsupported HMAC hash"));
-            }
-            let mut mac = <hmac::Hmac<sha2::Sha256> as hmac::Mac>::new_from_slice(&key)
-                .map_err(|_| anyhow!("invalid HMAC key"))?;
-            mac.update(&data);
-            Ok(serde_json::json!({ "bytes": mac.finalize().into_bytes().to_vec() }))
-        }
-        "aes-gcm-encrypt" | "aes-gcm-decrypt" => {
-            use aes_gcm::aead::{Aead, KeyInit};
-            let key = crypto_bytes(args, "key")?;
-            let iv = crypto_bytes(args, "iv")?;
-            let data = crypto_bytes(args, "data")?;
-            let cipher = aes_gcm::Aes256Gcm::new_from_slice(&key)
-                .map_err(|_| anyhow!("AES-GCM requires a 256-bit key"))?;
-            let nonce = aes_gcm::Nonce::from_slice(&iv);
-            let bytes = if operation == "aes-gcm-encrypt" {
-                cipher.encrypt(nonce, data.as_ref())
-            } else {
-                cipher.decrypt(nonce, data.as_ref())
-            }
-            .map_err(|_| anyhow!("AES-GCM operation failed"))?;
-            Ok(serde_json::json!({ "bytes": bytes }))
-        }
-        "ed25519-sign" => {
-            use ed25519_dalek::pkcs8::DecodePrivateKey;
-            use ed25519_dalek::Signer;
-            let key = crypto_bytes(args, "key")?;
-            let data = crypto_bytes(args, "data")?;
-            let key = ed25519_dalek::SigningKey::from_pkcs8_der(&key)
-                .map_err(|_| anyhow!("invalid Ed25519 PKCS#8 key"))?;
-            Ok(serde_json::json!({ "bytes": key.sign(&data).to_bytes().to_vec() }))
-        }
-        "p256-sign" => {
-            use p256::ecdsa::signature::Signer;
-            use p256::pkcs8::DecodePrivateKey;
-            let key = crypto_bytes(args, "key")?;
-            let data = crypto_bytes(args, "data")?;
-            let key = p256::ecdsa::SigningKey::from_pkcs8_der(&key)
-                .map_err(|_| anyhow!("invalid P-256 PKCS#8 key"))?;
-            let signature: p256::ecdsa::Signature = key.sign(&data);
-            Ok(serde_json::json!({ "bytes": signature.to_bytes().to_vec() }))
-        }
-        "rsa-generate" => {
-            use rsa::traits::{PrivateKeyParts, PublicKeyParts};
-            let mut rng = rand::rngs::OsRng;
-            let mut private = rsa::RsaPrivateKey::new(&mut rng, 2048)?;
-            private.precompute()?;
-            let public = rsa::RsaPublicKey::from(&private);
-            let public_jwk = serde_json::json!({
-                "kty": "RSA",
-                "n": rsa_jwk_encode(public.n()),
-                "e": rsa_jwk_encode(public.e()),
-                "alg": "RSA-OAEP-256",
-                "ext": true,
-                "key_ops": ["encrypt"],
-            });
-            let private_jwk = serde_json::json!({
-                "kty": "RSA",
-                "n": rsa_jwk_encode(private.n()),
-                "e": rsa_jwk_encode(private.e()),
-                "d": rsa_jwk_encode(private.d()),
-                "p": rsa_jwk_encode(&private.primes()[0]),
-                "q": rsa_jwk_encode(&private.primes()[1]),
-                "alg": "RSA-OAEP-256",
-                "ext": true,
-                "key_ops": ["decrypt"],
-            });
-            Ok(serde_json::json!({ "publicKey": public_jwk, "privateKey": private_jwk }))
-        }
-        "rsa-oaep-decrypt" => {
-            let jwk = args.get("jwk").ok_or_else(|| anyhow!("missing RSA JWK"))?;
-            let n = rsa_jwk_uint(jwk, "n")?;
-            let e = rsa_jwk_uint(jwk, "e")?;
-            let d = rsa_jwk_uint(jwk, "d")?;
-            let p = rsa_jwk_uint(jwk, "p")?;
-            let q = rsa_jwk_uint(jwk, "q")?;
-            let mut key = rsa::RsaPrivateKey::from_components(n, e, d, vec![p, q])?;
-            key.precompute()?;
-            let data = crypto_bytes(args, "data")?;
-            let bytes = key.decrypt(rsa::Oaep::new::<sha2::Sha256>(), &data)?;
-            Ok(serde_json::json!({ "bytes": bytes }))
-        }
-        _ => Err(anyhow!("unsupported crypto operation")),
-    }
-}
-
-fn op_crypto_operation(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    mut rv: v8::ReturnValue<v8::Value>,
-) {
-    let operation = args.get(0).to_rust_string_lossy(scope);
-    let input: serde_json::Value =
-        serde_json::from_str(&args.get(1).to_rust_string_lossy(scope)).unwrap_or_default();
-    match crypto_operation(&operation, &input) {
-        Ok(value) => {
-            let json = value.to_string();
-            rv.set(v8::String::new(scope, &json).unwrap().into());
-        }
-        Err(error) => {
-            let message = v8::String::new(scope, &format!("crypto: {error}")).unwrap();
-            let exception = v8::Exception::error(scope, message);
-            scope.throw_exception(exception);
-        }
-    }
-}
-
 fn view_bytes(value: v8::Local<v8::Value>) -> Option<Vec<u8>> {
     let view = v8::Local::<v8::ArrayBufferView>::try_from(value).ok()?;
     let mut bytes = vec![0_u8; view.byte_length()];
@@ -4427,1117 +4680,8 @@ fn webcrypto_return_bytes(
     rv.set(view.into());
 }
 
-/// Fill an existing integer typed array in-place. JS performs the WebCrypto
-/// type and 65,536-byte quota checks before entering this host op.
-fn op_webcrypto_random(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
-    let Ok(view) = v8::Local::<v8::ArrayBufferView>::try_from(args.get(0)) else {
-        return;
-    };
-    let Some(buffer) = view.buffer(scope) else {
-        return;
-    };
-    let store = buffer.get_backing_store();
-    let offset = view.byte_offset();
-    let len = view.byte_length();
-    let bytes = unsafe {
-        std::slice::from_raw_parts_mut(store[offset..offset + len].as_ptr() as *mut u8, len)
-    };
-    if getrandom::fill(bytes).is_err() {
-        let message = v8::String::new(scope, "secure random generation failed").unwrap();
-        let exception = v8::Exception::error(scope, message);
-        scope.throw_exception(exception);
-    }
-}
-
-/// WebCrypto digest: (algorithm, ArrayBufferView) -> Uint8Array.
-fn op_webcrypto_digest(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    rv: v8::ReturnValue<v8::Value>,
-) {
-    use sha2::Digest;
-    let algorithm = args.get(0).to_rust_string_lossy(scope).to_ascii_uppercase();
-    let Some(bytes) = view_bytes(args.get(1)) else {
-        return;
-    };
-    let digest = match algorithm.as_str() {
-        "MD5" => md5::Md5::digest(&bytes).to_vec(),
-        "SHA-1" => sha1::Sha1::digest(&bytes).to_vec(),
-        "SHA-224" => sha2::Sha224::digest(&bytes).to_vec(),
-        "SHA-256" => sha2::Sha256::digest(&bytes).to_vec(),
-        "SHA-384" => sha2::Sha384::digest(&bytes).to_vec(),
-        "SHA-512" => sha2::Sha512::digest(&bytes).to_vec(),
-        _ => return,
-    };
-    webcrypto_return_bytes(scope, rv, &digest);
-}
-
-fn op_webcrypto_hmac_sign(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    rv: v8::ReturnValue<v8::Value>,
-) {
-    use hmac::Mac;
-    let algorithm = args.get(0).to_rust_string_lossy(scope).to_ascii_uppercase();
-    let Some(key) = view_bytes(args.get(1)) else {
-        return;
-    };
-    let Some(data) = view_bytes(args.get(2)) else {
-        return;
-    };
-    macro_rules! sign {
-        ($digest:ty) => {{
-            let Ok(mut mac) = <hmac::Hmac<$digest> as hmac::Mac>::new_from_slice(&key) else {
-                return;
-            };
-            mac.update(&data);
-            mac.finalize().into_bytes().to_vec()
-        }};
-    }
-    let signature = match algorithm.as_str() {
-        "MD5" => sign!(md5::Md5),
-        "SHA-1" => sign!(sha1::Sha1),
-        "SHA-224" => sign!(sha2::Sha224),
-        "SHA-256" => sign!(sha2::Sha256),
-        "SHA-384" => sign!(sha2::Sha384),
-        "SHA-512" => sign!(sha2::Sha512),
-        _ => return,
-    };
-    webcrypto_return_bytes(scope, rv, &signature);
-}
-
-/// HMAC-based KDF cores for node:crypto. Manual PBKDF2 (RFC 2898) and HKDF
-/// (RFC 5869) over the hmac crate — no extra dependencies. The JS layer has
-/// already validated the digest name and the 255×hashLen output cap.
-fn hmac_once<D>(key: &[u8], parts: &[&[u8]]) -> Vec<u8>
-where
-    D: hmac::digest::Digest + hmac::digest::core_api::BlockSizeUser,
-{
-    use hmac::Mac;
-    let mut mac = <hmac::SimpleHmac<D> as hmac::Mac>::new_from_slice(key)
-        .expect("HMAC accepts any key length");
-    for part in parts {
-        mac.update(part);
-    }
-    mac.finalize().into_bytes().to_vec()
-}
-
-fn pbkdf2_kdf<D>(password: &[u8], salt: &[u8], iterations: u32, keylen: usize) -> Vec<u8>
-where
-    D: hmac::digest::Digest + hmac::digest::core_api::BlockSizeUser,
-{
-    let mut out = Vec::with_capacity(keylen);
-    let mut block: u32 = 1;
-    while out.len() < keylen {
-        let mut u = hmac_once::<D>(password, &[salt, &block.to_be_bytes()]);
-        let mut t = u.clone();
-        for _ in 1..iterations {
-            u = hmac_once::<D>(password, &[&u]);
-            for (t_, u_) in t.iter_mut().zip(&u) {
-                *t_ ^= u_;
-            }
-        }
-        out.extend_from_slice(&t);
-        block += 1;
-    }
-    out.truncate(keylen);
-    out
-}
-
-fn hkdf_kdf<D>(ikm: &[u8], salt: &[u8], info: &[u8], length: usize) -> Vec<u8>
-where
-    D: hmac::digest::Digest + hmac::digest::core_api::BlockSizeUser,
-{
-    let prk = hmac_once::<D>(salt, &[ikm]);
-    let mut out = Vec::with_capacity(length);
-    let mut t: Vec<u8> = Vec::new();
-    let mut counter: u8 = 1;
-    while out.len() < length {
-        t = hmac_once::<D>(&prk, &[&t, info, &[counter]]);
-        out.extend_from_slice(&t);
-        counter += 1;
-    }
-    out.truncate(length);
-    out
-}
-
-macro_rules! dispatch_digest {
-    ($name:expr, $fn:ident, ($($arg:expr),*)) => {
-        match $name {
-            "MD5" => Some($fn::<md5::Md5>($($arg),*)),
-            "SHA-1" => Some($fn::<sha1::Sha1>($($arg),*)),
-            "SHA-224" => Some($fn::<sha2::Sha224>($($arg),*)),
-            "SHA-256" => Some($fn::<sha2::Sha256>($($arg),*)),
-            "SHA-384" => Some($fn::<sha2::Sha384>($($arg),*)),
-            "SHA-512" => Some($fn::<sha2::Sha512>($($arg),*)),
-            _ => None,
-        }
-    };
-}
-
-/// `$$pbkdf2(algorithm, password, salt, iterations, keylen)` -> Uint8Array
-fn op_node_pbkdf2(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    rv: v8::ReturnValue<v8::Value>,
-) {
-    let algorithm = args.get(0).to_rust_string_lossy(scope);
-    let Some(password) = view_bytes(args.get(1)) else {
-        return;
-    };
-    let Some(salt) = view_bytes(args.get(2)) else {
-        return;
-    };
-    let iterations = args.get(3).uint32_value(scope).unwrap_or(0).max(1);
-    let keylen = args.get(4).uint32_value(scope).unwrap_or(0) as usize;
-    let out = dispatch_digest!(
-        algorithm.as_str(),
-        pbkdf2_kdf,
-        (&password, &salt, iterations, keylen)
-    );
-    if let Some(out) = out {
-        webcrypto_return_bytes(scope, rv, &out);
-    }
-}
-
-/// `$$hkdf(algorithm, ikm, salt, info, length)` -> Uint8Array
-fn op_node_hkdf(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    rv: v8::ReturnValue<v8::Value>,
-) {
-    let algorithm = args.get(0).to_rust_string_lossy(scope);
-    let Some(ikm) = view_bytes(args.get(1)) else {
-        return;
-    };
-    let Some(salt) = view_bytes(args.get(2)) else {
-        return;
-    };
-    let Some(info) = view_bytes(args.get(3)) else {
-        return;
-    };
-    let length = args.get(4).uint32_value(scope).unwrap_or(0) as usize;
-    let out = dispatch_digest!(algorithm.as_str(), hkdf_kdf, (&ikm, &salt, &info, length));
-    if let Some(out) = out {
-        webcrypto_return_bytes(scope, rv, &out);
-    }
-}
-
-fn op_webcrypto_hmac_verify(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    mut rv: v8::ReturnValue<v8::Value>,
-) {
-    use hmac::Mac;
-    let algorithm = args.get(0).to_rust_string_lossy(scope).to_ascii_uppercase();
-    let Some(key) = view_bytes(args.get(1)) else {
-        return;
-    };
-    let Some(signature) = view_bytes(args.get(2)) else {
-        return;
-    };
-    let Some(data) = view_bytes(args.get(3)) else {
-        return;
-    };
-    macro_rules! verify {
-        ($digest:ty) => {{
-            let Ok(mut mac) = <hmac::Hmac<$digest> as hmac::Mac>::new_from_slice(&key) else {
-                return;
-            };
-            mac.update(&data);
-            mac.verify_slice(&signature).is_ok()
-        }};
-    }
-    let valid = match algorithm.as_str() {
-        "SHA-1" => verify!(sha1::Sha1),
-        "SHA-256" => verify!(sha2::Sha256),
-        "SHA-384" => verify!(sha2::Sha384),
-        "SHA-512" => verify!(sha2::Sha512),
-        _ => return,
-    };
-    rv.set(v8::Boolean::new(scope, valid).into());
-}
-
-fn op_webcrypto_aes_encrypt(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    rv: v8::ReturnValue<v8::Value>,
-) {
-    use aes_gcm::aead::{Aead, KeyInit};
-    let Some(key) = view_bytes(args.get(0)) else {
-        return;
-    };
-    let Some(iv) = view_bytes(args.get(1)) else {
-        return;
-    };
-    let Some(data) = view_bytes(args.get(2)) else {
-        return;
-    };
-    if iv.len() != 12 {
-        return;
-    }
-    let nonce = aes_gcm::Nonce::from_slice(&iv);
-    let encrypted = match key.len() {
-        16 => {
-            let Ok(cipher) = aes_gcm::Aes128Gcm::new_from_slice(&key) else {
-                return;
-            };
-            cipher.encrypt(nonce, data.as_ref())
-        }
-        32 => {
-            let Ok(cipher) = aes_gcm::Aes256Gcm::new_from_slice(&key) else {
-                return;
-            };
-            cipher.encrypt(nonce, data.as_ref())
-        }
-        _ => return,
-    };
-    let Ok(encrypted) = encrypted else { return };
-    webcrypto_return_bytes(scope, rv, &encrypted);
-}
-
-fn op_webcrypto_aes_decrypt(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    rv: v8::ReturnValue<v8::Value>,
-) {
-    use aes_gcm::aead::{Aead, KeyInit};
-    let Some(key) = view_bytes(args.get(0)) else {
-        return;
-    };
-    let Some(iv) = view_bytes(args.get(1)) else {
-        return;
-    };
-    let Some(data) = view_bytes(args.get(2)) else {
-        return;
-    };
-    if iv.len() != 12 {
-        return;
-    }
-    let nonce = aes_gcm::Nonce::from_slice(&iv);
-    let decrypted = match key.len() {
-        16 => {
-            let Ok(cipher) = aes_gcm::Aes128Gcm::new_from_slice(&key) else {
-                return;
-            };
-            cipher.decrypt(nonce, data.as_ref())
-        }
-        32 => {
-            let Ok(cipher) = aes_gcm::Aes256Gcm::new_from_slice(&key) else {
-                return;
-            };
-            cipher.decrypt(nonce, data.as_ref())
-        }
-        _ => return,
-    };
-    let Ok(decrypted) = decrypted else { return };
-    webcrypto_return_bytes(scope, rv, &decrypted);
-}
-
-fn op_zlib(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    mut rv: v8::ReturnValue<v8::Value>,
-) {
-    use std::io::{Read, Write};
-    let mode = args.get(0).to_rust_string_lossy(scope);
-    let bytes: Vec<u8> =
-        serde_json::from_str(&args.get(1).to_rust_string_lossy(scope)).unwrap_or_default();
-    let result = (|| -> Result<Vec<u8>> {
-        match mode.as_str() {
-            "gzip" => {
-                let mut encoder =
-                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-                encoder.write_all(&bytes)?;
-                Ok(encoder.finish()?)
-            }
-            "gunzip" => {
-                let mut decoder = flate2::read::GzDecoder::new(bytes.as_slice());
-                let mut out = Vec::new();
-                decoder.read_to_end(&mut out)?;
-                Ok(out)
-            }
-            "deflate" => {
-                let mut encoder =
-                    flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-                encoder.write_all(&bytes)?;
-                Ok(encoder.finish()?)
-            }
-            "inflate" => {
-                let mut decoder = flate2::read::ZlibDecoder::new(bytes.as_slice());
-                let mut out = Vec::new();
-                decoder.read_to_end(&mut out)?;
-                Ok(out)
-            }
-            "deflateRaw" => {
-                let mut encoder =
-                    flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
-                encoder.write_all(&bytes)?;
-                Ok(encoder.finish()?)
-            }
-            "inflateRaw" => {
-                let mut decoder = flate2::read::DeflateDecoder::new(bytes.as_slice());
-                let mut out = Vec::new();
-                decoder.read_to_end(&mut out)?;
-                Ok(out)
-            }
-            _ => Err(anyhow!("unsupported zlib operation")),
-        }
-    })();
-    match result {
-        Ok(bytes) => {
-            let json = serde_json::to_string(&bytes).unwrap();
-            rv.set(v8::String::new(scope, &json).unwrap().into());
-        }
-        Err(error) => {
-            let message = v8::String::new(scope, &format!("zlib: {error}")).unwrap();
-            let exception = v8::Exception::error(scope, message);
-            scope.throw_exception(exception);
-        }
-    }
-}
-
-/// One live `CompressionStream`/`DecompressionStream`: a stateful flate2
-/// writer whose `Vec` sink is drained after every push, so output streams
-/// chunk by chunk instead of arriving once at close.
-enum ZlibStream {
-    GzipEncode(flate2::write::GzEncoder<Vec<u8>>),
-    GzipDecode(flate2::write::GzDecoder<Vec<u8>>),
-    ZlibEncode(flate2::write::ZlibEncoder<Vec<u8>>),
-    ZlibDecode(flate2::write::ZlibDecoder<Vec<u8>>),
-    RawEncode(flate2::write::DeflateEncoder<Vec<u8>>),
-    RawDecode(flate2::write::DeflateDecoder<Vec<u8>>),
-}
-
-/// The six writer types share `write`/`flush`/`get_mut`/`finish` but no
-/// trait, so dispatch once here.
-macro_rules! zlib_each {
-    ($stream:expr, $w:ident => $body:expr) => {
-        match $stream {
-            ZlibStream::GzipEncode($w) => $body,
-            ZlibStream::GzipDecode($w) => $body,
-            ZlibStream::ZlibEncode($w) => $body,
-            ZlibStream::ZlibDecode($w) => $body,
-            ZlibStream::RawEncode($w) => $body,
-            ZlibStream::RawDecode($w) => $body,
-        }
-    };
-}
-
-impl ZlibStream {
-    fn new(format: &str, decompress: bool) -> Option<ZlibStream> {
-        use flate2::write as z;
-        let level = flate2::Compression::default();
-        let sink = Vec::new;
-        Some(match (format, decompress) {
-            ("gzip", false) => Self::GzipEncode(z::GzEncoder::new(sink(), level)),
-            ("gzip", true) => Self::GzipDecode(z::GzDecoder::new(sink())),
-            ("deflate", false) => Self::ZlibEncode(z::ZlibEncoder::new(sink(), level)),
-            ("deflate", true) => Self::ZlibDecode(z::ZlibDecoder::new(sink())),
-            ("deflate-raw", false) => Self::RawEncode(z::DeflateEncoder::new(sink(), level)),
-            ("deflate-raw", true) => Self::RawDecode(z::DeflateDecoder::new(sink())),
-            _ => return None,
-        })
-    }
-
-    fn decompress(&self) -> bool {
-        matches!(
-            self,
-            Self::GzipDecode(_) | Self::ZlibDecode(_) | Self::RawDecode(_)
-        )
-    }
-
-    /// Workerd's canonical message, matched by its conformance suite.
-    fn failure(&self) -> &'static str {
-        if self.decompress() {
-            "Decompression failed."
-        } else {
-            "Compression failed."
-        }
-    }
-
-    /// Write one chunk and return whatever output it produced. Decoded
-    /// output flows per chunk; encoders hold theirs until a full buffer
-    /// accumulates (matching Workerd, whose suite reads a small message
-    /// back as one chunk), with the rest arriving from `finish`. A
-    /// decoder that stops consuming input has hit the end of the
-    /// compressed stream, so leftover bytes are trailing garbage —
-    /// Workerd's strict_compression_checks.
-    fn push(&mut self, mut input: &[u8]) -> Result<Vec<u8>> {
-        use std::io::Write;
-        const ENCODER_CHUNK: usize = 32 * 1024;
-        let failure = self.failure();
-        let held = if self.decompress() { 0 } else { ENCODER_CHUNK };
-        zlib_each!(self, w => {
-            while !input.is_empty() {
-                let n = w.write(input).map_err(|_| anyhow!(failure))?;
-                if n == 0 { return Err(anyhow!(failure)); }
-                input = &input[n..];
-            }
-            if w.get_ref().len() < held { return Ok(Vec::new()); }
-            Ok(std::mem::take(w.get_mut()))
-        })
-    }
-
-    /// Terminate the stream and return the final output. For gzip this
-    /// also validates the trailer, so a truncated stream errors here.
-    fn finish(self) -> Result<Vec<u8>> {
-        let failure = self.failure();
-        zlib_each!(self, w => w.finish().map_err(|_| anyhow!(failure)))
-    }
-}
-
-thread_local! {
-    static ZLIB_STREAMS: std::cell::RefCell<
-        std::collections::HashMap<u64, ZlibStream>> = Default::default();
-    static ZLIB_STREAM_NEXT: std::cell::Cell<u64> =
-        const { std::cell::Cell::new(1) };
-}
-
-fn zlib_stream_return(
-    scope: &mut v8::PinScope,
-    rv: v8::ReturnValue<v8::Value>,
-    result: Result<Vec<u8>>,
-) {
-    match result {
-        Ok(bytes) => webcrypto_return_bytes(scope, rv, &bytes),
-        Err(error) => {
-            let message = v8::String::new(scope, &error.to_string()).unwrap();
-            let exception = v8::Exception::type_error(scope, message);
-            scope.throw_exception(exception);
-        }
-    }
-}
-
-/// `__zlib_stream_new(format, decompress)` -> id. JS validates the format
-/// and throws the spec TypeError, so an unknown one here is a bug.
-fn op_zlib_stream_new(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    mut rv: v8::ReturnValue<v8::Value>,
-) {
-    let format = args.get(0).to_rust_string_lossy(scope);
-    let decompress = args.get(1).boolean_value(scope);
-    let stream = ZlibStream::new(&format, decompress).expect("JS validated the compression format");
-    let id = ZLIB_STREAM_NEXT.with(|next| {
-        let id = next.get();
-        next.set(id + 1);
-        id
-    });
-    ZLIB_STREAMS.with(|streams| streams.borrow_mut().insert(id, stream));
-    rv.set(v8::Number::new(scope, id as f64).into());
-}
-
-/// `__zlib_stream_push(id, view)` -> Uint8Array (possibly empty). An
-/// error poisons the stream: its native state is dropped and the
-/// TypeError errors both sides of the transform.
-fn op_zlib_stream_push(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    rv: v8::ReturnValue<v8::Value>,
-) {
-    let id = args.get(0).integer_value(scope).unwrap_or(0) as u64;
-    let bytes = view_bytes(args.get(1)).unwrap_or_default();
-    let result = ZLIB_STREAMS.with(|streams| {
-        let mut streams = streams.borrow_mut();
-        let stream = streams
-            .get_mut(&id)
-            .ok_or_else(|| anyhow!("zlib stream already closed"))?;
-        let out = stream.push(&bytes);
-        if out.is_err() {
-            streams.remove(&id);
-        }
-        out
-    });
-    zlib_stream_return(scope, rv, result);
-}
-
-/// `__zlib_stream_end(id)` -> the final Uint8Array. Consumes the stream.
-fn op_zlib_stream_end(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    rv: v8::ReturnValue<v8::Value>,
-) {
-    let id = args.get(0).integer_value(scope).unwrap_or(0) as u64;
-    let result = ZLIB_STREAMS.with(|streams| {
-        streams
-            .borrow_mut()
-            .remove(&id)
-            .ok_or_else(|| anyhow!("zlib stream already closed"))
-    });
-    zlib_stream_return(scope, rv, result.and_then(ZlibStream::finish));
-}
-
-/// `__zlib_stream_drop(id)` — cancelled/aborted transform cleanup.
-fn op_zlib_stream_drop(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
-    let id = args.get(0).integer_value(scope).unwrap_or(0) as u64;
-    ZLIB_STREAMS.with(|streams| streams.borrow_mut().remove(&id));
-}
-
-fn op_ws_send(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
-    let id = args
-        .get(0)
-        .to_integer(scope)
-        .map(|n| n.value() as u64)
-        .unwrap_or(0);
-    let data = args.get(1).to_rust_string_lossy(scope);
-    ws_emit(id, WsOut::Text(data));
-}
-fn op_ws_send_binary(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
-    let id = args
-        .get(0)
-        .to_integer(scope)
-        .map(|n| n.value() as u64)
-        .unwrap_or(0);
-    let data = view_bytes(args.get(1)).unwrap_or_default();
-    ws_emit(id, WsOut::Binary(data));
-}
-fn op_ws_close(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
-    let id = args
-        .get(0)
-        .to_integer(scope)
-        .map(|n| n.value() as u64)
-        .unwrap_or(0);
-    let code = args.get(1).uint32_value(scope).unwrap_or(1000) as u16;
-    let reason = args.get(2).to_rust_string_lossy(scope);
-    ws_emit(id, WsOut::Close(code, reason));
-}
-fn op_ws_alloc(
-    scope: &mut v8::PinScope,
-    _args: v8::FunctionCallbackArguments,
-    mut rv: v8::ReturnValue<v8::Value>,
-) {
-    rv.set(v8::Number::new(scope, ws_next_id() as f64).into());
-}
-/// `fetch(url, { headers: { Upgrade: "websocket" } })`. Returns a JSON
-/// envelope: either an upgraded socket, or the ordinary response a server sent
-/// instead, which the caller returns unchanged.
-fn op_ws_upgrade(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    mut rv: v8::ReturnValue<v8::Value>,
-) {
-    if actor_runtime_state(scope).egress == EgressPolicy::Deny {
-        return loader_throw(
-            scope,
-            "This worker is not permitted to access the internet via global functions.",
-        );
-    }
-    let id = args
-        .get(0)
-        .to_integer(scope)
-        .map(|n| n.value() as u64)
-        .unwrap_or(0);
-    let cell = args.get(1).to_rust_string_lossy(scope);
-    let url = args.get(2).to_rust_string_lossy(scope);
-    let headers: Vec<(String, String)> =
-        serde_json::from_str(&args.get(3).to_rust_string_lossy(scope)).unwrap_or_default();
-    let protocols: Vec<String> = headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("sec-websocket-protocol"))
-        .map(|(_, value)| value.split(',').map(|p| p.trim().to_string()).collect())
-        .unwrap_or_default();
-    let pull = cell.is_empty().then(|| {
-        let (pull_tx, pull_rx) = tokio::sync::mpsc::unbounded_channel();
-        ws_pull_register(id, pull_rx);
-        ws_region_track(id);
-        pull_tx
-    });
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let sent = OUTBOUND_WS_TX.get().is_some_and(|sender| {
-        sender
-            .send(OutboundWsReq {
-                scope: cell,
-                id,
-                url,
-                protocols,
-                pull,
-                headers,
-                want_response: true,
-                reply: tx,
-            })
-            .is_ok()
-    });
-    let async_id = asyncrt::enqueue(async move {
-        if !sent {
-            return Err("no outbound WebSocket channel".into());
-        }
-        let open = match rx.await {
-            Ok(Ok(open)) => open,
-            Ok(Err(error)) => return Err(format!("WebSocket upgrade failed: {error}")),
-            Err(error) => return Err(format!("WebSocket connector dropped: {error}")),
-        };
-        Ok(match open.declined {
-            Some(declined) => serde_json::json!({
-                "upgraded": false,
-                "status": declined.status,
-                "headers": declined.headers,
-                "body": declined.body,
-            })
-            .to_string(),
-            None => serde_json::json!({
-                "upgraded": true,
-                "protocol": open.protocol.unwrap_or_default(),
-            })
-            .to_string(),
-        })
-    });
-    rv.set(promise_for(scope, async_id));
-}
-
-/// Await the next inbound event on an isolate-polled socket. Resolves with a
-/// tagged buffer; a closed queue resolves as a 1006 close so the JS pump always
-/// terminates rather than hanging on a dropped sender.
-fn op_ws_next(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    mut rv: v8::ReturnValue<v8::Value>,
-) {
-    let id = args
-        .get(0)
-        .to_integer(scope)
-        .map(|n| n.value() as u64)
-        .unwrap_or(0);
-    let queue = ws_pull().lock().unwrap().get(&id).cloned();
-    let async_id = asyncrt::enqueue(async move {
-        let Some(queue) = queue else {
-            return Ok(WsPull::Close(1006, "socket is not registered".into(), false).encode());
-        };
-        let mut queue = queue.lock().await;
-        Ok(queue
-            .recv()
-            .await
-            .unwrap_or_else(|| WsPull::Close(1006, String::new(), false))
-            .encode())
-    });
-    rv.set(promise_for(scope, async_id));
-}
-
-fn op_ws_connect(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    mut rv: v8::ReturnValue<v8::Value>,
-) {
-    if actor_runtime_state(scope).egress == EgressPolicy::Deny {
-        return loader_throw(
-            scope,
-            "This worker is not permitted to access the internet via global functions.",
-        );
-    }
-    let id = args
-        .get(0)
-        .to_integer(scope)
-        .map(|n| n.value() as u64)
-        .unwrap_or(0);
-    let cell = args.get(1).to_rust_string_lossy(scope);
-    let url = args.get(2).to_rust_string_lossy(scope);
-    let protocols: Vec<String> =
-        serde_json::from_str(&args.get(3).to_rust_string_lossy(scope)).unwrap_or_default();
-    // No cell means a Worker socket: the isolate polls it, so register the
-    // queue here on the JS thread and track it against the running region.
-    let pull = cell.is_empty().then(|| {
-        let (pull_tx, pull_rx) = tokio::sync::mpsc::unbounded_channel();
-        ws_pull_register(id, pull_rx);
-        ws_region_track(id);
-        pull_tx
-    });
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let sent = OUTBOUND_WS_TX.get().is_some_and(|sender| {
-        sender
-            .send(OutboundWsReq {
-                scope: cell,
-                id,
-                url,
-                protocols,
-                pull,
-                headers: Vec::new(),
-                want_response: false,
-                reply: tx,
-            })
-            .is_ok()
-    });
-    let async_id = asyncrt::enqueue(async move {
-        if !sent {
-            return Err("no outbound WebSocket channel".into());
-        }
-        match rx.await {
-            Ok(Ok(open)) => Ok(open.protocol.unwrap_or_default()),
-            Ok(Err(error)) => Err(format!("WebSocket connection failed: {error}")),
-            Err(error) => Err(format!("WebSocket connector dropped: {error}")),
-        }
-    });
-    rv.set(promise_for(scope, async_id));
-}
-fn op_ws_accept(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
-    let id = args
-        .get(0)
-        .to_integer(scope)
-        .map(|n| n.value() as u64)
-        .unwrap_or(0);
-    let cell = args.get(1).to_rust_string_lossy(scope);
-    let tags: Vec<String> =
-        serde_json::from_str(&args.get(2).to_rust_string_lossy(scope)).unwrap_or_default();
-    let replaced_regular_scope = {
-        let mut registry = ws_registry().lock().unwrap();
-        let sockets = &mut registry.metadata;
-        let replaced_regular_scope = sockets
-            .get(&id)
-            .filter(|meta| !meta.hibernatable)
-            .map(|meta| meta.scope.clone());
-        sockets
-            .entry(id)
-            .and_modify(|meta| {
-                meta.scope = cell.clone();
-                meta.hibernatable = true;
-                meta.tags = tags.clone();
-            })
-            .or_insert(WsMeta {
-                scope: cell.clone(),
-                hibernatable: true,
-                tags,
-                attachment: None,
-                pending: Vec::new(),
-            });
-        replaced_regular_scope
-    };
-    if let Some(scope) = replaced_regular_scope {
-        decrement_regular_ws(&scope);
-    }
-    tracing::info!(ws_id = id, scope = %cell, "accepted hibernatable WebSocket");
-}
-fn op_ws_accept_regular(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
-    let id = args
-        .get(0)
-        .to_integer(scope)
-        .map(|n| n.value() as u64)
-        .unwrap_or(0);
-    let cell = args.get(1).to_rust_string_lossy(scope);
-    let inserted = {
-        let mut registry = ws_registry().lock().unwrap();
-        let sockets = &mut registry.metadata;
-        if let std::collections::hash_map::Entry::Vacant(entry) = sockets.entry(id) {
-            entry.insert(WsMeta {
-                scope: cell.clone(),
-                hibernatable: false,
-                tags: Vec::new(),
-                attachment: None,
-                pending: Vec::new(),
-            });
-            true
-        } else {
-            false
-        }
-    };
-    if inserted {
-        increment_regular_ws(&cell);
-    }
-    tracing::info!(ws_id = id, scope = %cell, "accepted regular WebSocket");
-}
-fn op_ws_list(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    mut rv: v8::ReturnValue<v8::Value>,
-) {
-    let cell = args.get(0).to_rust_string_lossy(scope);
-    let tag = args.get(1);
-    let tag = if tag.is_undefined() || tag.is_null() {
-        None
-    } else {
-        Some(tag.to_rust_string_lossy(scope))
-    };
-    let rows = ws_registry()
-        .lock()
-        .unwrap()
-        .metadata
-        .iter()
-        .filter(|(_, meta)| {
-            meta.hibernatable
-                && meta.scope == cell
-                && tag.as_ref().is_none_or(|tag| meta.tags.contains(tag))
-        })
-        .map(|(id, meta)| {
-            serde_json::json!({
-                "id": id,
-                "tags": meta.tags,
-                "attachment": meta.attachment,
-            })
-        })
-        .collect::<Vec<_>>();
-    let json = serde_json::to_string(&rows).unwrap();
-    rv.set(v8::String::new(scope, &json).unwrap().into());
-}
-fn op_ws_attachment_set(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
-    let id = args
-        .get(0)
-        .to_integer(scope)
-        .map(|n| n.value() as u64)
-        .unwrap_or(0);
-    let attachment = args.get(1).to_rust_string_lossy(scope);
-    if let Some(meta) = ws_registry().lock().unwrap().metadata.get_mut(&id) {
-        meta.attachment = Some(attachment);
-    }
-}
-
-#[cfg(all(test, celld_internal_tests))]
-mod websocket_registry_private {
-    include!(env!("CELLD_CONFORMANCE_WEBSOCKET_REGISTRY_TESTS"));
-}
-fn op_storage_get(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    mut rv: v8::ReturnValue<v8::Value>,
-) {
-    let scope_s = args.get(0).to_rust_string_lossy(scope);
-    let key = args.get(1).to_rust_string_lossy(scope);
-    match storage::get_stored(&scope_s, &key) {
-        Ok(Some(value)) => {
-            if let Some((value, _)) = deserialize_stored(scope, value, args.get(2)) {
-                rv.set(value);
-            }
-        }
-        Ok(None) => rv.set(v8::undefined(scope).into()),
-        Err(error) => throw_storage_error(scope, "get", error),
-    }
-}
-fn op_storage_get_many(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    mut rv: v8::ReturnValue<v8::Value>,
-) {
-    let cell = args.get(0).to_rust_string_lossy(scope);
-    let keys = match storage_string_array(scope, args.get(1)) {
-        Ok(keys) => keys,
-        Err(error) => {
-            throw_storage_error(scope, "get", error);
-            return;
-        }
-    };
-    match storage::get_many_stored(&cell, &keys) {
-        Ok(entries) => {
-            let sentinel = args.get(2);
-            if let Some((map, tagged)) = storage_entries_map(scope, entries, sentinel) {
-                rv.set(if tagged {
-                    wrap_stored(scope, sentinel, map.into())
-                } else {
-                    map.into()
-                });
-            }
-        }
-        Err(error) => throw_storage_error(scope, "get", error),
-    }
-}
-fn op_storage_put(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
-    let s = args.get(0).to_rust_string_lossy(scope);
-    let k = args.get(1).to_rust_string_lossy(scope);
-    let Some(value) = serialize_storage_value(scope, args.get(2)) else {
-        return;
-    };
-    if let Err(error) = storage::put_serialized(&s, &k, &value) {
-        throw_storage_error(scope, "put", error);
-    }
-}
-fn op_storage_put_many(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
-    let cell = args.get(0).to_rust_string_lossy(scope);
-    let Ok(entries) = v8::Local::<v8::Array>::try_from(args.get(1)) else {
-        throw_storage_error(scope, "put", "entries must be an array");
-        return;
-    };
-    let mut serialized = Vec::with_capacity(entries.length() as usize);
-    for index in 0..entries.length() {
-        let Some(entry) = entries.get_index(scope, index) else {
-            return;
-        };
-        let Ok(entry) = v8::Local::<v8::Array>::try_from(entry) else {
-            throw_storage_error(scope, "put", "entry must be a key/value pair");
-            return;
-        };
-        let Some(key) = entry.get_index(scope, 0) else {
-            return;
-        };
-        let Some(value) = entry.get_index(scope, 1) else {
-            return;
-        };
-        let Some(value) = serialize_storage_value(scope, value) else {
-            return;
-        };
-        serialized.push((key.to_rust_string_lossy(scope), value));
-    }
-    if let Err(error) = storage::put_many_serialized(&cell, &serialized) {
-        throw_storage_error(scope, "put", error);
-    }
-}
-
-/// `__storage_put_serialized(cell, key, bytes)`: write pre-encoded row
-/// bytes verbatim — the stored-stub envelope (or a plain clone) built by
-/// the JS storage wrapper after a plain clone failed. Never on the fast
-/// path.
-fn op_storage_put_serialized(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
-    let cell = args.get(0).to_rust_string_lossy(scope);
-    let key = args.get(1).to_rust_string_lossy(scope);
-    let Some(bytes) = view_bytes(args.get(2)) else {
-        throw_storage_error(scope, "put", "serialized row must be bytes");
-        return;
-    };
-    if let Err(error) = storage::put_serialized(&cell, &key, &bytes) {
-        throw_storage_error(scope, "put", error);
-    }
-}
-
-/// The queued flavor of [`op_storage_put_serialized`], joining the same
-/// pending-puts batch the plain queue ops feed.
-fn op_storage_queue_put_serialized(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
-    let cell = args.get(0).to_rust_string_lossy(scope);
-    let key = args.get(1).to_rust_string_lossy(scope);
-    let Some(bytes) = view_bytes(args.get(2)) else {
-        throw_storage_error(scope, "put", "serialized row must be bytes");
-        return;
-    };
-    queue_serialized_puts(scope, cell, vec![(key, bytes)]);
-}
-
-fn actor_runtime_state(scope: &mut v8::PinScope) -> Arc<ActorRuntimeState> {
-    scope
-        .get_slot::<Arc<ActorRuntimeState>>()
-        .expect("actor runtime state slot")
-        .clone()
-}
-
-fn queue_serialized_puts(scope: &mut v8::PinScope, cell: String, entries: Vec<(String, Vec<u8>)>) {
-    actor_runtime_state(scope)
-        .pending_puts
-        .lock()
-        .expect("pending puts lock poisoned")
-        .entry(cell)
-        .or_default()
-        .extend(entries);
-}
-
-fn op_storage_queue_put(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
-    let cell = args.get(0).to_rust_string_lossy(scope);
-    let key = args.get(1).to_rust_string_lossy(scope);
-    let Some(value) = serialize_storage_value(scope, args.get(2)) else {
-        return;
-    };
-    queue_serialized_puts(scope, cell, vec![(key, value)]);
-}
-
-fn op_storage_queue_put_many(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
-    let cell = args.get(0).to_rust_string_lossy(scope);
-    let Ok(entries) = v8::Local::<v8::Array>::try_from(args.get(1)) else {
-        throw_storage_error(scope, "put", "entries must be an array");
-        return;
-    };
-    let mut serialized = Vec::with_capacity(entries.length() as usize);
-    for index in 0..entries.length() {
-        let Some(entry) = entries.get_index(scope, index) else {
-            return;
-        };
-        let Ok(entry) = v8::Local::<v8::Array>::try_from(entry) else {
-            throw_storage_error(scope, "put", "entry must be a key/value pair");
-            return;
-        };
-        let Some(key) = entry.get_index(scope, 0) else {
-            return;
-        };
-        let Some(value) = entry.get_index(scope, 1) else {
-            return;
-        };
-        let Some(value) = serialize_storage_value(scope, value) else {
-            return;
-        };
-        serialized.push((key.to_rust_string_lossy(scope), value));
-    }
-    queue_serialized_puts(scope, cell, serialized);
-}
-
-fn op_storage_flush_pending_puts(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
-    let cell = args.get(0).to_rust_string_lossy(scope);
-    let entries = actor_runtime_state(scope)
-        .pending_puts
-        .lock()
-        .expect("pending puts lock poisoned")
-        .remove(&cell)
-        .unwrap_or_default();
-    if entries.is_empty() {
-        return;
-    }
-    if let Err(error) = storage::put_many_serialized(&cell, &entries) {
-        throw_storage_error(scope, "put", error);
-    }
-}
-
-fn op_storage_cancel_pending_puts(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
-    let cell = args.get(0).to_rust_string_lossy(scope);
-    actor_runtime_state(scope)
-        .pending_puts
-        .lock()
-        .expect("pending puts lock poisoned")
-        .remove(&cell);
-}
+mod crypto;
+mod zlib;
 
 fn op_actor_abort(
     scope: &mut v8::PinScope,
@@ -5565,6 +4709,13 @@ fn op_process_exit(
     _rv: v8::ReturnValue<v8::Value>,
 ) {
     let code = args.get(0).integer_value(scope).unwrap_or(0);
+    if current_context().depth() == 0 {
+        tracing::warn!(
+            code,
+            "process.exit called without an active request; ignoring"
+        );
+        return;
+    }
     let actor_scope = args.get(1).to_rust_string_lossy(scope);
     let actor_scope = (!actor_scope.is_empty()).then_some(actor_scope);
     let state = actor_runtime_state(scope);
@@ -5574,8 +4725,6 @@ fn op_process_exit(
             .lock()
             .expect("pending puts lock poisoned")
             .remove(actor_scope);
-    } else {
-        state.worker_exit_requested.store(true, Ordering::Relaxed);
     }
     *state.termination.lock().expect("termination lock poisoned") = Some(ExecutionTermination {
         error: format!("__CELLD_PROCESS_EXIT__:The Node.js process.exit({code}) API was called."),
@@ -5592,7 +4741,20 @@ fn op_log(
     let msg: Vec<String> = (0..args.length())
         .map(|i| args.get(i).to_rust_string_lossy(scope))
         .collect();
-    tracing::info!(target: "cell_console", "{}", msg.join(" "));
+    let body = msg.join(" ");
+    // Correlated by CPED, so a continuation logging after an await — or
+    // another entry's continuation running in this turn's checkpoint —
+    // lands on the trace that owns it, not on whoever holds the isolate.
+    if crate::telemetry::active() {
+        let ids = current_trace_ids(scope);
+        crate::telemetry::record_log(crate::telemetry::Log {
+            trace_id: ids.as_ref().map(|ids| ids.trace_id),
+            span_id: ids.as_ref().map(|ids| ids.span_id),
+            time_unix_us: crate::telemetry::now_unix_us(),
+            body: body.clone(),
+        });
+    }
+    tracing::info!(target: "cell_console", "{}", body);
 }
 fn op_heap_limit_excessively_exceeded(
     scope: &mut v8::PinScope,
@@ -5624,475 +4786,8 @@ fn op_test_gc(
 ) {
     scope.request_garbage_collection_for_testing(v8::GarbageCollectionType::Full);
 }
-/// `ctx.storage.sql.exec(query, ...binds)` — args: scope, query, binds(JSON).
-/// Returns a JSON `{columns, rows, rowsWritten}` (or `{error}`).
-fn op_sql_exec(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    mut rv: v8::ReturnValue<v8::Value>,
-) {
-    let sc = args.get(0).to_rust_string_lossy(scope);
-    let query = args.get(1).to_rust_string_lossy(scope);
-    let binds: Vec<serde_json::Value> =
-        serde_json::from_str(&args.get(2).to_rust_string_lossy(scope)).unwrap_or_default();
-    let out = match storage::sql_exec(&sc, &query, &binds) {
-        Ok((columns, rows, rows_written)) => serde_json::json!({
-            "columns": columns, "rows": rows, "rowsWritten": rows_written,
-        }),
-        Err(e) => serde_json::json!({ "error": e }),
-    };
-    rv.set(v8::String::new(scope, &out.to_string()).unwrap().into());
-}
-fn op_sql_ingest(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    mut rv: v8::ReturnValue<v8::Value>,
-) {
-    let cell = args.get(0).to_rust_string_lossy(scope);
-    let input = args.get(1).to_rust_string_lossy(scope);
-    let out = match storage::sql_ingest(&cell, &input) {
-        Ok((remainder, rows_written, statement_count)) => serde_json::json!({
-            "remainder": remainder,
-            "rowsWritten": rows_written,
-            "statementCount": statement_count,
-        }),
-        Err(error) => serde_json::json!({ "error": error }),
-    };
-    rv.set(v8::String::new(scope, &out.to_string()).unwrap().into());
-}
-fn op_sql_cursor_start(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    mut rv: v8::ReturnValue<v8::Value>,
-) {
-    let cell = args.get(0).to_rust_string_lossy(scope);
-    let query = args.get(1).to_rust_string_lossy(scope);
-    let binds: Vec<serde_json::Value> =
-        serde_json::from_str(&args.get(2).to_rust_string_lossy(scope)).unwrap_or_default();
-    let out = match storage::sql_cursor_start(&cell, &query, &binds) {
-        Ok((cursor, columns, row, rows_written, reused_cached_query)) => serde_json::json!({
-            "native": true,
-            "cursorId": cursor,
-            "columns": columns,
-            "row": row,
-            "rowsWritten": rows_written,
-            "reusedCachedQuery": reused_cached_query,
-        }),
-        Err(error) => serde_json::json!({ "error": error }),
-    };
-    rv.set(v8::String::new(scope, &out.to_string()).unwrap().into());
-}
-fn op_sql_cursor_next(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    mut rv: v8::ReturnValue<v8::Value>,
-) {
-    let cursor = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
-    let out = match storage::sql_cursor_next(cursor) {
-        Ok((row, rows_written)) => serde_json::json!({
-            "row": row,
-            "rowsWritten": rows_written,
-        }),
-        Err(error) => serde_json::json!({ "error": error }),
-    };
-    rv.set(v8::String::new(scope, &out.to_string()).unwrap().into());
-}
-fn op_sql_cursor_close(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
-    let cursor = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
-    storage::sql_cursor_close(cursor);
-}
-fn op_sql_database_size(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    mut rv: v8::ReturnValue<v8::Value>,
-) {
-    let cell = args.get(0).to_rust_string_lossy(scope);
-    match storage::sql_database_size(&cell) {
-        Ok(bytes) => rv.set(v8::Number::new(scope, bytes as f64).into()),
-        Err(error) => throw_storage_error(scope, "sql.databaseSize", error),
-    }
-}
-#[cfg(all(test, celld_internal_tests))]
-fn op_sql_set_max_page_count_for_test(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
-    let cell = args.get(0).to_rust_string_lossy(scope);
-    let pages = args.get(1).uint32_value(scope).unwrap_or(0);
-    if let Err(error) = storage::set_max_page_count_for_test(&cell, pages) {
-        throw_storage_error(scope, "sql.setMaxPageCountForTest", error);
-    }
-}
-#[cfg(all(test, celld_internal_tests))]
-fn op_sql_set_write_fault_for_test(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
-    storage::set_write_fault_for_test(args.get(0).boolean_value(scope));
-}
-#[cfg(all(test, celld_internal_tests))]
-fn op_sql_set_cache_size_for_test(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
-    let cell = args.get(0).to_rust_string_lossy(scope);
-    let pages = args.get(1).int32_value(scope).unwrap_or(0);
-    if let Err(error) = storage::set_cache_size_for_test(&cell, pages) {
-        throw_storage_error(scope, "sql.setCacheSizeForTest", error);
-    }
-}
-#[cfg(all(test, celld_internal_tests))]
-fn op_sql_set_interrupt_fault_for_test(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
-    let cell = args.get(0).to_rust_string_lossy(scope);
-    let enabled = args.get(1).boolean_value(scope);
-    if let Err(error) = storage::set_interrupt_fault_for_test(&cell, enabled) {
-        throw_storage_error(scope, "sql.setInterruptFaultForTest", error);
-    }
-}
-#[cfg(all(test, celld_internal_tests))]
-fn op_sql_register_nomem_function_for_test(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
-    let cell = args.get(0).to_rust_string_lossy(scope);
-    if let Err(error) = storage::register_nomem_function_for_test(&cell) {
-        throw_storage_error(scope, "sql.registerNomemFunctionForTest", error);
-    }
-}
-fn op_storage_transaction_control(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
-    let cell = args.get(0).to_rust_string_lossy(scope);
-    let action = args.get(1).to_rust_string_lossy(scope);
-    let nested = args.get(2).boolean_value(scope);
-    let savepoint = args.get(3).to_rust_string_lossy(scope);
-    match storage::transaction_control(&cell, &action, nested, &savepoint) {
-        Err(error) => throw_storage_error(scope, "transaction", error),
-        // An outermost commit published a dirty alarm: register its
-        // wake-entry PUT against the cell's output gate.
-        Ok(Some(at)) if at >= 0 => spawn_arm_gate(&cell, at),
-        Ok(_) => {}
-    }
-}
-fn op_storage_delete(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    mut rv: v8::ReturnValue<v8::Value>,
-) {
-    let s = args.get(0).to_rust_string_lossy(scope);
-    let k = args.get(1).to_rust_string_lossy(scope);
-    match storage::delete(&s, &k) {
-        Ok(deleted) => rv.set(v8::Boolean::new(scope, deleted).into()),
-        Err(error) => throw_storage_error(scope, "delete", error),
-    }
-}
-fn op_storage_delete_many(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    mut rv: v8::ReturnValue<v8::Value>,
-) {
-    let cell = args.get(0).to_rust_string_lossy(scope);
-    let keys = match storage_string_array(scope, args.get(1)) {
-        Ok(keys) => keys,
-        Err(error) => {
-            throw_storage_error(scope, "delete", error);
-            return;
-        }
-    };
-    match storage::delete_many(&cell, &keys) {
-        Ok(deleted) => rv.set(v8::Number::new(scope, deleted as f64).into()),
-        Err(error) => throw_storage_error(scope, "delete", error),
-    }
-}
-
-#[derive(Default, serde::Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-struct StorageListOptions {
-    start: Option<String>,
-    end: Option<String>,
-    start_after: Option<String>,
-    prefix: Option<String>,
-    limit: Option<usize>,
-    reverse: bool,
-}
-
-fn op_storage_list(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    mut rv: v8::ReturnValue<v8::Value>,
-) {
-    let cell = args.get(0).to_rust_string_lossy(scope);
-    let options = match serde_json::from_str::<StorageListOptions>(
-        &args.get(1).to_rust_string_lossy(scope),
-    ) {
-        Ok(options) => options,
-        Err(error) => {
-            throw_storage_error(scope, "list", error);
-            return;
-        }
-    };
-    match storage::list_stored_with_options(
-        &cell,
-        options.start.as_deref(),
-        options.end.as_deref(),
-        options.start_after.as_deref(),
-        options.prefix.as_deref(),
-        options.limit,
-        options.reverse,
-    ) {
-        Ok(entries) => {
-            let sentinel = args.get(2);
-            if let Some((map, tagged)) = storage_entries_map(scope, entries, sentinel) {
-                rv.set(if tagged {
-                    wrap_stored(scope, sentinel, map.into())
-                } else {
-                    map.into()
-                });
-            }
-        }
-        Err(error) => throw_storage_error(scope, "list", error),
-    }
-}
-
-fn op_storage_sync_list_start(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    mut rv: v8::ReturnValue<v8::Value>,
-) {
-    let cell = args.get(0).to_rust_string_lossy(scope);
-    let options = match serde_json::from_str::<StorageListOptions>(
-        &args.get(1).to_rust_string_lossy(scope),
-    ) {
-        Ok(options) => options,
-        Err(error) => {
-            throw_storage_error(scope, "kv.list", error);
-            return;
-        }
-    };
-    match storage::sync_list_start(
-        &cell,
-        options.start.as_deref(),
-        options.end.as_deref(),
-        options.start_after.as_deref(),
-        options.prefix.as_deref(),
-        options.limit,
-        options.reverse,
-    ) {
-        Ok(cursor) => rv.set(v8::Number::new(scope, cursor as f64).into()),
-        Err(error) => throw_storage_error(scope, "kv.list", error),
-    }
-}
-
-fn op_storage_sync_list_next(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    mut rv: v8::ReturnValue<v8::Value>,
-) {
-    let cursor = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
-    match storage::sync_list_next(cursor) {
-        Ok(Some((key, value))) => {
-            let Some((decoded, _)) = deserialize_stored(scope, value, args.get(1)) else {
-                throw_storage_error(
-                    scope,
-                    "kv.list",
-                    format!("deserialization failed for key {key}"),
-                );
-                return;
-            };
-            let pair = v8::Array::new(scope, 2);
-            let key = v8::String::new(scope, &key).unwrap();
-            pair.set_index(scope, 0, key.into());
-            pair.set_index(scope, 1, decoded);
-            rv.set(pair.into());
-        }
-        Ok(None) => rv.set(v8::null(scope).into()),
-        Err(error) => throw_storage_error(scope, "kv.list", error),
-    }
-}
-
-struct StorageValueDelegate;
-
-impl v8::ValueSerializerImpl for StorageValueDelegate {
-    fn throw_data_clone_error(&self, scope: &mut v8::PinScope, message: v8::Local<v8::String>) {
-        let exception = v8::Exception::type_error(scope, message);
-        scope.throw_exception(exception);
-    }
-}
-
-impl v8::ValueDeserializerImpl for StorageValueDelegate {}
-
-fn serialize_storage_value(
-    scope: &mut v8::PinScope,
-    value: v8::Local<v8::Value>,
-) -> Option<Vec<u8>> {
-    let context = scope.get_current_context();
-    let serializer = v8::ValueSerializer::new(scope, Box::new(StorageValueDelegate));
-    serializer.write_header();
-    if !serializer.write_value(context, value).unwrap_or(false) {
-        return None;
-    }
-    let mut bytes = serializer.release();
-    // Workerd pins persisted actor values to V8 wire version 15 so rolling
-    // upgrades remain readable by older processes. V8 150 writes version 16;
-    // for Cells' supported (sub-4GiB) ArrayBuffers its varint encoding is
-    // byte-compatible, so retain the Workerd on-disk version tag.
-    if bytes.starts_with(&[0xff, 0x10]) {
-        bytes[1] = 0x0f;
-    }
-    Some(bytes)
-}
-
-fn deserialize_storage_value<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    value: storage::StoredValue,
-) -> Option<v8::Local<'s, v8::Value>> {
-    match value {
-        storage::StoredValue::LegacyJson(json) => {
-            let json = v8::String::new(scope, &json)?;
-            v8::json::parse(scope, json)
-        }
-        storage::StoredValue::V8(bytes) => {
-            let context = scope.get_current_context();
-            let deserializer =
-                v8::ValueDeserializer::new(scope, Box::new(StorageValueDelegate), &bytes);
-            deserializer.set_supports_legacy_wire_format(true);
-            if !deserializer.read_header(context).unwrap_or(false) {
-                return None;
-            }
-            deserializer.read_value(context)
-        }
-    }
-}
-
-/// First byte of a stored-stub row: a durable stub marker tree follows
-/// as an ordinary V8 clone. Plain rows keep V8's own 0xff prefix, so
-/// the tag branch never runs for them.
-const STORED_STUB_TAG: u8 = 0x01;
-
-fn wrap_stored<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    sentinel: v8::Local<v8::Value>,
-    value: v8::Local<v8::Value>,
-) -> v8::Local<'s, v8::Value> {
-    let pair = v8::Array::new(scope, 2);
-    pair.set_index(scope, 0, sentinel);
-    pair.set_index(scope, 1, value);
-    pair.into()
-}
-
-/// Decode one stored row for JS. A stub-tagged row comes back as
-/// `[sentinel, tree]` (plus `true`), which only the storage wrapper —
-/// holder of the closure-private sentinel — turns back into live stubs.
-fn deserialize_stored<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    value: storage::StoredValue,
-    sentinel: v8::Local<v8::Value>,
-) -> Option<(v8::Local<'s, v8::Value>, bool)> {
-    match value {
-        storage::StoredValue::V8(bytes) if bytes.first() == Some(&STORED_STUB_TAG) => {
-            let tree =
-                deserialize_storage_value(scope, storage::StoredValue::V8(bytes[1..].to_vec()))?;
-            Some((wrap_stored(scope, sentinel, tree), true))
-        }
-        value => deserialize_storage_value(scope, value).map(|value| (value, false)),
-    }
-}
-
-/// `__sc_encode(value)` -> Uint8Array: V8 structured clone, sharing the
-/// storage serializer (same delegate, same pinned wire version). The RPC
-/// marshalling seam — a failed clone leaves the delegate's throw pending.
-fn op_sc_encode(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    mut rv: v8::ReturnValue<v8::Value>,
-) {
-    if let Some(bytes) = serialize_storage_value(scope, args.get(0)) {
-        rv.set(bytes_value(scope, bytes));
-    }
-}
-
-/// `__sc_decode(bytes)` -> value: inverse of `__sc_encode`.
-fn op_sc_decode(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    mut rv: v8::ReturnValue<v8::Value>,
-) {
-    let Some(bytes) = view_bytes(args.get(0)) else {
-        let message = v8::String::new(scope, "__sc_decode expects bytes").unwrap();
-        let exception = v8::Exception::type_error(scope, message);
-        scope.throw_exception(exception);
-        return;
-    };
-    match deserialize_storage_value(scope, storage::StoredValue::V8(bytes)) {
-        Some(value) => rv.set(value),
-        None => throw_storage_error(scope, "rpc", "corrupt clone payload"),
-    }
-}
-
-fn storage_string_array(
-    scope: &mut v8::PinScope,
-    value: v8::Local<v8::Value>,
-) -> std::result::Result<Vec<String>, &'static str> {
-    let array = v8::Local::<v8::Array>::try_from(value).map_err(|_| "keys must be an array")?;
-    let mut keys = Vec::with_capacity(array.length() as usize);
-    for index in 0..array.length() {
-        let value = array.get_index(scope, index).ok_or("missing key")?;
-        keys.push(value.to_rust_string_lossy(scope));
-    }
-    Ok(keys)
-}
-
-/// The `bool` reports whether any entry was a stored-stub row, so the
-/// caller wraps the whole map only then — plain maps cross unwrapped and
-/// the JS side never walks them.
-fn storage_entries_map<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    entries: Vec<(String, storage::StoredValue)>,
-    sentinel: v8::Local<v8::Value>,
-) -> Option<(v8::Local<'s, v8::Map>, bool)> {
-    let map = v8::Map::new(scope);
-    let mut any_tagged = false;
-    for (key, value) in entries {
-        let key = v8::String::new(scope, &key)?;
-        let (value, tagged) = deserialize_stored(scope, value, sentinel)?;
-        any_tagged |= tagged;
-        map.set(scope, key.into(), value)?;
-    }
-    Some((map, any_tagged))
-}
-
-fn throw_storage_error(scope: &mut v8::PinScope, operation: &str, error: impl std::fmt::Display) {
-    let message = v8::String::new(scope, &format!("storage.{operation}: {error}")).unwrap();
-    let exception = v8::Exception::error(scope, message);
-    scope.throw_exception(exception);
-}
-fn op_storage_delete_all(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
-    let cell = args.get(0).to_rust_string_lossy(scope);
-    let delete_alarm = args.get(1).boolean_value(scope);
-    if let Err(error) = storage::delete_all_with_alarm(&cell, delete_alarm) {
-        let message = v8::String::new(scope, &format!("deleteAll: {error}")).unwrap();
-        let exception = v8::Exception::error(scope, message);
-        scope.throw_exception(exception);
-    }
-}
+mod storage_ops;
+use storage_ops::{actor_runtime_state, throw_storage_error};
 
 /// $$urlParse(input, base?) -> {protocol,username,password,host,port,pathname,search,hash,href}
 /// Backed by the WHATWG-conformant `url` crate.
@@ -6259,12 +4954,253 @@ fn op_atob(
 // isolate that never touches AsyncLocalStorage never sets the value, so
 // a bundle that does not import async_hooks pays nothing per promise.
 
+/// The per-request context: everything a request owns while it is in flight.
+///
+/// Modelled on workerd's `IoContext`. The host owns it, not JS: a request's
+/// event frames and the `waitUntil` promises inside them live here, and JS
+/// reaches them only through ops that ask for the *current* context. That
+/// inversion is the point. While an isolate serves one request at a time,
+/// JS-side per-request state is indistinguishable from isolate-side state,
+/// and the two silently diverge the moment requests interleave — one
+/// request's `__endEvent` popping another's event, its `waitUntil` work
+/// attributed to a request that never asked for it.
+///
+/// `current()` is a thread-local the host installs for the duration of a
+/// turn and restores on the way out, exactly as `threadLocalRequest` is set
+/// in `IoContext::runInContextScope` and restored by `SuppressIoContextScope`.
+/// An op that needs a context and finds none is a bug in the host, not in
+/// the script, so it says so rather than inventing one.
+///
+/// **It is `Send + Sync`, and that is load-bearing.** Under D1 a request is
+/// a tokio task that suspends between turns and can resume on any worker, so
+/// the context it carries has to cross threads with it. `Rc` and `RefCell`
+/// would forbid that, and the alternative — parking every live context in a
+/// map inside the isolate, keyed by request id — rebuilds the very
+/// demultiplexing table (`idmap`) that deleting the pump exists to remove.
+/// So the interiors are `Mutex` instead. The locks are uncontended by
+/// construction, because only the isolate's holder can reach a context, and
+/// they are taken about twice per request.
+pub struct IoContext {
+    /// This caller's delivery order for each cell it has called. See
+    /// `CallOrder` — it is here rather than in a process-wide map because
+    /// nothing outside this caller ever reads it.
+    call_chains: Mutex<CallChains>,
+    /// Event frames, innermost last. A frame collects the `waitUntil`
+    /// promises registered while it is the innermost one.
+    ///
+    /// Nesting is per-request and strictly LIFO — a service-binding
+    /// dispatch, an RPC entry, or a DO construction pushes its own frame so
+    /// its `waitUntil` binds to that dispatch, matching workerd.
+    events: Mutex<Vec<Vec<v8::Global<v8::Promise>>>>,
+    /// Isolate-polled sockets opened by each nested run loop of this
+    /// request, innermost last. `asyncrt` aborts a region's pending ops when
+    /// it exits; these are host-side resources abort cannot reach, so the
+    /// region closes them itself.
+    sockets: Mutex<Vec<Vec<u64>>>,
+    /// Sockets opened before any run loop exists. A handler runs
+    /// synchronously to its first await before its loop is entered, so a
+    /// socket built at the top of a handler has no frame yet; the loop
+    /// adopts these when it starts.
+    pending_sockets: Mutex<Vec<u64>>,
+    /// Output-gate capture. While a `webSocketMessage` runs, the frames it
+    /// sends are collected here instead of reaching the wire, so the shell
+    /// can hold them until the message's write is durable. A stack, so a
+    /// nested dispatch keeps its frames apart from the outer one's.
+    ///
+    /// On the event and not on the thread, because an event outlives the
+    /// turn that began it: capture starts in one turn and is taken in a
+    /// later one, which tokio may run on a different worker.
+    ws_capture: Mutex<Vec<Vec<(u64, WsOut)>>>,
+    /// Which cell an event belongs to, and the committed-write position it
+    /// started at, innermost last. An outbound effect raised during the
+    /// event consults this: if the handler has advanced the position, the
+    /// effect waits for the output gate before it leaves the process.
+    ///
+    /// Empty for stateless Worker code, which owns no cell and gates
+    /// nothing.
+    egress: Mutex<Vec<(String, u64)>>,
+}
+
+impl IoContext {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            call_chains: Mutex::new(CallChains::default()),
+            events: Mutex::new(Vec::new()),
+            sockets: Mutex::new(Vec::new()),
+            pending_sockets: Mutex::new(Vec::new()),
+            ws_capture: Mutex::new(Vec::new()),
+            egress: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn begin_event(&self) {
+        self.events.lock().unwrap().push(Vec::new());
+    }
+
+    /// Pop the innermost frame and hand back what it collected. `None` when
+    /// there is no frame, which is a script calling `waitUntil` outside any
+    /// event; the harness turns that into workerd's global-scope error.
+    fn end_event(&self) -> Option<Vec<v8::Global<v8::Promise>>> {
+        self.events.lock().unwrap().pop()
+    }
+
+    fn register_wait_until(&self, promise: v8::Global<v8::Promise>) {
+        if let Some(frame) = self.events.lock().unwrap().last_mut() {
+            frame.push(promise);
+        }
+    }
+
+    fn depth(&self) -> usize {
+        self.events.lock().unwrap().len()
+    }
+}
+
+/// What `OwnedIsolate::into_shared` demands of us: every slot value on a
+/// shared isolate is reachable, and droppable, from whichever thread holds
+/// the lock. The type system cannot check it at the call site, so it is
+/// checked here instead.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<HeapLimitState>();
+    assert_send_sync::<ActorRuntimeState>();
+    assert_send_sync::<ModuleRegistry>();
+};
+
+/// A request must be able to carry its own context across a suspension. A
+/// compile-time check, because losing it would surface as an unrelated
+/// `Send` error wherever the request task is spawned.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Arc<IoContext>>();
+};
+
+thread_local! {
+    /// The request whose turn is running on this thread, or none between
+    /// turns. Never set by JS.
+    static CURRENT: RefCell<Option<Arc<IoContext>>> =
+        const { RefCell::new(None) };
+}
+
+/// Install `context` for the duration of a turn, restoring whatever was
+/// current when the guard drops.
+///
+/// Restoring rather than clearing is what makes nested host dispatch safe: a
+/// service binding runs a second handler inside the first one's turn, and the
+/// outer request must still be current when it returns.
+pub struct CurrentGuard(Option<Arc<IoContext>>);
+
+impl CurrentGuard {
+    pub fn enter(context: Arc<IoContext>) -> Self {
+        CurrentGuard(CURRENT.with(|current| current.borrow_mut().replace(context)))
+    }
+}
+
+impl Drop for CurrentGuard {
+    fn drop(&mut self) {
+        CURRENT.with(|current| *current.borrow_mut() = self.0.take());
+    }
+}
+
+/// The context this turn belongs to.
+///
+/// A thread that has not had one installed gets a default: every path that
+/// runs JS without an explicit request context — a cell isolate, which the
+/// DO contract already serializes, an RPC entry, a DO constructor — keeps
+/// exactly the semantics it had when the stack lived in JS, one per isolate.
+/// Isolation is a property of *installing* a context, so it arrives with the
+/// paths that need it rather than being retrofitted to every caller at once.
+fn current_context() -> Arc<IoContext> {
+    CURRENT.with(|current| {
+        let mut current = current.borrow_mut();
+        current.get_or_insert_with(IoContext::new).clone()
+    })
+}
+
+fn op_event_begin(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let _ = scope;
+    current_context().begin_event();
+}
+
+/// Pop the innermost event and return the aggregate of its `waitUntil`
+/// promises, or null when it collected none. The aggregate is built here
+/// rather than in JS because the promises live here: the host holds them for
+/// the request, and the request is what the frame belongs to.
+fn op_event_end<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let Some(frame) = current_context().end_event() else {
+        rv.set_null();
+        return;
+    };
+    if frame.is_empty() {
+        rv.set_null();
+        return;
+    }
+    let promises: Vec<v8::Local<v8::Value>> = frame
+        .iter()
+        .map(|promise| v8::Local::new(scope, promise).into())
+        .collect();
+    let array = v8::Array::new_with_elements(scope, &promises);
+    match all_settled(scope, array.into()) {
+        Some(aggregate) => rv.set(aggregate),
+        None => rv.set_null(),
+    }
+}
+
+fn op_wait_until<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let value = args.get(0);
+    let promise = match value.try_cast::<v8::Promise>() {
+        Ok(promise) => promise,
+        Err(_) => match resolved_promise(scope, value) {
+            Ok(promise) => promise,
+            Err(_) => return,
+        },
+    };
+    current_context().register_wait_until(v8::Global::new(scope, promise));
+}
+
+/// How many events are open on the current request. The harness uses it for
+/// workerd's global-scope error, which fires when `waitUntil` is imported and
+/// called with no event in progress.
+fn op_event_depth(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let depth = current_context().depth();
+    rv.set(v8::Integer::new(scope, depth as i32).into());
+}
+
+/// `Promise.allSettled(values)`, from the context's own realm.
+fn all_settled<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    values: v8::Local<'s, v8::Value>,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let global = scope.get_current_context().global(scope);
+    let key = v8::String::new(scope, "Promise").unwrap();
+    let promise_ctor: v8::Local<v8::Object> = global.get(scope, key.into())?.try_into().ok()?;
+    let key = v8::String::new(scope, "allSettled").unwrap();
+    let all_settled: v8::Local<v8::Function> =
+        promise_ctor.get(scope, key.into())?.try_into().ok()?;
+    all_settled.call(scope, promise_ctor.into(), &[values])
+}
+
 fn op_als_get(
     scope: &mut v8::PinScope,
     _args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
-    rv.set(scope.get_continuation_preserved_embedder_data());
+    rv.set(cped_frame(scope));
 }
 
 fn op_als_set(
@@ -6272,7 +5208,8 @@ fn op_als_set(
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue<v8::Value>,
 ) {
-    scope.set_continuation_preserved_embedder_data(args.get(0));
+    let trace = cped_trace(scope);
+    set_cped(scope, args.get(0), trace);
 }
 
 // node:util prelude calls these; registration is the sole per-isolate cost.
@@ -6449,12 +5386,17 @@ fn op_btoa(
 // mid-stream decoder is abandoned. Ids are never reused, so a late
 // finalizer free of an already-closed id is a no-op.
 
-thread_local! {
-    static TEXT_DECODERS: std::cell::RefCell<
-        std::collections::HashMap<u64, encoding_rs::Decoder>> =
-            Default::default();
-    static TEXT_DECODER_NEXT: std::cell::Cell<u64> =
-        const { std::cell::Cell::new(1) };
+/// Live streaming decoders, keyed by an id JS holds across awaits.
+///
+/// Process-wide for the same reason as [`zlib_streams`]: a `TextDecoder` in
+/// streaming mode outlives the turn that made it, and under D1 the next turn
+/// can run on a different tokio worker. A per-thread counter would also hand
+/// the same id to two requests.
+static TEXT_DECODERS: OnceLock<Mutex<HashMap<u64, encoding_rs::Decoder>>> = OnceLock::new();
+static TEXT_DECODER_NEXT: AtomicU64 = AtomicU64::new(1);
+
+fn text_decoders() -> &'static Mutex<HashMap<u64, encoding_rs::Decoder>> {
+    TEXT_DECODERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// `$$textDecoderLabel(label)` -> canonical lowercase name, or undefined
@@ -6485,12 +5427,8 @@ fn op_text_decoder_new(
     } else {
         enc.new_decoder_with_bom_removal()
     };
-    let id = TEXT_DECODER_NEXT.with(|next| {
-        let id = next.get();
-        next.set(id + 1);
-        id
-    });
-    TEXT_DECODERS.with(|table| table.borrow_mut().insert(id, dec));
+    let id = TEXT_DECODER_NEXT.fetch_add(1, Ordering::Relaxed);
+    text_decoders().lock().unwrap().insert(id, dec);
     rv.set(v8::Number::new(scope, id as f64).into());
 }
 
@@ -6514,8 +5452,10 @@ fn op_text_decoder_decode(
         rv.set(v8::String::empty(scope).into());
         return;
     }
-    let mut dec = TEXT_DECODERS
-        .with(|table| table.borrow_mut().remove(&id))
+    let mut dec = text_decoders()
+        .lock()
+        .unwrap()
+        .remove(&id)
         .expect("JS holds the only live id");
     let mut out = String::new();
     let ok = if fatal {
@@ -6540,7 +5480,7 @@ fn op_text_decoder_decode(
         return;
     }
     if !last {
-        TEXT_DECODERS.with(|table| table.borrow_mut().insert(id, dec));
+        text_decoders().lock().unwrap().insert(id, dec);
     }
     rv.set(v8::String::new(scope, &out).unwrap().into());
 }
@@ -6553,1084 +5493,24 @@ fn op_text_decoder_free(
     _rv: v8::ReturnValue<v8::Value>,
 ) {
     let id = args.get(0).integer_value(scope).unwrap_or(0) as u64;
-    TEXT_DECODERS.with(|table| table.borrow_mut().remove(&id));
+    text_decoders().lock().unwrap().remove(&id);
 }
 
 // ---- the JS harness: Web API + the DO object model ----
 
-/// Per-process compiled-bytecode cache for the fixed bootstrap scripts.
-/// Every cell wake pays a fresh isolate, and without this each one re-parses
-/// and re-compiles the same ~23k lines of prelude + harness — the single
-/// largest slice of hibernated-wake latency. The first isolate compiles
-/// eagerly and publishes the cache; every later isolate consumes it and only
-/// executes.
-type BootstrapCache = std::collections::HashMap<&'static str, std::sync::Arc<Vec<u8>>>;
-
-fn bootstrap_code_cache() -> &'static std::sync::Mutex<BootstrapCache> {
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<BootstrapCache>> =
-        std::sync::OnceLock::new();
-    CACHE.get_or_init(Default::default)
-}
-
-fn run_bootstrap_script(scope: &mut v8::PinScope, name: &'static str, src: &str) -> Result<()> {
-    use v8::script_compiler::CompileOptions;
-    use v8::script_compiler::NoCacheReason;
-    let code = v8::String::new(scope, src).unwrap();
-    let cached = bootstrap_code_cache().lock().unwrap().get(name).cloned();
-    let unbound = match cached {
-        // `CachedData` borrows `bytes`; the Arc binding outlives the Source.
-        Some(bytes) => {
-            let data = v8::script_compiler::CachedData::new(&bytes);
-            let mut source = v8::script_compiler::Source::new_with_cached_data(code, None, data);
-            let unbound = v8::script_compiler::compile_unbound_script(
-                scope,
-                &mut source,
-                CompileOptions::ConsumeCodeCache,
-                NoCacheReason::NoReason,
-            )
-            .ok_or_else(|| anyhow!("bootstrap compile {name}"))?;
-            debug_assert!(
-                !source.get_cached_data().is_some_and(|data| data.rejected()),
-                "code cache rejected for {name}"
-            );
-            unbound
-        }
-        None => {
-            let mut source = v8::script_compiler::Source::new(code, None);
-            // Eager: a lazily-compiled cache would push function-body compile
-            // cost back into every consumer's first request.
-            let unbound = v8::script_compiler::compile_unbound_script(
-                scope,
-                &mut source,
-                CompileOptions::EagerCompile,
-                NoCacheReason::NoReason,
-            )
-            .ok_or_else(|| anyhow!("bootstrap compile {name}"))?;
-            if let Some(data) = unbound.create_code_cache() {
-                bootstrap_code_cache()
-                    .lock()
-                    .unwrap()
-                    .insert(name, std::sync::Arc::new(data.to_vec()));
-            }
-            unbound
-        }
-    };
-    unbound
-        .bind_to_current_context(scope)
-        .run(scope)
-        .ok_or_else(|| anyhow!("bootstrap run {name}"))?;
-    Ok(())
-}
-
-/// WPT-conformant Web APIs: TextEncoder, URL/URLSearchParams, atob/btoa, and
-/// Headers. Run once per isolate before the Cells/Cloudflare-specific harness.
-fn install_prelude(scope: &mut v8::PinScope) -> Result<()> {
-    const PRELUDE: &[(&str, &str)] = &[
-        ("text_encoding.js", include_str!("js/text_encoding.js")),
-        (
-            "url_search_params.js",
-            include_str!("js/url_search_params.js"),
-        ),
-        ("url.js", include_str!("js/url.js")),
-        ("atob_btoa.js", include_str!("js/atob_btoa.js")),
-        ("headers.js", include_str!("js/headers.js")),
-        ("streams.js", include_str!("js/streams.js")),
-        ("writable_stream.js", include_str!("js/writable_stream.js")),
-        (
-            "text_encoding_streams.js",
-            include_str!("js/text_encoding_streams.js"),
-        ),
-    ];
-    for (name, src) in PRELUDE {
-        run_bootstrap_script(scope, name, src)?;
-    }
-    Ok(())
-}
-
-fn install_harness(scope: &mut v8::PinScope) -> Result<()> {
-    run_bootstrap_script(scope, "harness.js", include_str!("js/harness.js"))?;
-    run_bootstrap_script(scope, "crypto.js", include_str!("js/crypto.js"))
-}
-
-fn register_class(scope: &mut v8::PinScope, name: &str, cls: v8::Local<v8::Value>) -> Result<()> {
-    let ctx = scope.get_current_context();
-    let global = ctx.global(scope);
-    let ck = v8::String::new(scope, "__cell").unwrap();
-    let cell = global
-        .get(scope, ck.into())
-        .unwrap()
-        .to_object(scope)
-        .unwrap();
-    let clk = v8::String::new(scope, "classes").unwrap();
-    let classes = cell
-        .get(scope, clk.into())
-        .unwrap()
-        .to_object(scope)
-        .unwrap();
-    let nk = v8::String::new(scope, name).unwrap();
-    classes.set(scope, nk.into(), cls);
-    Ok(())
-}
-
-/// Populate `cloudflare:workers` `exports` with the worker module's own exports:
-/// a Durable Object class is exposed as its namespace (idFromName/get/RPC), any
-/// other export by value. `default` is omitted (it is the fetch entrypoint, not
-/// an importable export). Mirrors Workerd's `import { exports }` surface.
-fn populate_cf_exports(
-    scope: &mut v8::PinScope,
-    ns: v8::Local<v8::Object>,
-    do_classes: &[String],
-) -> Result<()> {
-    let context = scope.get_current_context();
-    let global = context.global(scope);
-    let cf = global
-        .get(scope, v8::String::new(scope, "__cf").unwrap().into())
-        .and_then(|value| value.to_object(scope))
-        .ok_or_else(|| anyhow!("missing __cf runtime state"))?;
-    let exports = cf
-        .get(scope, v8::String::new(scope, "exports").unwrap().into())
-        .and_then(|value| value.to_object(scope))
-        .ok_or_else(|| anyhow!("missing __cf.exports"))?;
-    let cell = global
-        .get(scope, v8::String::new(scope, "__cell").unwrap().into())
-        .and_then(|value| value.to_object(scope))
-        .ok_or_else(|| anyhow!("missing __cell runtime state"))?;
-    let make_ns: v8::Local<v8::Function> = cell
-        .get(
-            scope,
-            v8::String::new(scope, "makeNamespace").unwrap().into(),
-        )
-        .and_then(|value| value.try_into().ok())
-        .ok_or_else(|| anyhow!("missing __cell.makeNamespace"))?;
-    let do_set: std::collections::HashSet<&str> = do_classes.iter().map(String::as_str).collect();
-    let names = ns
-        .get_own_property_names(scope, Default::default())
-        .ok_or_else(|| anyhow!("no module export names"))?;
-    for index in 0..names.length() {
-        let name_value = names.get_index(scope, index).unwrap();
-        let name = name_value.to_rust_string_lossy(scope);
-        if name == "default" {
-            continue;
-        }
-        let export_value = if do_set.contains(name.as_str()) {
-            let arg = v8::String::new(scope, &name).unwrap().into();
-            make_ns
-                .call(scope, cell.into(), &[arg])
-                .ok_or_else(|| anyhow!("makeNamespace({name}) failed"))?
-        } else {
-            ns.get(scope, name_value)
-                .ok_or_else(|| anyhow!("export {name}"))?
-        };
-        let key = v8::String::new(scope, &name).unwrap();
-        exports.set(scope, key.into(), export_value);
-    }
-    Ok(())
-}
-
-fn inject_namespace_keys(
-    scope: &mut v8::PinScope,
-    script_name: &str,
-    do_classes: &[String],
-) -> Result<()> {
-    let context = scope.get_current_context();
-    let global = context.global(scope);
-    let cell_key = v8::String::new(scope, "__cell").unwrap();
-    let cell = global
-        .get(scope, cell_key.into())
-        .and_then(|value| value.to_object(scope))
-        .ok_or_else(|| anyhow!("missing __cell runtime state"))?;
-    let keys_key = v8::String::new(scope, "namespaceKeys").unwrap();
-    let keys = cell
-        .get(scope, keys_key.into())
-        .and_then(|value| value.to_object(scope))
-        .ok_or_else(|| anyhow!("missing Durable Object namespace registry"))?;
-    let script_key = v8::String::new(scope, "script").unwrap();
-    let script_value = v8::String::new(scope, script_name).unwrap();
-    cell.set(scope, script_key.into(), script_value.into());
-    for class_name in do_classes {
-        let class_key = v8::String::new(scope, class_name).unwrap();
-        let namespace_key = format!("cells:v1:{}:{script_name}:{class_name}", script_name.len(),);
-        let namespace_key = v8::String::new(scope, &namespace_key).unwrap();
-        if !keys
-            .set(scope, class_key.into(), namespace_key.into())
-            .unwrap_or(false)
-        {
-            anyhow::bail!("could not register namespace key for {class_name}");
-        }
-    }
-    Ok(())
-}
-
-/// `globalThis.Cloudflare.compatibilityFlags`. Only flags Cells actually
-/// honours are listed; a flag Cells does not model is absent (falsy) rather
-/// than reported as enabled.
-///
-/// Built through the V8 object API rather than by compiling a snippet: this
-/// runs on every isolate load, and a separate `Script::compile` there cost
-/// ~100us per worker.
-fn inject_compatibility_flags(scope: &mut v8::PinScope, compat: Compat) -> Result<()> {
-    let context = scope.get_current_context();
-    let global = context.global(scope);
-    let flags = v8::Object::new(scope);
-    let set_flag = |scope: &mut v8::PinScope, name: &str, value: bool| {
-        let key = v8::String::new(scope, name).unwrap();
-        let value = v8::Boolean::new(scope, value);
-        flags.set(scope, key.into(), value.into());
-    };
-    set_flag(scope, "upper_case_all_http_methods", true);
-    // Cells' async stream/pipe methods return rejected promises
-    // rather than throwing synchronously, which is exactly the
-    // behavior this flag names.
-    set_flag(scope, "capture_async_api_throws", true);
-    set_flag(
-        scope,
-        "delete_all_deletes_alarm",
-        compat.delete_all_deletes_alarm,
-    );
-    set_flag(scope, "js_rpc", compat.js_rpc);
-    set_flag(
-        scope,
-        "fetcher_no_get_put_delete",
-        !compat.fetcher_get_put_delete,
-    );
-    let cloudflare = v8::Object::new(scope);
-    let key = v8::String::new(scope, "compatibilityFlags").unwrap();
-    cloudflare.set(scope, key.into(), flags.into());
-    let key = v8::String::new(scope, "Cloudflare").unwrap();
-    global.set(scope, key.into(), cloudflare.into());
-    Ok(())
-}
-
-fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Result<()> {
-    let script_name = config.script_name.as_str();
-    let bindings = config.bindings.as_slice();
-    let r2_bindings = config.r2_bindings.as_slice();
-    let ai_binding = config.ai_binding.as_deref();
-    let vars = config.vars.as_slice();
-    let services = config.services.as_slice();
-    let asset_binding = config.asset_binding.as_deref();
-    // call the harness: for each binding, env[bindingName] = makeNamespace(className)
-    let src = {
-        let mut lines = String::from("(() => { const e = __cell.env;\n");
-        for (bname, cname) in bindings {
-            lines.push_str(&format!(
-                "e[{:?}] = __cell.makeNamespace({:?});\n",
-                bname, cname
-            ));
-        }
-        for name in r2_bindings {
-            lines.push_str(&format!("e[{:?}] = __makeR2Bucket({:?});\n", name, name));
-        }
-        if let (Some(name), Ok(url)) = (ai_binding, std::env::var("CELLD_AI_URL")) {
-            lines.push_str(&format!("e[{:?}] = __makeAiBinding({:?});\n", name, url));
-        }
-        for (binding, script, entrypoint) in services {
-            let entrypoint = match entrypoint {
-                Some(name) => format!("{name:?}"),
-                None => "null".to_string(),
-            };
-            lines.push_str(&format!(
-                "e[{:?}] = __makeServiceBinding({:?}, {});\n",
-                binding, script, entrypoint
-            ));
-        }
-        for (name, value) in vars {
-            lines.push_str(&format!("e[{:?}] = {:?};\n", name, value));
-        }
-        if let Some(name) = asset_binding {
-            lines.push_str(&format!(
-                "e[{:?}] = __makeAssetsBinding({:?});\n",
-                name, script_name
-            ));
-        }
-        if let Some(name) = config.loader_binding.as_deref() {
-            lines.push_str(&format!("e[{:?}] = __makeLoader();\n", name));
-        }
-        // A loaded worker's caller-supplied `env` (plain JSON values only in
-        // the walking skeleton) merges last, over the declared bindings.
-        if let Some(env) = config.loader_env.as_deref() {
-            lines.push_str(&format!("Object.assign(e, {});\n", env));
-        }
-        lines.push_str("})();");
-        lines
-    };
-    let code = v8::String::new(scope, &src).unwrap();
-    let s = v8::Script::compile(scope, code, None).ok_or_else(|| anyhow!("env compile"))?;
-    s.run(scope).ok_or_else(|| anyhow!("env run"))?;
-    Ok(())
-}
-
-/// Record every exported class deriving from `WorkerEntrypoint` in
-/// `__cell.entrypoints`, so a service binding with `entrypoint = "Name"` can
-/// resolve it, and every export deriving from `DurableObject` in
-/// `__cell.doExports`, so misrouting a DO class as a stateless entrypoint is
-/// reported as such (Workerd getExportedHandler()). Runs once per load; the
-/// check is a prototype walk, not a call into user code.
-fn register_entrypoints(scope: &mut v8::PinScope, ns: v8::Local<v8::Object>) -> Result<()> {
-    let context = scope.get_current_context();
-    let global = context.global(scope);
-    let cell_key = v8::String::new(scope, "__cell").unwrap();
-    let cell = global
-        .get(scope, cell_key.into())
-        .and_then(|value| value.to_object(scope))
-        .ok_or_else(|| anyhow!("missing __cell runtime state"))?;
-    let key = v8::String::new(scope, "entrypoints").unwrap();
-    let entrypoints = cell
-        .get(scope, key.into())
-        .and_then(|value| value.to_object(scope))
-        .ok_or_else(|| anyhow!("missing entrypoint registry"))?;
-    let key = v8::String::new(scope, "objectEntrypoints").unwrap();
-    let object_entrypoints = cell
-        .get(scope, key.into())
-        .and_then(|value| value.to_object(scope))
-        .ok_or_else(|| anyhow!("missing object-entrypoint registry"))?;
-    let key = v8::String::new(scope, "doExports").unwrap();
-    let do_exports = cell
-        .get(scope, key.into())
-        .and_then(|value| value.to_object(scope))
-        .ok_or_else(|| anyhow!("missing doExports registry"))?;
-    let cf_key = v8::String::new(scope, "__cf").unwrap();
-    let cf = global
-        .get(scope, cf_key.into())
-        .and_then(|value| value.to_object(scope))
-        .ok_or_else(|| anyhow!("missing __cf"))?;
-    let key = v8::String::new(scope, "WorkerEntrypoint").unwrap();
-    let entrypoint_base = cf
-        .get(scope, key.into())
-        .ok_or_else(|| anyhow!("missing WorkerEntrypoint base"))?;
-    let key = v8::String::new(scope, "DurableObject").unwrap();
-    let durable_base = cf
-        .get(scope, key.into())
-        .ok_or_else(|| anyhow!("missing DurableObject base"))?;
-    let Some(names) = ns.get_own_property_names(scope, Default::default()) else {
-        return Ok(());
-    };
-    let yes = v8::Boolean::new(scope, true);
-    for index in 0..names.length() {
-        let Some(name) = names.get_index(scope, index) else {
-            continue;
-        };
-        let Some(value) = ns.get(scope, name) else {
-            continue;
-        };
-        if !value.is_function() {
-            // A plain-object export is Workerd's non-class entrypoint; its
-            // handler functions dispatch as fn(arg, env, ctx).
-            if value.is_object() {
-                object_entrypoints.set(scope, name, value);
-            }
-            continue;
-        }
-        // Walk the prototype chain rather than calling anything.
-        let mut proto = value.to_object(scope).and_then(|o| o.get_prototype(scope));
-        while let Some(current) = proto {
-            if current == entrypoint_base {
-                entrypoints.set(scope, name, value);
-                break;
-            }
-            if current == durable_base {
-                do_exports.set(scope, name, yes.into());
-                break;
-            }
-            proto = current
-                .to_object(scope)
-                .and_then(|o| o.get_prototype(scope));
-        }
-    }
-    Ok(())
-}
-
-/// Mark which cell scopes are local to this node and record the node id. Every
-/// other scope routes cross-node via `__do_call`.
-fn inject_routing(scope: &mut v8::PinScope, owned: &[String], node: &str) -> Result<()> {
-    let mut src = format!("(() => {{ __cell.node = {node:?};\n");
-    for s in owned {
-        src.push_str(&format!("__cell.owned[{s:?}] = true;\n"));
-    }
-    src.push_str("})();");
-    let code = v8::String::new(scope, &src).unwrap();
-    let s = v8::Script::compile(scope, code, None).ok_or_else(|| anyhow!("routing compile"))?;
-    s.run(scope).ok_or_else(|| anyhow!("routing run"))?;
-    Ok(())
-}
-
-fn inject_storage_compatibility(scope: &mut v8::PinScope, compat: Compat) -> Result<()> {
-    let source = format!(
-        "__cell.deleteAllDeletesAlarm = {};\n\
-         __cell.compat.jsRpc = {};\n\
-         __cell.compat.fetcherGetPutDelete = {};\n\
-         __cell.compat.websocketStandardBinaryType = {};",
-        compat.delete_all_deletes_alarm,
-        compat.js_rpc,
-        compat.fetcher_get_put_delete,
-        compat.websocket_standard_binary_type,
-    );
-    let code = v8::String::new(scope, &source).unwrap();
-    let script =
-        v8::Script::compile(scope, code, None).ok_or_else(|| anyhow!("compatibility compile"))?;
-    script
-        .run(scope)
-        .ok_or_else(|| anyhow!("compatibility run"))?;
-    Ok(())
-}
-
-fn harness_env<'s>(scope: &mut v8::PinScope<'s, '_>) -> Result<v8::Local<'s, v8::Value>> {
-    let ctx = scope.get_current_context();
-    let global = ctx.global(scope);
-    let ck = v8::String::new(scope, "__cell").unwrap();
-    let cell = global
-        .get(scope, ck.into())
-        .unwrap()
-        .to_object(scope)
-        .unwrap();
-    let ek = v8::String::new(scope, "env").unwrap();
-    Ok(cell.get(scope, ek.into()).unwrap())
-}
-
-fn begin_event_context<'s>(scope: &mut v8::PinScope<'s, '_>) -> Result<v8::Local<'s, v8::Value>> {
-    let global = scope.get_current_context().global(scope);
-    let key = v8::String::new(scope, "__beginEvent").unwrap();
-    let function: v8::Local<v8::Function> = global
-        .get(scope, key.into())
-        .ok_or_else(|| anyhow!("no __beginEvent"))?
-        .try_into()
-        .map_err(|_| anyhow!("__beginEvent is not a function"))?;
-    let recv = v8::undefined(scope).into();
-    function
-        .call(scope, recv, &[])
-        .ok_or_else(|| anyhow!("__beginEvent threw"))
-}
-
-fn end_event_context<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-) -> Result<Option<v8::Local<'s, v8::Promise>>> {
-    let global = scope.get_current_context().global(scope);
-    let key = v8::String::new(scope, "__endEvent").unwrap();
-    let function: v8::Local<v8::Function> = global
-        .get(scope, key.into())
-        .ok_or_else(|| anyhow!("no __endEvent"))?
-        .try_into()
-        .map_err(|_| anyhow!("__endEvent is not a function"))?;
-    let recv = v8::undefined(scope).into();
-    let value = function
-        .call(scope, recv, &[])
-        .ok_or_else(|| anyhow!("__endEvent threw"))?;
-    if value.is_null_or_undefined() {
-        Ok(None)
-    } else {
-        Ok(Some(value.try_into().map_err(|_| {
-            anyhow!("__endEvent did not return a promise")
-        })?))
-    }
-}
-
-// ---- module compilation + request/response marshalling ----
-
-fn compile_module<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    name: &str,
-    src: &str,
-) -> Option<v8::Local<'s, v8::Module>> {
-    let name = v8::String::new(scope, name)?;
-    let source = v8::String::new(scope, src)?;
-    let origin = v8::ScriptOrigin::new(
-        scope,
-        name.into(),
-        0,
-        0,
-        false,
-        0,
-        None,
-        false,
-        false,
-        true,
-        None,
-    );
-    let mut src = v8::script_compiler::Source::new(source, Some(&origin));
-    v8::script_compiler::compile_module(scope, &mut src)
-}
-
-thread_local! {
-    // specifier -> pre-compiled stub module, consulted by `resolve_external`
-    // while V8 statically links a real worker bundle's imports.
-    static MODREG: RefCell<HashMap<String, v8::Global<v8::Module>>> =
-        RefCell::new(HashMap::new());
-}
-
-/// Scan a bundle for its external (`cloudflare:*` / `node:*`) imports and the
-/// named/default bindings pulled from each. V8 static-links these, so a stub
-/// must provide exactly these names; namespace imports (`* as x`) need none.
-/// Is `spec` an external builtin (`node:*`, `cloudflare:*`, or a bare node
-/// builtin)? esbuild bundles every npm dep inline and leaves only builtins
-/// external, so a remaining bare specifier is a node builtin.
-fn is_external(spec: &str) -> bool {
-    const BARE: &[&str] = &[
-        "path",
-        "os",
-        "fs",
-        "fs/promises",
-        "crypto",
-        "stream",
-        "util",
-        "util/types",
-        "assert",
-        "module",
-        "process",
-        "tty",
-        "url",
-        "v8",
-        "constants",
-        "buffer",
-        "events",
-        "zlib",
-        "child_process",
-        "http",
-        "https",
-        "http2",
-        "net",
-        "tls",
-        "dns",
-        "readline",
-        "string_decoder",
-        "querystring",
-        "async_hooks",
-        "perf_hooks",
-        "worker_threads",
-        "vm",
-        "diagnostics_channel",
-        "timers",
-        "inspector",
-        "dgram",
-        "cluster",
-        "punycode",
-        "sqlite",
-    ];
-    if spec.starts_with("node:") || spec.starts_with("cloudflare:") {
-        return true;
-    }
-    // bare builtin, or a builtin submodule like `stream/promises`
-    BARE.contains(&spec) || BARE.contains(&spec.split('/').next().unwrap_or(""))
-}
-
-fn scan_external_imports(
-    src: &str,
-) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
-    let re = regex::Regex::new(r#"import\s+([^;]*?)\s*from\s*["']([^"']+)["']"#).unwrap();
-    let braces = regex::Regex::new(r"\{([^}]*)\}").unwrap();
-    let mut map: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
-        Default::default();
-    for cap in re.captures_iter(src) {
-        if !is_external(&cap[2]) {
-            continue;
-        }
-        let clause = cap[1].trim();
-        let set = map.entry(cap[2].to_string()).or_default();
-        if let Some(b) = braces.captures(clause) {
-            for part in b[1].split(',') {
-                let name = part.split_whitespace().next().unwrap_or("");
-                // A commented-out binding inside the braces is not a name.
-                if !name.is_empty() && !name.starts_with("//") {
-                    set.insert(name.to_string());
-                }
-            }
-        }
-        let head = clause
-            .split(['{', '*'])
-            .next()
-            .unwrap_or("")
-            .trim()
-            .trim_end_matches(',')
-            .trim();
-        if !head.is_empty() {
-            set.insert("default".into());
-        } // default import
-          // `import * as x` consumes the whole namespace; the stub must then
-          // export the module's full surface, not just the scanned names.
-        if clause.contains('*') {
-            set.insert("*".into());
-        }
-    }
-    map
-}
-
-/// A stub ES module for `spec`. `cloudflare:workers` binds the real DO base
-/// class from the harness; every other builtin routes to a pass-through proxy
-/// so evaluation never crashes on an unsupported node/cf API.
-/// A module Cells really implements in JS. Its source is injected into the
-/// generated stub module, and `register_stubs` only builds stubs for
-/// specifiers a bundle actually imports — so an isolate that never imports it
-/// pays nothing at load. `global` is what the source defines and doubles as
-/// the redefinition guard when a bundle imports several aliases.
-struct LazyModule {
-    specs: &'static [&'static str],
-    global: &'static str,
-    source: &'static str,
-}
-
-const LAZY_MODULES: &[LazyModule] = &[
-    LazyModule {
-        specs: &["assert", "node:assert"],
-        global: "__assertModule",
-        source: include_str!("js/node_assert.js"),
-    },
-    LazyModule {
-        specs: &["assert/strict", "node:assert/strict"],
-        global: "__assertStrictModule",
-        source: include_str!("js/node_assert.js"),
-    },
-    LazyModule {
-        specs: &["timers/promises", "node:timers/promises"],
-        global: "__timersPromises",
-        source: include_str!("js/node_timers.js"),
-    },
-    LazyModule {
-        specs: &["test", "node:test", "node:test/reporters"],
-        global: "__nodeTest",
-        source: include_str!("js/node_test.js"),
-    },
-    LazyModule {
-        specs: &["util", "node:util"],
-        global: "__utilModule",
-        source: include_str!("js/node_util.js"),
-    },
-    // Same source, different namespace: node:util/types has the type
-    // predicates as its named exports. The shared source defines both
-    // globals, so either entry's guard covers the other.
-    LazyModule {
-        specs: &["util/types", "node:util/types"],
-        global: "__utilTypesModule",
-        source: include_str!("js/node_util.js"),
-    },
-    LazyModule {
-        specs: &["events", "node:events"],
-        global: "__eventsModule",
-        source: include_str!("js/node_events.js"),
-    },
-    LazyModule {
-        specs: &["path", "node:path", "path/posix", "node:path/posix"],
-        global: "__pathModule",
-        source: include_str!("js/node_path.js"),
-    },
-    // Same source; either entry's guard covers the other.
-    LazyModule {
-        specs: &["path/win32", "node:path/win32"],
-        global: "__pathWin32Module",
-        source: include_str!("js/node_path.js"),
-    },
-    // Shares its source with the `Buffer` LAZY_GLOBALS entry; the script
-    // is self-guarded, so whichever seam runs first wins and the other
-    // reuses the same classes.
-    LazyModule {
-        specs: &["buffer", "node:buffer"],
-        global: "__buffer",
-        source: include_str!("js/node_buffer.js"),
-    },
-    LazyModule {
-        specs: &["crypto", "node:crypto"],
-        global: "__cryptoModule",
-        source: include_str!("js/node_crypto.js"),
-    },
-    LazyModule {
-        specs: &["async_hooks", "node:async_hooks"],
-        global: "__asyncHooksModule",
-        source: include_str!("js/node_async_hooks.js"),
-    },
-    // One source defines the whole stream family; whichever entry runs
-    // first, its guard covers the others.
-    LazyModule {
-        specs: &["stream", "node:stream"],
-        global: "__streamModule",
-        source: include_str!("js/node_stream.js"),
-    },
-    LazyModule {
-        specs: &["stream/promises", "node:stream/promises"],
-        global: "__streamPromises",
-        source: include_str!("js/node_stream.js"),
-    },
-    LazyModule {
-        specs: &["stream/web", "node:stream/web"],
-        global: "__streamWeb",
-        source: include_str!("js/node_stream.js"),
-    },
-    LazyModule {
-        specs: &["stream/consumers", "node:stream/consumers"],
-        global: "__streamConsumers",
-        source: include_str!("js/node_stream.js"),
-    },
-];
-
-/// A global whose definition only compiles when something reads the name.
-/// One script may define several names; touching any of them installs them
-/// all. A bundle that names none pays only the `SetLazyDataProperty` calls
-/// at boot, so this is where a new global belongs unless the prelude has to
-/// see it.
-struct LazyGlobal {
-    names: &'static [&'static str],
-    source: &'static str,
-}
-
-const LAZY_GLOBALS: &[LazyGlobal] = &[
-    LazyGlobal {
-        names: &["IdentityTransformStream", "FixedLengthStream"],
-        source: include_str!("js/identity_transform_stream.js"),
-    },
-    LazyGlobal {
-        names: &["CompressionStream", "DecompressionStream"],
-        source: include_str!("js/compression_streams.js"),
-    },
-    LazyGlobal {
-        names: &[
-            "ReadableByteStreamController",
-            "ReadableStreamBYOBReader",
-            "ReadableStreamBYOBRequest",
-        ],
-        source: include_str!("js/byte_streams.js"),
-    },
-    LazyGlobal {
-        names: &["Buffer"],
-        source: include_str!("js/node_buffer.js"),
-    },
-    LazyGlobal {
-        names: &["setImmediate", "clearImmediate"],
-        source: include_str!("js/set_immediate.js"),
-    },
-    LazyGlobal {
-        names: &["URLPattern"],
-        source: include_str!("js/url_pattern.js"),
-    },
-];
-
-/// Runs once per group, the first time one of its names is read. V8 then
-/// replaces the accessor with the returned value, so the script never
-/// compiles twice.
-fn lazy_global_getter(
-    scope: &mut v8::PinScope,
-    name: v8::Local<v8::Name>,
-    args: v8::PropertyCallbackArguments,
-    mut rv: v8::ReturnValue<v8::Value>,
-) {
-    let index = args.data().integer_value(scope).unwrap();
-    let group = &LAZY_GLOBALS[index as usize];
-    let code = v8::String::new(scope, group.source).unwrap();
-    let script = v8::Script::compile(scope, code, None).unwrap();
-    let exports = script.run(scope).unwrap();
-    let exports: v8::Local<v8::Object> = exports.try_into().unwrap();
-    // The group's other names are still lazy; define them now or reading one
-    // would compile the same script again. Not this one — V8 asserts the
-    // property is still an accessor when the getter returns.
-    let global = scope.get_current_context().global(scope);
-    for other in group.names {
-        let key = v8::String::new(scope, other).unwrap();
-        if name.strict_equals(key.into()) {
-            continue;
-        }
-        let value = exports.get(scope, key.into()).unwrap();
-        global.create_data_property(scope, key.into(), value);
-    }
-    rv.set(exports.get(scope, name.into()).unwrap());
-}
-
-fn install_lazy_globals(scope: &mut v8::PinScope) -> Result<()> {
-    let global = scope.get_current_context().global(scope);
-    for (i, group) in LAZY_GLOBALS.iter().enumerate() {
-        let data = v8::Integer::new(scope, i as i32);
-        for name in group.names {
-            let key = v8::String::new(scope, name).unwrap();
-            global.set_lazy_data_property_with_data(
-                scope,
-                key.into(),
-                lazy_global_getter,
-                data.into(),
-                v8::PropertyAttribute::NONE,
-                v8::SideEffectType::HasSideEffect,
-                v8::SideEffectType::HasSideEffect,
-            );
-        }
-    }
-    Ok(())
-}
-
-/// Globals already installed by the src/js/harness for partially supported
-/// builtins. These cost every isolate, so new modules belong in
-/// `LAZY_MODULES` instead.
-fn eager_module_global(spec: &str) -> Option<&'static str> {
-    Some(match spec {
-        "fs" | "node:fs" | "fs/promises" | "node:fs/promises" => "globalThis.__fs",
-        "zlib" | "node:zlib" => "globalThis.__zlibModule",
-        _ => return None,
-    })
-}
-
-fn stub_source(spec: &str, names: &std::collections::BTreeSet<String>) -> String {
-    let cf = spec == "cloudflare:workers";
-    let lazy = LAZY_MODULES.iter().find(|m| m.specs.contains(&spec));
-    let eager = eager_module_global(spec);
-    let base = if cf {
-        "globalThis.__cf".to_string()
-    } else if let Some(m) = lazy {
-        format!("globalThis.{}", m.global)
-    } else if let Some(global) = eager {
-        global.to_string()
-    } else {
-        "globalThis.__nodeStub".to_string()
-    };
-    let real = cf || lazy.is_some() || eager.is_some();
-    let mut out = String::new();
-    if let Some(m) = lazy {
-        out.push_str(&format!("if (!globalThis.{}) {{\n", m.global));
-        out.push_str(m.source);
-        out.push_str("}\n");
-    }
-    for n in names {
-        if n == "*" {
-            continue; // namespace imports take the full-surface path
-        } else if n == "default" {
-            out.push_str(&format!("export default {base};\n"));
-        } else if cf
-            && matches!(
-                n.as_str(),
-                "DurableObject" | "RpcTarget" | "WorkerEntrypoint" | "env" | "exports"
-            )
-        {
-            out.push_str(&format!("export const {n} = globalThis.__cf.{n};\n"));
-        } else if real {
-            out.push_str(&format!("export const {n} = {base}.{n};\n"));
-        } else {
-            out.push_str(&format!("export const {n} = globalThis.__nodeStub;\n"));
-        }
-    }
-    out
-}
-
-/// Compile one stub module per external specifier into MODREG. Run before
-/// instantiating a real bundle; `resolve_external` then serves them.
-fn register_stubs(scope: &mut v8::PinScope, src: &str, text: &[(String, String)]) {
-    MODREG.with(|r| r.borrow_mut().clear());
-    let reg = |spec: String, source: String, scope: &mut v8::PinScope| {
-        if let Some(m) = compile_module(scope, &spec, &source) {
-            MODREG.with(|r| r.borrow_mut().insert(spec, v8::Global::new(scope, m)));
-        } else {
-            tracing::warn!(%spec, "module stub failed to compile");
-        }
-    };
-    for (spec, names) in scan_external_imports(src) {
-        // `import * as x` binds the whole namespace, so the stub's exports
-        // must be the module's full surface — probed from the backing
-        // object, like dynamic import() — not just the scanned names.
-        let s = if names.contains("*") {
-            full_surface_source(scope, &spec, &names).unwrap_or_else(|| stub_source(&spec, &names))
-        } else {
-            stub_source(&spec, &names)
-        };
-        reg(spec, s, scope);
-    }
-    // sibling text modules (wrangler Text rule: `import md from './x.md'`)
-    for (spec, content) in text {
-        let s = format!(
-            "export default {};",
-            serde_json::to_string(content).unwrap()
-        );
-        reg(spec.clone(), s, scope);
-    }
-    tracing::debug!(
-        mods = MODREG.with(|r| r.borrow().len()),
-        "registered import stubs + text modules"
-    );
-}
-
-/// Register a loaded worker's sibling JS modules (Worker Loader multi-module
-/// bundles), in addition to the builtins `register_stubs` already added for the
-/// main module. Each module is registered under its own name and `./name` so
-/// both bare and relative sibling imports resolve; the whole graph links when
-/// the main module instantiates. Any builtin a sibling imports (and the main
-/// module did not) is stubbed too.
-fn register_loader_modules(scope: &mut v8::PinScope, modules: &[(String, String)]) {
-    for (_name, source) in modules {
-        for (spec, names) in scan_external_imports(source) {
-            if MODREG.with(|r| r.borrow().contains_key(&spec)) {
-                continue;
-            }
-            let s = if names.contains("*") {
-                full_surface_source(scope, &spec, &names)
-                    .unwrap_or_else(|| stub_source(&spec, &names))
-            } else {
-                stub_source(&spec, &names)
-            };
-            if let Some(m) = compile_module(scope, &spec, &s) {
-                MODREG.with(|r| r.borrow_mut().insert(spec, v8::Global::new(scope, m)));
-            }
-        }
-    }
-    for (name, source) in modules {
-        let Some(m) = compile_module(scope, name, source) else {
-            tracing::warn!(%name, "loader module failed to compile");
-            continue;
-        };
-        let g = v8::Global::new(scope, m);
-        MODREG.with(|r| {
-            let mut reg = r.borrow_mut();
-            reg.insert(name.clone(), g.clone());
-            reg.insert(format!("./{name}"), g);
-        });
-    }
-}
-
-/// Module resolve callback: serve a registered stub for `cloudflare:*`/`node:*`.
-/// celld bundles are single-file, so anything else is genuinely unresolvable.
-fn resolve_external<'s>(
-    context: v8::Local<'s, v8::Context>,
-    specifier: v8::Local<'s, v8::String>,
-    _a: v8::Local<'s, v8::FixedArray>,
-    _r: v8::Local<'s, v8::Module>,
-) -> Option<v8::Local<'s, v8::Module>> {
-    v8::callback_scope!(unsafe scope, context);
-    let spec = specifier.to_rust_string_lossy(scope);
-    let m = MODREG.with(|r| r.borrow().get(&spec).map(|g| v8::Local::new(scope, g)));
-    if m.is_none() {
-        tracing::warn!(%spec, "resolve: no stub for specifier");
-    }
-    m
-}
-
-/// The (guarded setup script, backing-object expression) pair for a builtin
-/// specifier, or None if `spec` is not one. The setup materializes a lazy
-/// module's source at most once; the expression then names its global.
-fn builtin_source(spec: &str) -> Option<(String, String)> {
-    if spec == "cloudflare:workers" {
-        return Some((String::new(), "globalThis.__cf".into()));
-    }
-    if let Some(m) = LAZY_MODULES.iter().find(|m| m.specs.contains(&spec)) {
-        return Some((
-            format!("if (!globalThis.{}) {{\n{}}}\n", m.global, m.source),
-            format!("globalThis.{}", m.global),
-        ));
-    }
-    if let Some(global) = eager_module_global(spec) {
-        return Some((String::new(), global.to_string()));
-    }
-    is_external(spec).then(|| (String::new(), "globalThis.__nodeStub".to_string()))
-}
-
-/// Full-surface module source for a builtin: run the (guarded) setup, probe
-/// the backing object's enumerable keys, and re-export each one. Serves both
-/// `import * as x` stubs and dynamic import(). `extra` adds statically
-/// scanned names the probe may have missed, so mixed named + namespace
-/// imports still link. String export names sidestep identifier restrictions.
-fn full_surface_source(
-    scope: &mut v8::PinScope,
-    spec: &str,
-    extra: &std::collections::BTreeSet<String>,
-) -> Option<String> {
-    let (setup, expr) = builtin_source(spec)?;
-    let probe = format!("{setup}JSON.stringify(Object.keys(Object({expr})))");
-    let code = v8::String::new(scope, &probe)?;
-    let script = v8::Script::compile(scope, code, None)?;
-    let keys = script.run(scope)?.to_rust_string_lossy(scope);
-    let mut names: Vec<String> = serde_json::from_str(&keys).unwrap_or_default();
-    for name in extra {
-        if name != "*" && !names.contains(name) {
-            names.push(name.clone());
-        }
-    }
-    let mut src = format!("const __b = {expr};\nexport default __b;\n");
-    for (i, name) in names.iter().enumerate() {
-        if name == "default" {
-            continue;
-        }
-        let name = serde_json::to_string(name).unwrap();
-        src.push_str(&format!(
-            "const __e{i} = __b[{name}]; export {{ __e{i} as {name} }};\n"
-        ));
-    }
-    Some(src)
-}
-
-/// `process.getBuiltinModule(id)`: the builtin's backing object, or
-/// undefined for anything that is not a node builtin.
-fn op_builtin_module(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    mut rv: v8::ReturnValue<v8::Value>,
-) {
-    let spec = args.get(0).to_rust_string_lossy(scope);
-    if spec.starts_with("cloudflare:") {
-        return; // not a node builtin
-    }
-    let Some((setup, expr)) = builtin_source(&spec) else {
-        return;
-    };
-    let code = v8::String::new(scope, &format!("{setup}{expr}")).unwrap();
-    if let Some(script) = v8::Script::compile(scope, code, None) {
-        if let Some(value) = script.run(scope) {
-            rv.set(value);
-        }
-    }
-}
-
-/// Evaluate (once per isolate) a full-namespace module for a builtin
-/// specifier. Unlike the static stubs, whose exports are the statically
-/// scanned import names, this re-exports every enumerable key of the
-/// backing object — a dynamic import's consumer can reach for any of them.
-/// Cached in MODREG under a `dyn:` key so later import() calls are a
-/// table lookup.
-fn dynamic_namespace<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    spec: &str,
-) -> Result<v8::Local<'s, v8::Value>> {
-    let key = format!("dyn:{spec}");
-    let cached = MODREG.with(|r| r.borrow().get(&key).map(|g| v8::Local::new(scope, g)));
-    if let Some(module) = cached {
-        return Ok(module.get_module_namespace());
-    }
-    let src = full_surface_source(scope, spec, &Default::default())
-        .ok_or_else(|| anyhow!("dynamic import of \"{spec}\" is not supported"))?;
-    let module = compile_module(scope, spec, &src)
-        .ok_or_else(|| anyhow!("dynamic module for {spec} did not compile"))?;
-    module
-        .instantiate_module(scope, resolve_external)
-        .ok_or_else(|| anyhow!("dynamic module for {spec} did not link"))?;
-    module
-        .evaluate(scope)
-        .ok_or_else(|| anyhow!("dynamic module for {spec} threw"))?;
-    if module.get_status() != v8::ModuleStatus::Evaluated {
-        return Err(anyhow!("dynamic module for {spec} failed to evaluate"));
-    }
-    MODREG.with(|r| r.borrow_mut().insert(key, v8::Global::new(scope, module)));
-    Ok(module.get_module_namespace())
-}
-
-/// Dynamic `import()` host hook. Builtin specifiers resolve through the same
-/// table static imports use; anything else rejects — celld bundles are
-/// single-file, so there is nothing else to load.
-fn host_import_module_dynamically<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    _host_defined_options: v8::Local<'s, v8::Data>,
-    _resource_name: v8::Local<'s, v8::Value>,
-    specifier: v8::Local<'s, v8::String>,
-    _import_attributes: v8::Local<'s, v8::FixedArray>,
-) -> Option<v8::Local<'s, v8::Promise>> {
-    let resolver = v8::PromiseResolver::new(scope)?;
-    let promise = resolver.get_promise(scope);
-    let spec = specifier.to_rust_string_lossy(scope);
-    let tc = std::pin::pin!(v8::TryCatch::new(scope));
-    let tc = &mut tc.init();
-    match dynamic_namespace(tc, &spec) {
-        Ok(namespace) => {
-            resolver.resolve(tc, namespace);
-        }
-        Err(error) => {
-            let caught = tc.exception();
-            tc.reset();
-            let exception = caught.unwrap_or_else(|| {
-                let message = v8::String::new(tc, &error.to_string()).unwrap();
-                v8::Exception::error(tc, message)
-            });
-            resolver.reject(tc, exception);
-        }
-    }
-    Some(promise)
-}
-
+mod bootstrap;
+mod modules;
+use bootstrap::{
+    adopt_cell, begin_event_context, build_env, end_event_context, harness_env,
+    inject_compatibility_flags, inject_namespace_keys, inject_routing,
+    inject_storage_compatibility, install_harness, install_prelude, populate_cf_exports,
+    register_class, register_entrypoints,
+};
+use modules::{
+    compile_module, host_import_module_dynamically, install_lazy_globals, op_builtin_module,
+    register_loader_modules, register_stubs, register_wasm_modules, resolve_external,
+    ModuleRegistry,
+};
 /// Like `make_request`, but marks the request as incoming. Its signal is
 /// registered only if the handler actually suspends, preserving the
 /// synchronous request path.
@@ -7714,11 +5594,7 @@ fn make_request<'s>(
         .ok_or_else(|| anyhow!("makeRequest threw"))
 }
 
-fn read_response(
-    scope: &mut v8::PinScope,
-    ret: v8::Local<v8::Value>,
-    cell_rx: Option<&std::sync::mpsc::Receiver<CellJob>>,
-) -> Result<HttpResponse> {
+fn read_response(scope: &mut v8::PinScope, ret: v8::Local<v8::Value>) -> Result<HttpResponse> {
     let ctx = scope.get_current_context();
     let global = ctx.global(scope);
     let key = v8::String::new(scope, "__readResponse").unwrap();
@@ -7731,11 +5607,12 @@ fn read_response(
     let out = f
         .call(scope, recv, &[ret])
         .ok_or_else(|| anyhow!("readResponse threw"))?;
-    let out = if let Ok(promise) = out.try_cast::<v8::Promise>() {
-        run_loop(scope, promise, cell_rx)?
-    } else {
-        out
-    };
+    // The harness response reader is synchronous. Keeping this assertion at
+    // the native boundary prevents a future harness change from quietly
+    // reintroducing a nested async runtime while an isolate is entered.
+    if out.is_promise() {
+        return Err(anyhow!("__readResponse returned a promise"));
+    }
     let out = out.to_object(scope).ok_or_else(|| anyhow!("not object"))?;
     let sk = v8::String::new(scope, "status").unwrap();
     let bk = v8::String::new(scope, "bodyBytes").unwrap();
@@ -7817,4 +5694,9 @@ mod conformance_runtime_tests {
 #[cfg(all(test, celld_internal_tests))]
 mod conformance_web_platform_tests {
     include!(env!("CELLD_CONFORMANCE_WEB_PLATFORM_TESTS"));
+}
+
+#[cfg(all(test, celld_internal_tests))]
+mod call_order_private {
+    include!(env!("CELLD_CONFORMANCE_CALL_ORDER_TESTS"));
 }

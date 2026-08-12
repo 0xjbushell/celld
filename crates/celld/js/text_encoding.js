@@ -62,7 +62,12 @@
                 }
                 i += c > 0xffff ? 2 : 1;
             }
-            return buf.subarray(0, w);
+            // `slice`, not `subarray`: the scratch buffer is 4x the input
+            // length, and a subarray would hand the caller a view onto it.
+            // `encode(s).buffer` is a common idiom -- into crypto.subtle,
+            // into a Blob -- and with a shared buffer it carries up to 3x
+            // the bytes of trailing garbage.
+            return buf.slice(0, w);
         }
         encodeInto(source, destination) {
             if (!(destination instanceof Uint8Array))

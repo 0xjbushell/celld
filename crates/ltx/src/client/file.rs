@@ -24,25 +24,11 @@ impl FileReplicaClient {
     pub fn new(path: impl Into<String>) -> Self {
         FileReplicaClient { path: path.into() }
     }
-
-    /// The replica destination path.
-    pub fn path(&self) -> &str {
-        &self.path
-    }
 }
 
 #[async_trait]
 impl ReplicaClient for FileReplicaClient {
-    fn type_name(&self) -> &str {
-        "file"
-    }
-
-    async fn ltx_files(
-        &self,
-        level: i32,
-        seek: TXID,
-        _use_metadata: bool,
-    ) -> Result<Vec<FileInfo>> {
+    async fn ltx_files(&self, level: i32, seek: TXID) -> Result<Vec<FileInfo>> {
         let dir = ltx_level_dir(&self.path, level as u32);
         let mut rd = match tokio::fs::read_dir(&dir).await {
             Ok(rd) => rd,
@@ -80,29 +66,10 @@ impl ReplicaClient for FileReplicaClient {
         Ok(infos)
     }
 
-    async fn open_ltx_file(
-        &self,
-        level: i32,
-        min_txid: TXID,
-        max_txid: TXID,
-        offset: i64,
-        size: i64,
-    ) -> Result<Vec<u8>> {
+    async fn open_ltx_file(&self, level: i32, min_txid: TXID, max_txid: TXID) -> Result<Vec<u8>> {
         let path = ltx_file_path(&self.path, level as u32, min_txid, max_txid);
         // NotFound is preserved so callers can classify auto-recoverable errors.
-        let bytes = tokio::fs::read(&path).await.map_err(Error::Io)?;
-
-        let off = offset.max(0) as usize;
-        if off >= bytes.len() {
-            return Ok(Vec::new());
-        }
-        // size == 0 means "read to end of file" (NOT zero bytes).
-        let end = if size <= 0 {
-            bytes.len()
-        } else {
-            (off + size as usize).min(bytes.len())
-        };
-        Ok(bytes[off..end].to_vec())
+        tokio::fs::read(&path).await.map_err(Error::Io)
     }
 
     async fn write_ltx_file(
@@ -181,11 +148,6 @@ mod tests {
         run_client_suite(&client).await;
     }
 
-    #[test]
-    fn type_name_is_file() {
-        assert_eq!(FileReplicaClient::new("/x").type_name(), "file");
-    }
-
     // The file client reads the real golden replica tree (captured from the
     // litestream binary): 6 L0 files, in order, each decoding byte-exact.
     #[tokio::test]
@@ -193,27 +155,19 @@ mod tests {
         let root = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/golden/replica");
         let client = FileReplicaClient::new(root);
 
-        let files = client.ltx_files(0, TXID(0), false).await.unwrap();
+        let files = client.ltx_files(0, TXID(0)).await.unwrap();
         assert_eq!(files.len(), 6, "golden L0 file count");
         let order: Vec<u64> = files.iter().map(|f| f.min_txid.0).collect();
         assert_eq!(order, vec![1, 2, 3, 4, 5, 6], "ascending by txid");
 
         for f in &files {
             let bytes = client
-                .open_ltx_file(0, f.min_txid, f.max_txid, 0, 0)
+                .open_ltx_file(0, f.min_txid, f.max_txid)
                 .await
                 .unwrap();
             assert_eq!(bytes.len() as i64, f.size, "read size matches listing");
             let decoded = ltx::decode_file(&bytes).expect("golden file decodes via client");
             assert_eq!(decoded.header.min_txid, f.min_txid);
         }
-
-        // Partial read of the page-index tail (the restore fast-path).
-        let f = &files[0];
-        let tail = client
-            .open_ltx_file(0, f.min_txid, f.max_txid, f.size - 24, 0)
-            .await
-            .unwrap();
-        assert_eq!(tail.len(), 24, "tail read returns last 24 bytes");
     }
 }

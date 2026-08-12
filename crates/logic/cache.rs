@@ -1,8 +1,8 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
-//! Local hibernation-cache eviction, sans-IO.
+//! Local snapshot-cache eviction, sans-IO.
 //!
-//! Idle hibernation preserves each cell's SQLite file so a same-node wake is
+//! Idle eviction preserves each cell's SQLite file so a same-node wake is
 //! a rename instead of a remote restore, which saves tens of serial storage
 //! round trips per wake. The cost is that a node accumulates one file per
 //! cell it has ever hosted, which is unbounded while the durable population

@@ -3,8 +3,11 @@
 The boundaries of the current alpha:
 
 - A fleet runs one application deployment. There is no multi-tenant
-  scheduler, no account service, no managed ingress, and no global
-  placement layer.
+  scheduler, no account service, or managed ingress.
+- celld requires an S3-compatible bucket or a Google Cloud Storage
+  bucket, also on a laptop. There is no local filesystem mode, so local
+  development needs a real bucket or a local store that provides
+  conditional writes (see [ownership and fencing](fencing.md)).
 - The peer HTTP protocol does not terminate TLS. Run the fleet on a
   private network or an encrypted overlay, and terminate public TLS in an
   ingress proxy.
@@ -14,6 +17,9 @@ The boundaries of the current alpha:
 - The bucket credentials come from the `AWS_*` environment or from
   explicit managed credentials, which includes instance metadata and web
   identity tokens. celld does not read `~/.aws` profiles or SSO logins.
+  A `gs://` bucket authenticates with Google Application Default
+  Credentials or with a service account key from the `GOOGLE_*`
+  environment; S3 static credentials do not apply to it.
 - The [Cloudflare compatibility](cloudflare-compat.md) page shows what
   celld runs of the Workers platform: the available APIs, the deploy
   contract, and what is out of scope (KV, R2, `wrangler.toml`, routes).
@@ -30,9 +36,9 @@ The boundaries of the current alpha:
   sockets can hold.
 - Windows is not available, and Intel Macs get no prebuilt binaries; a
   build from source works.
-- Pressure shedding is off until the release measurements give safe
-  defaults. A new node receives cells through the usual traffic; there is
-  no central placement controller.
+- celld has no central placement controller, so it does not rebalance the
+  fleet when a node joins. Normal traffic places an unowned or released cell
+  on a node with capacity.
 - Updates are manual: the installer keeps immutable releases behind one
   `current` pointer, so a previous SHA is the rollback. There is no
   automatic update agent.

@@ -116,60 +116,10 @@ async fn object_store_passes_conformance_suite_vs_minio() {
     }
 
     let client = make_client(unique_path("conformance"));
-    // Surface a build/connect failure clearly instead of a generic panic.
-    client
-        .init()
-        .await
-        .expect("init ObjectStoreClient against MinIO");
-
     run_client_suite(&client).await;
 
     // Leave no residue behind.
     client.delete_all().await.expect("final cleanup");
-}
-
-/// Exercises the timestamp-metadata path (`use_metadata = true`): the
-/// `litestream-timestamp` header value written on PUT must be read back via the
-/// `head` fan-out, distinct from the listing's `last_modified`. Ported in spirit
-/// from s3/replica_client.go:679-683 + 1543-1553.
-#[tokio::test]
-async fn object_store_use_metadata_reads_header_timestamp() {
-    if !minio_reachable() {
-        eprintln!("SKIP object_store_use_metadata_reads_header_timestamp: MinIO not reachable");
-        return;
-    }
-
-    let client = make_client(unique_path("metadata"));
-    client.delete_all().await.expect("clean start");
-
-    // Build an LTX file with a specific, non-"now" header timestamp.
-    // 2021-01-01T00:00:00.123Z = 1_609_459_200_123 ms.
-    let header_millis: i64 = 1_609_459_200_123;
-    let data = make_ltx_with_timestamp(TXID(1), TXID(1), 7, header_millis);
-
-    client
-        .write_ltx_file(0, TXID(1), TXID(1), &data)
-        .await
-        .expect("write ltx with timestamp");
-
-    // With use_metadata, created_at must equal the header timestamp we stored,
-    // NOT the wall-clock LastModified of the object.
-    let files = client
-        .ltx_files(0, TXID(0), true)
-        .await
-        .expect("list with metadata");
-    assert_eq!(files.len(), 1, "one file listed");
-    let created = files[0].created_at.expect("created_at present");
-    let got_millis = created
-        .duration_since(UNIX_EPOCH)
-        .expect("after epoch")
-        .as_millis() as i64;
-    assert_eq!(
-        got_millis, header_millis,
-        "use_metadata reads back the LTX header timestamp, not LastModified"
-    );
-
-    client.delete_all().await.expect("cleanup");
 }
 
 /// The 5 MiB multipart boundary: a file at or above the threshold is uploaded
@@ -203,24 +153,17 @@ async fn object_store_multipart_upload_round_trips() {
 
     // Full read returns identical bytes.
     let got = client
-        .open_ltx_file(0, TXID(1), TXID(1), 0, 0)
+        .open_ltx_file(0, TXID(1), TXID(1))
         .await
         .expect("read back multipart object");
     assert_eq!(got, data, "multipart round-trip is byte-exact");
-
-    // Partial (byte-range) read still works on a multipart object.
-    let mid = client
-        .open_ltx_file(0, TXID(1), TXID(1), 100, 64)
-        .await
-        .expect("range read");
-    assert_eq!(mid.as_slice(), &data[100..164], "range read window");
 
     client.delete_all().await.expect("cleanup");
 }
 
 // ── LTX builders (real, decodable files; mirror client::make_test_ltx_file) ───
 
-fn header(min_txid: TXID, max_txid: TXID, page_size: u32, timestamp: i64, commit: u32) -> Header {
+fn header(min_txid: TXID, max_txid: TXID, page_size: u32, commit: u32) -> Header {
     Header {
         version: VERSION,
         flags: HEADER_FLAG_NO_CHECKSUM,
@@ -228,7 +171,7 @@ fn header(min_txid: TXID, max_txid: TXID, page_size: u32, timestamp: i64, commit
         commit,
         min_txid,
         max_txid,
-        timestamp,
+        timestamp: 0,
         pre_apply_checksum: 0,
         wal_offset: 0,
         wal_size: 0,
@@ -236,13 +179,6 @@ fn header(min_txid: TXID, max_txid: TXID, page_size: u32, timestamp: i64, commit
         wal_salt2: 0,
         node_id: 0,
     }
-}
-
-fn make_ltx_with_timestamp(min_txid: TXID, max_txid: TXID, seed: u8, timestamp: i64) -> Vec<u8> {
-    let page_size: u32 = 512;
-    let pages = vec![(1u32, vec![seed; page_size as usize])];
-    let hdr = header(min_txid, max_txid, page_size, timestamp, 1);
-    ltx::encode_file(&hdr, &pages, 0).expect("encode ltx")
 }
 
 /// Build a real LTX file whose *encoded* size is at least `min_bytes` by writing
@@ -282,6 +218,6 @@ fn make_large_ltx(min_txid: TXID, max_txid: TXID, min_bytes: usize) -> Vec<u8> {
         pgno += 1;
     }
 
-    let hdr = header(min_txid, max_txid, page_size, 0, commit);
+    let hdr = header(min_txid, max_txid, page_size, commit);
     ltx::encode_file(&hdr, &pages, 0).expect("encode large ltx")
 }

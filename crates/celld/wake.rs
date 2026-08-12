@@ -1,10 +1,10 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
-//! Alarm wake for hibernated cells (on by default).
+//! Alarm wake for inactive cells (on by default).
 //!
 //! Committed alarm state is mirrored into the bucket as
 //! `wake/<YYYY-MM-DDTHH:MM>/<cell>` so a wake hint survives fence, crash,
-//! and deploy; the sweep hibernates alarm-bearing cells behind a durable
+//! and deploy; the sweep evicts alarm-bearing cells behind a durable
 //! entry, a per-node heap plus boot scan re-activates them, and a per-fleet
 //! advisory waker revives orphans whose owner died.
 //!
@@ -20,18 +20,17 @@ use celld_logic::wake::Op;
 use celld_logic::wake::Step;
 use celld_logic::wake::WakeCore;
 use std::sync::Mutex;
+use std::time::Duration;
 use tracing::warn;
 
 /// Stay-resident threshold: alarms due sooner than this keep their cell
 /// resident when residency is cheaper than a wake cycle. Alarms further out
-/// hibernate behind an entry.
+/// are evicted behind an entry.
 pub fn resident_ms() -> i64 {
     static MS: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
     *MS.get_or_init(|| {
-        std::env::var("CELLD_ALARM_RESIDENT_MS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(3_600_000)
+        crate::env_vars::with_default("CELLD_ALARM_RESIDENT_MS", 3_600_000)
+            .expect("validated CELLD_ALARM_RESIDENT_MS")
     })
 }
 
@@ -101,7 +100,7 @@ pub async fn try_hold_waker(bucket: &Bucket, node: &str, now_ms: i64, ttl_ms: i6
 /// Mirrors each resident cell's committed next-alarm into the bucket. One
 /// instance per node, driven from the eviction sweep tick. The pure transition
 /// (`decide` / `covered` / `due_cells` / `adopt`) is the sans-IO
-/// `celld_logic::wake::WakeCore`; this facade adds the lock, the async S3
+/// `celld_logic::wake::WakeCore`; this facade adds the lock, the async bucket
 /// executor, and the shadow-pin log.
 pub struct WakeFlusher {
     core: Mutex<WakeCore>,
@@ -144,7 +143,7 @@ impl WakeFlusher {
         self.core.lock().unwrap().tracks(cell)
     }
 
-    /// Reconcile one cell against S3 — the async executor for `WakeCore::decide`.
+    /// Reconcile one cell against the bucket — the async executor for `WakeCore::decide`.
     /// Failed PUTs keep local state unchanged so the next tick retries (an entry
     /// may be late, never silently absent); failed deletes drop matching state
     /// anyway — a stale entry is one spurious wake. `consume_durable` gates the
@@ -156,8 +155,8 @@ impl WakeFlusher {
         next_alarm_ms: i64,
         consume_durable: bool,
     ) {
-        // A PUT must never race an in-flight delete for the same cell: S3
-        // gives concurrent same-key writes no order, so the PUT can lose and
+        // A PUT must never race an in-flight delete for the same cell: the
+        // bucket gives concurrent same-key writes no order, so the PUT can lose and
         // leave a confirmed belief with no entry. Sequence behind any delete
         // a previous reconcile still has on the wire.
         self.await_no_inflight_delete(cell).await;
@@ -190,11 +189,22 @@ impl WakeFlusher {
                     }
                 }
                 Step::Delete { key } => {
-                    // A failed delete still drops the state: a stale entry is
+                    // A transient store error must not orphan the entry — a
+                    // dropped delete was one of the immortal-orphan producers
+                    // (the item-6 audit) — so retry briefly. A delete that
+                    // still fails drops the state anyway: a stale entry is
                     // one spurious wake, and keeping it would block the arm
                     // that replaces it.
-                    if let Err(e) = bucket.delete(&key).await {
-                        warn!(%cell, %key, error = %e, "wake entry delete failed");
+                    for attempt in 0..3u32 {
+                        match bucket.delete(&key).await {
+                            Ok(()) => break,
+                            Err(e) if attempt == 2 => {
+                                warn!(%cell, %key, error = %e, "wake entry delete failed");
+                            }
+                            Err(_) => {
+                                tokio::time::sleep(Duration::from_millis(100 << attempt)).await;
+                            }
+                        }
                     }
                     plan.delete_done(&mut self.core.lock().unwrap(), &key);
                     self.quiesce.notify_waiters();
@@ -233,7 +243,7 @@ impl WakeFlusher {
         self.core.lock().unwrap().covered(cell, next_alarm_ms)
     }
 
-    /// Entries whose cells this node hibernated and whose due time has
+    /// Entries whose cells this node evicted and whose due time has
     /// arrived — the tier-2 wake heap, derived from flusher state.
     pub fn due_cells(&self, now_ms: i64) -> Vec<String> {
         self.core.lock().unwrap().due_cells(now_ms)

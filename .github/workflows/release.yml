@@ -96,13 +96,12 @@ jobs:
           printf '%s' "$GHCR_TOKEN" |
             docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
 
-      - name: Build the test stage
+      - name: Build and test the image
         run: |
           set -euo pipefail
           version=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/celld/Cargo.toml | head -1)
           docker buildx build \
             --platform linux/amd64 \
-            --target test \
             --build-arg "CELLD_COMMIT=$GITHUB_SHA" \
             --build-arg "CELLD_VERSION=$version" \
             --cache-from "type=registry,ref=$IMAGE:buildcache-amd64" \
@@ -230,20 +229,7 @@ jobs:
           printf '%s' "$GHCR_TOKEN" |
             docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
 
-      - name: Test architecture image
-        run: |
-          set -euo pipefail
-          cache="$IMAGE:buildcache-${{ matrix.suffix }}"
-          docker buildx build \
-            --platform "${{ matrix.platform }}" \
-            --target test \
-            --build-arg "CELLD_COMMIT=$TAG_SHA" \
-            --build-arg "CELLD_VERSION=$CELLD_VERSION" \
-            --cache-from "type=registry,ref=$cache" \
-            --cache-to "type=registry,ref=$cache,mode=max" \
-            .
-
-      - name: Build and push architecture image
+      - name: Test, build, and push architecture image
         run: |
           set -euo pipefail
           tag="$IMAGE:$TAG_SHA-${{ matrix.suffix }}"

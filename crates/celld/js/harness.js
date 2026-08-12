@@ -11,6 +11,74 @@ function __bodyBytes(body) {
     return new Uint8Array(body.buffer, body.byteOffset, body.byteLength).slice();
   return new TextEncoder().encode(String(body));
 }
+// Bodies that carry their own Content-Type. A Blob's is its `type`, a
+// FormData serializes to multipart with a generated boundary, and a
+// URLSearchParams to urlencoded. Returns null for every other body so the
+// caller falls through to __bodyBytes. Blob, File, FormData and
+// URLSearchParams are all installed later in this file; this runs per
+// request, long after that.
+function __typedBody(body) {
+  if (body == null || typeof body !== "object") return null;
+  if (globalThis.Blob && body instanceof Blob)
+    return { bytes: body._bytes.slice(), type: body.type };
+  if (globalThis.FormData && body instanceof FormData)
+    return __multipartBody(body);
+  if (globalThis.URLSearchParams && body instanceof URLSearchParams)
+    return {
+      bytes: new TextEncoder().encode(String(body)),
+      type: "application/x-www-form-urlencoded;charset=UTF-8",
+    };
+  return null;
+}
+// The WHATWG escape for a multipart field name or filename. It is one-way:
+// a parser does not undo it, so a name containing a quote round-trips as
+// `%22` rather than the original character.
+function __mimeEscape(value) {
+  value = String(value);
+  // A trailing backslash would escape the closing quote of the parameter and
+  // run the header into the part body, so it is refused rather than encoded.
+  // Workerd refuses it with this exact message.
+  if (value.endsWith("\\"))
+    throw new TypeError("Name or filename can't end with backslash");
+  return value
+    .replace(/\n/g, "%0A").replace(/\r/g, "%0D").replace(/"/g, "%22");
+}
+// Serialize a FormData into a multipart/form-data body. The boundary must
+// not occur in any part; 16 random bytes make that collision unreachable,
+// and the delimiter stays unquoted so a `boundary=` parameter needs no
+// quoting.
+function __multipartBody(form) {
+  const random = new Uint8Array(16);
+  if (globalThis.crypto && crypto.getRandomValues) crypto.getRandomValues(random);
+  else for (let i = 0; i < random.length; i++)
+    random[i] = Math.floor(Math.random() * 256);
+  const boundary = "----celldFormBoundary" +
+    Array.from(random, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  const encoder = new TextEncoder();
+  const chunks = [];
+  for (const [name, value] of form) {
+    let header = `--${boundary}\r\nContent-Disposition: form-data; name="${
+      __mimeEscape(name)
+    }"`;
+    if (value instanceof Blob) {
+      header += `; filename="${__mimeEscape(value.name)}"`;
+      header += `\r\nContent-Type: ${value.type || "application/octet-stream"}`;
+    }
+    chunks.push(encoder.encode(`${header}\r\n\r\n`));
+    chunks.push(value instanceof Blob ? value._bytes : encoder.encode(value));
+    chunks.push(encoder.encode("\r\n"));
+  }
+  chunks.push(encoder.encode(`--${boundary}--\r\n`));
+  let total = 0;
+  for (const chunk of chunks) total += chunk.byteLength;
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return { bytes, type: `multipart/form-data; boundary=${boundary}` };
+}
 function __chunkBytes(chunk) {
   if (chunk instanceof ArrayBuffer) return new Uint8Array(chunk);
   if (ArrayBuffer.isView(chunk))
@@ -163,10 +231,10 @@ globalThis.Response = class Response {
     // Streaming/iterable detection runs only for object bodies, so
     // the common string path skips every instanceof below.
     let stream = null;
-    let blob = null;
+    let typed = null;
     if (body !== null && typeof body === "object") {
       if (body instanceof ReadableStream) stream = body;
-      else if (globalThis.Blob && body instanceof Blob) blob = body;
+      else if ((typed = __typedBody(body)) !== null) { /* bytes and type */ }
       else {
         const iterable = __iterableBody(body);
         if (iterable instanceof ReadableStream) stream = iterable;
@@ -175,7 +243,7 @@ globalThis.Response = class Response {
     }
     this._bodyBytes = stream !== null
       ? null
-      : blob ? blob._bytes.slice() : __bodyBytes(body);
+      : typed ? typed.bytes : __bodyBytes(body);
     this._body = stream !== null
       ? null
       : new TextDecoder().decode(this._bodyBytes);
@@ -191,8 +259,8 @@ globalThis.Response = class Response {
     this.status = init.status === undefined ? 200 : Number(init.status);
     this.statusText = init.statusText === undefined ? "" : String(init.statusText);
     this.headers = new Headers(init.headers);
-    if (blob && blob.type && !this.headers.has("content-type"))
-      this.headers.set("content-type", blob.type);
+    if (typed && typed.type && !this.headers.has("content-type"))
+      this.headers.set("content-type", typed.type);
     this.webSocket = init.webSocket;
     this._wsTarget = init.__wsTarget || init._wsTarget || null;
     this.ok = this.status >= 200 && this.status <= 299;
@@ -274,10 +342,10 @@ globalThis.Request = class Request {
       Object.prototype.hasOwnProperty.call(init, "body");
     let body = hasBody ? init.body : null;
     let stream = null;
-    let blob = null;
+    let typed = null;
     if (hasBody && body !== null && typeof body === "object") {
       if (body instanceof ReadableStream) stream = body;
-      else if (globalThis.Blob && body instanceof Blob) blob = body;
+      else if ((typed = __typedBody(body)) !== null) { /* bytes and type */ }
       else {
         const iterable = __iterableBody(body);
         if (iterable instanceof ReadableStream) stream = iterable;
@@ -293,15 +361,37 @@ globalThis.Request = class Request {
     this._bodyBytes = stream !== null
       ? null
       : hasBody
-        ? (blob ? blob._bytes.slice() : __bodyBytes(body))
+        ? (typed ? typed.bytes : __bodyBytes(body))
         : (prior ? prior._bodyBytes.slice() : new Uint8Array());
-    this._body = this._bodyBytes === null
-      ? null
-      : new TextDecoder().decode(this._bodyBytes);
-    this.headers = new Headers(init.headers === undefined && prior ? prior.headers : init.headers);
-    if (blob && blob.type && !this.headers.has("content-type"))
-      this.headers.set("content-type", blob.type);
+    // Body text is decoded on the first text()/json(), not here: a request
+    // whose body is never read never pays the decode.
+    this._body = undefined;
+    // Headers are stored raw and built on the first `.headers` access. The
+    // hot paths -- a hello world, a Worker that only forwards to a cell --
+    // read none, so `new Headers` and the JSON.parse behind it never run.
+    if (init.__headersJson !== undefined) {
+      this._headersJson = init.__headersJson;
+      this._headersInit = undefined;
+    } else if (init.headers === undefined && prior) {
+      this._headersJson = prior._headersJson;
+      this._headersInit = prior._headers ?? prior._headersInit;
+    } else {
+      this._headersJson = undefined;
+      this._headersInit = init.headers;
+    }
+    this._headers = null;
+    // A typed body's default content-type must land now; only user-built
+    // typed bodies reach this, never the incoming request path.
+    if (typed && typed.type && !this.headers.has("content-type")) {
+      this.headers.set("content-type", typed.type);
+    }
     this.bodyUsed = false;
+    // The body stream and the signal stay eager, own properties: the RPC and
+    // storage serializers fall back to the lift-into-marker path only when a
+    // value is not directly structured-cloneable, and a Request's un-cloneable
+    // body stream (or AbortSignal) is what triggers that. Making them lazy
+    // getters let `__sc_encode` clone the Request into a broken plain object
+    // and skip the lift -- the serializeHttpTypes conformance failure.
     this.body = stream !== null
       ? stream
       : ["GET", "HEAD"].includes(this.method)
@@ -319,15 +409,30 @@ globalThis.Request = class Request {
         ? this.signal
         : (prior ? prior._signalForSubrequests : null);
   }
+  get headers() {
+    if (this._headers === null) {
+      const src = this._headersJson !== undefined
+        ? JSON.parse(this._headersJson)
+        : this._headersInit;
+      this._headers = new Headers(src);
+      this._headersJson = undefined;
+      this._headersInit = undefined;
+    }
+    return this._headers;
+  }
+  set headers(value) {
+    this._headers = value instanceof Headers ? value : new Headers(value);
+    this._headersJson = undefined;
+    this._headersInit = undefined;
+  }
   async _consume() {
     if (this._bodyBytes !== null) return this._bodyBytes;
     return __drainBody(this);
   }
   async text() {
     this.bodyUsed = true;
-    if (this._body !== null) return this._body;
-    await this._consume();
-    return this._body;
+    const bytes = await this._consume();
+    return this._body ??= new TextDecoder().decode(bytes);
   }
   async json() { return JSON.parse(await this.text()); }
   async formData() {
@@ -357,7 +462,10 @@ globalThis.__makeRequest = (
   url, method, body, headersJson = "[]", signal = undefined,
   incomingSignal = false,
 ) => new Request(url, {
-  method, body, headers: JSON.parse(headersJson), signal,
+  // The raw header JSON, not a parsed object: an incoming request whose
+  // handler never reads `.headers` (a hello world, or a Worker that only
+  // routes to a cell) then never parses it. See `get headers()`.
+  method, body, __headersJson: headersJson, signal,
   __celldIncomingSignal: incomingSignal,
 });
 const __fmt = (a) => a.map((x) => {
@@ -981,6 +1089,30 @@ const __durableObjectRoutingError = (error) => {
     return new DurableObjectRoutingError();
   }
 };
+// A cell's input gate as the isolate sees it, for the one delivery
+// point that is inside the isolate rather than in front of it: an
+// RPC stub op. `shut` counts the blocks that have asked for the gate
+// and is raised synchronously, so no window exists in which a block
+// has started and the isolate still thinks the cell is open.
+// `holder` names the block actually running — a second block that is
+// still queued has raised `shut` but holds nothing.
+//
+// A stub minted while a block runs carries that block's token and
+// re-enters it instead of queueing behind it. That is Workerd's
+// `IoContext::makeReentryCallback`, and without it a callback the
+// block itself sent out could never come back.
+const __cellBlocks = new Map();
+const __blockEnter = (scope) => {
+  const block = __cellBlocks.get(scope);
+  if (block !== undefined) return (block.shut++, block);
+  const fresh = { shut: 1, holder: null };
+  __cellBlocks.set(scope, fresh);
+  return fresh;
+};
+const __blockLeave = (scope, block) => {
+  block.holder = null;
+  if (--block.shut === 0) __cellBlocks.delete(scope);
+};
 class DurableObjectState {
   constructor(scope) {
     this._scope = scope;
@@ -1006,7 +1138,58 @@ class DurableObjectState {
         "blockConcurrencyWhile() calls are nested too deeply.",
       );
     if (this._blockDepth > 0) return this._runConcurrencyBlock(f);
-    const next = this._gate.then(() => this._runConcurrencyBlock(f));
+    // The host owns the gate (celld_logic::gate::InputGate). It replaces a
+    // promise chain that could only order blocks against each other; the
+    // gate sits at the delivery points, so nothing else is delivered to this
+    // cell at all while the block runs.
+    //
+    // The acquire waits. It used to be synchronous, and had to be: a cell's
+    // events came off one channel, so yielding even one microtask reopened a
+    // window in which this cell delivered an event that then waited on a
+    // gate nothing would release. Events are independent tasks now, so two
+    // can reach a block together and the second has to queue — and nothing
+    // nests, so waiting cannot deadlock on an event suspended beneath it.
+    // Asked for synchronously, awaited asynchronously, and the split is the
+    // whole point. The op shuts the gate in this very call, so no event can
+    // be delivered to this cell from here on — that immediacy is what makes
+    // `failCriticalSection()` reject a `ping()` issued right after it.
+    // Waiting for the *ticket* is separate: events are independent tasks
+    // now, so two of them can reach a block together and the second has to
+    // queue behind the first. Calling this inside the async body instead
+    // costs one microtask, and an event delivered in that window walks
+    // straight into the critical section.
+    const block = __blockEnter(this._scope);
+    const acquired = __gate_acquire(this._scope);
+    const next = (async () => {
+      try {
+        // The op answers a string; the gate keys events by number.
+        const event = Number(await acquired);
+        block.holder = event;
+        // A critical section that fails resets the actor, so whatever queued
+        // behind its gate must be refused rather than handed to the reset
+        // one — it was sent to a cell whose state no longer exists. The
+        // failure rides with the release for that: waiters are woken with it
+        // instead of merely woken.
+        let failure = null;
+        try {
+          return await this._runConcurrencyBlock(f);
+        } catch (error) {
+          failure = String((error && error.message) || error);
+          throw error;
+        } finally {
+          __gate_release(this._scope, event, failure);
+        }
+      } finally {
+        // Also on a rejected `acquired`: the block ahead failed, this one
+        // never ran, and the cell must not stay shut on its behalf.
+        __blockLeave(this._scope, block);
+      }
+    })();
+    // `_ready()` awaits this. The host gate stops *other* events, but a
+    // block taken in the constructor runs inside the very event that is
+    // being delivered, so nothing external can hold that event back — the
+    // promise does. Concurrent blocks within one event go through
+    // `_blockDepth` above and never reach here.
     this._gate = next;
     return next;
   }
@@ -1100,6 +1283,45 @@ class DurableObjectState {
     return __sockets.get(Number(id)) ||
       this.getWebSockets().find((ws) => ws._id === id) ||
       __wsStub(id);
+  }
+  // Workerd actor-state.c++ setWebSocketAutoResponse: no pair unsets, and
+  // each side is capped at 2048 UTF-8 bytes. The pair itself lives in the
+  // shell — a matched message is answered without waking this cell.
+  setWebSocketAutoResponse(pair) {
+    if (pair === undefined || pair === null) {
+      __ws_auto_response_set(this._scope, null, null);
+      return;
+    }
+    if (!(pair instanceof WebSocketRequestResponsePair))
+      throw new TypeError(
+        "Failed to execute 'setWebSocketAutoResponse' on " +
+        "'DurableObjectState': parameter 1 is not of type " +
+        "'WebSocketRequestResponsePair'.",
+      );
+    const max = 2048;
+    const bytes = (s) => new TextEncoder().encode(s).length;
+    const requestSize = bytes(pair.request);
+    if (requestSize > max)
+      throw new RangeError(
+        `Request cannot be larger than ${max} bytes. ` +
+        `A request of size ${requestSize} was provided.`,
+      );
+    const responseSize = bytes(pair.response);
+    if (responseSize > max)
+      throw new RangeError(
+        `Response cannot be larger than ${max} bytes. ` +
+        `A response of size ${responseSize} was provided.`,
+      );
+    __ws_auto_response_set(this._scope, pair.request, pair.response);
+  }
+  getWebSocketAutoResponse() {
+    const pair = JSON.parse(__ws_auto_response_get(this._scope));
+    if (pair === null) return null;
+    return new WebSocketRequestResponsePair(pair[0], pair[1]);
+  }
+  getWebSocketAutoResponseTimestamp(ws) {
+    const ms = __ws_auto_response_ts(ws._id);
+    return ms === null ? null : new Date(ms);
   }
   waitUntil(promise) {
     globalThis.__registerWaitUntil(promise);
@@ -1352,10 +1574,36 @@ globalThis.__makeLoader = () => {
       idPromise.then((id) => finalizer.register(stub, id), () => {});
     return stub;
   };
+  // JSON.stringify silently drops binary values, so each non-string module —
+  // wasm bytes as a BufferSource, or workerd's `{ wasm }` / `{ esModule }`
+  // module shapes — is normalized first: ES modules to plain strings, wasm
+  // pulled out into a side-band `[name, Uint8Array]` list the op reads
+  // directly, so multi-MB blobs never take a base64/JSON round-trip.
+  const toBytes = (v) => v instanceof ArrayBuffer ? new Uint8Array(v)
+    : ArrayBuffer.isView(v)
+      ? new Uint8Array(v.buffer, v.byteOffset, v.byteLength) : null;
+  const encodeModules = (c) => {
+    if (c === null || typeof c !== "object" || c.modules === null
+        || typeof c.modules !== "object") return { config: c, wasm: [] };
+    const modules = {};
+    const wasm = [];
+    for (const [name, value] of Object.entries(c.modules)) {
+      const wrapped = value !== null && typeof value === "object" ? value : {};
+      const bytes = toBytes(value) ?? toBytes(wrapped.wasm);
+      if (bytes !== null) wasm.push([name, bytes]);
+      else if (typeof wrapped.esModule === "string") modules[name] = wrapped.esModule;
+      else modules[name] = value;
+    }
+    return { config: { ...c, modules }, wasm };
+  };
   // getCode is deferred into a microtask so a throw (or async getCode)
   // surfaces as a rejection when the worker is first used, not at get()/load().
   const loadFrom = (getCode) =>
-    Promise.resolve().then(getCode).then((c) => __loader_load(JSON.stringify(c)));
+    Promise.resolve().then(getCode)
+      .then((c) => {
+        const { config, wasm } = encodeModules(c);
+        return __loader_load(JSON.stringify(config), wasm);
+      });
   return {
     load(code) { return makeStub(loadFrom(() => code), true); },
     get(name, getCode) {
@@ -1647,10 +1895,14 @@ const __stubIsolate = Math.random().toString(36).slice(2);
 const __newEntry = (target) => {
   // `scope` records the actor event that minted the entry (top of
   // the event stack at lift time), so an actor breakage can find
-  // and abort the contexts hosting its exported stubs.
+  // and abort the contexts hosting its exported stubs, and an op on
+  // the stub can queue on that cell's input gate. `section` is the
+  // critical section running at lift time, if any — an op on this
+  // stub re-enters it rather than queueing behind it.
+  const scope = __actorEventStack[__actorEventStack.length - 1];
   const entry = {
-    id: __nextStubId++, target, refs: 1, ctx: __ctxNow(),
-    scope: __actorEventStack[__actorEventStack.length - 1],
+    id: __nextStubId++, target, refs: 1, ctx: __ctxNow(), scope,
+    section: __cellBlocks.get(scope)?.holder ?? null,
   };
   __stubEntries.set(entry.id, entry);
   return entry;
@@ -2213,6 +2465,19 @@ const __stubOp = (meta, path, args) => {
     // with the reason, not the post-abort message). Bodies queue
     // in call order, so e-order holds.
     await null;
+    // The cell that minted this stub gates it like any other event.
+    // The op is dispatched inside the isolate and never becomes a
+    // drive, so it is the one delivery point that has to ask here
+    // rather than in Rust. A stub carrying the running critical
+    // section re-enters it; everything else queues, and a section
+    // that failed refuses what queued.
+    const cell = entry.scope;
+    if (cell !== undefined) {
+      const block = __cellBlocks.get(cell);
+      if (block !== undefined && (entry.section === null ||
+          entry.section !== block.holder))
+        await __gate_wait(cell);
+    }
     const reply = await __ctxRun(entry.ctx,
       () => __rpcRun(async () => {
         const decoded =
@@ -2671,145 +2936,159 @@ function makeNamespace(className) {
   const namespaceKey = __cell.namespaceKeys[className];
   if (typeof namespaceKey !== "string")
     throw new Error("no Durable Object namespace key for " + className);
-  const namespace = {
-    idFromName(name) {
-      name = String(name);
-      return new DurableObjectId(
-        className, __do_id(namespaceKey, "name", name), name,
-      );
-    },
-    idFromString(value) {
-      return new DurableObjectId(
-        className, __do_id(namespaceKey, "validate", String(value)),
-      );
-    },
-    newUniqueId(options = {}) {
-      const jurisdiction = options == null ? undefined : options.jurisdiction;
-      if (jurisdiction != null)
-        throw new Error("Jurisdiction restrictions are not implemented");
-      return new DurableObjectId(
-        className, __do_id(namespaceKey, "unique", ""),
-      );
-    },
-    jurisdiction(value) {
-      if (value == null) return namespace;
+  return new DurableObjectNamespace(className, namespaceKey);
+}
+// A named class: SDKs sniff bindings by constructor name (workers-rs
+// EnvBinding requires `constructor.name === "DurableObjectNamespace"`).
+class DurableObjectNamespace {
+  constructor(className, namespaceKey) {
+    Object.defineProperty(this, "_className", { value: className });
+    Object.defineProperty(this, "_namespaceKey", { value: namespaceKey });
+  }
+  idFromName(name) {
+    name = String(name);
+    return new DurableObjectId(
+      this._className, __do_id(this._namespaceKey, "name", name), name,
+    );
+  }
+  idFromString(value) {
+    return new DurableObjectId(
+      this._className, __do_id(this._namespaceKey, "validate", String(value)),
+    );
+  }
+  newUniqueId(options = {}) {
+    const jurisdiction = options == null ? undefined : options.jurisdiction;
+    if (jurisdiction != null)
       throw new Error("Jurisdiction restrictions are not implemented");
-    },
-    getByName(name, options) {
-      return namespace.get(namespace.idFromName(name), options);
-    },
-    get(id) {
-      if (!(id instanceof DurableObjectId) || id._className !== className)
-        throw new TypeError("Durable Object ID is not valid for this namespace");
-      const scope = id._scope();
-      // Emulate production: the actor recovers its name only when it is
-      // <= 1024 UTF-8 bytes; longer names are dropped so ctx.id.name is
-      // undefined. The full name still seeds the routing hash, so
-      // dispatch is unchanged. Short names skip the byte count (< 256
-      // chars is always <= 1020 bytes) to keep the hot path alloc-free.
-      const nm = id.name;
-      const dispatchName = nm === undefined ? undefined
-        : nm.length < 256 || new TextEncoder().encode(nm).length <= 1024
-          ? nm : undefined;
-      if (dispatchName !== undefined) __cell.idNames[scope] = dispatchName;
-      // Fetch and native RPC use the same host routing/activation seam.
-      // Never expose `.then`: a DO stub is not itself a promise.
-      // `__celldDo` brands the stub so the RPC lift can send it as a
-      // revivable marker rather than failing the clone; non-enumerable
-      // so Object.keys(stub) stays Workerd's [id, name].
-      const target = { id, name: dispatchName };
-      Object.defineProperty(target, "__celldDo", { value: id });
-      const abortMarker = "__CELLD_ACTOR_ABORT__:";
-      const processExitMarker = "__CELLD_PROCESS_EXIT__:";
-      let brokenReason = null;
-      const invoke = async (operation) => {
-        if (brokenReason !== null) throw new Error(brokenReason);
-        try {
-          return await operation();
-        } catch (error) {
-          const routingError = __durableObjectRoutingError(error);
-          if (routingError !== null) throw routingError;
-          const message = String(error && error.message || error);
-          const marker = [abortMarker, processExitMarker]
-            .find((candidate) => message.includes(candidate));
-          if (!marker) throw error;
-          brokenReason = message.slice(message.indexOf(marker) + marker.length);
-          throw new Error(brokenReason);
+    return new DurableObjectId(
+      this._className, __do_id(this._namespaceKey, "unique", ""),
+    );
+  }
+  jurisdiction(value) {
+    if (value == null) return this;
+    throw new Error("Jurisdiction restrictions are not implemented");
+  }
+  getByName(name, options) {
+    return this.get(this.idFromName(name), options);
+  }
+  get(id) {
+    const className = this._className;
+    if (!(id instanceof DurableObjectId) || id._className !== className)
+      throw new TypeError("Durable Object ID is not valid for this namespace");
+    const scope = id._scope();
+    // Emulate production: the actor recovers its name only when it is
+    // <= 1024 UTF-8 bytes; longer names are dropped so ctx.id.name is
+    // undefined. The full name still seeds the routing hash, so
+    // dispatch is unchanged. Short names skip the byte count (< 256
+    // chars is always <= 1020 bytes) to keep the hot path alloc-free.
+    const nm = id.name;
+    const dispatchName = nm === undefined ? undefined
+      : nm.length < 256 || new TextEncoder().encode(nm).length <= 1024
+        ? nm : undefined;
+    if (dispatchName !== undefined) __cell.idNames[scope] = dispatchName;
+    // Fetch and native RPC use the same host routing/activation seam.
+    // Never expose `.then`: a DO stub is not itself a promise.
+    // `__celldDo` brands the stub so the RPC lift can send it as a
+    // revivable marker rather than failing the clone; non-enumerable
+    // so Object.keys(stub) stays Workerd's [id, name].
+    const target = { id, name: dispatchName };
+    Object.defineProperty(target, "__celldDo", { value: id });
+    const abortMarker = "__CELLD_ACTOR_ABORT__:";
+    const processExitMarker = "__CELLD_PROCESS_EXIT__:";
+    let brokenReason = null;
+    const invoke = async (operation) => {
+      if (brokenReason !== null) throw new Error(brokenReason);
+      try {
+        return await operation();
+      } catch (error) {
+        const routingError = __durableObjectRoutingError(error);
+        if (routingError !== null) throw routingError;
+        const message = String(error && error.message || error);
+        const marker = [abortMarker, processExitMarker]
+          .find((candidate) => message.includes(candidate));
+        if (!marker) throw error;
+        brokenReason = message.slice(message.indexOf(marker) + marker.length);
+        throw new Error(brokenReason);
+      }
+    };
+    const doFetch = async (input, init) => {
+        const req = new Request(input, init);
+        const signal = req._signalForSubrequests;
+        if (signal?.aborted) throw signal.reason;
+        // The DO seam carries exact bytes; a stream body is drained
+        // (and per spec disturbed) first.
+        const body_ = req._bodyBytes === null
+          ? await req._consume() : req._bodyBytes;
+        // Forward the request's headers to the cell as JSON. When they were
+        // never materialized -- a Worker that only routes to a cell reads
+        // none -- pass the raw header string straight through, so the whole
+        // dispatch never builds a Headers object on either side.
+        const headersJson = req._headersJson !== undefined
+          ? req._headersJson
+          : JSON.stringify(Array.from(req.headers));
+        // Fast path: this isolate owns the target cell — run the DO
+        // in-isolate, avoiding the __do_call host round trip.
+        if (__cell.owned[scope]) {
+          return await invoke(() => __dispatchTo(
+            scope, req.url, req.method, body_,
+            headersJson,
+            null,
+            true,
+            signal,
+          ));
         }
-      };
-      const doFetch = async (input, init) => {
-          const req = new Request(input, init);
-          const signal = req._signalForSubrequests;
-          if (signal?.aborted) throw signal.reason;
-          // The DO seam carries exact bytes; a stream body is drained
-          // (and per spec disturbed) first.
-          const body_ = req._bodyBytes === null
-            ? await req._consume() : req._bodyBytes;
-          // Fast path: this isolate owns the target cell — run the DO
-          // in-isolate, avoiding the __do_call host round trip.
-          if (__cell.owned[scope]) {
-            return await invoke(() => __dispatchTo(
-              scope, req.url, req.method, body_,
-              JSON.stringify(Array.from(req.headers)),
-              null,
-              true,
-              signal,
-            ));
-          }
-          const r = JSON.parse(await invoke(() => {
-            if (!signal) return __do_call(
-              scope, dispatchName ?? null, req.url, req.method, body_,
-              JSON.stringify(Array.from(req.headers)),
-            );
-            return __awaitCancellableDoCall(
-              __do_call_cancellable(
-                scope, dispatchName ?? null, req.url, req.method, body_,
-                JSON.stringify(Array.from(req.headers)),
-              ),
-              signal,
-            );
-          }));
-          const body = r.streamId !== undefined
-            ? new CelldHttpBodyStream(r.streamId)
-            : r.body !== undefined
-              ? r.body
-              : Uint8Array.from(r.bodyBytes || []);
-          return new Response(body, {
-            status: r.status, headers: r.headers, __wsTarget: r.wsTarget,
-          });
-      };
-      const stub = new Proxy(target, { get: (_target, prop) => {
-        if (prop === "then") return undefined;
-        if (Reflect.has(_target, prop)) return Reflect.get(_target, prop);
-        if (prop === "fetch") return doFetch;
-        if (typeof prop !== "string") return undefined;
-        if (__cell.compat.fetcherGetPutDelete &&
-            (prop === "get" || prop === "put" || prop === "delete"))
-          return __fetcherHelper(doFetch, prop);
-        // Fast path: this isolate owns the target cell — run the DO RPC
-        // in-isolate, avoiding the __rpc_call host round trip. Still a
-        // structured clone each way: Workerd extracts a copy even for a
-        // same-isolate call, and JSON round-tripped here before. The
-        // reply decodes inside invoke() so abort/exit markers rethrown
-        // from the envelope still trip the broken-stub sniffing.
-        if (__cell.owned[scope])
-          return async (...args) => invoke(
-            async () => __rpcDes(await __dispatchRpc(
-              scope, prop, __rpcOut(args, true))),
+        const r = JSON.parse(await invoke(() => {
+          if (!signal) return __do_call(
+            scope, dispatchName ?? null, req.url, req.method, body_,
+            headersJson,
           );
-        // The routed channel also lifts: same-process dispatch
-        // re-enters this isolate, where the markers revive; bytes
-        // that land elsewhere revive as loud foreign stubs.
+          return __awaitCancellableDoCall(
+            __do_call_cancellable(
+              scope, dispatchName ?? null, req.url, req.method, body_,
+              headersJson,
+            ),
+            signal,
+          );
+        }));
+        const body = r.streamId !== undefined
+          ? new CelldHttpBodyStream(r.streamId)
+          : r.body !== undefined
+            ? r.body
+            : Uint8Array.from(r.bodyBytes || []);
+        return new Response(body, {
+          status: r.status, headers: r.headers, __wsTarget: r.wsTarget,
+        });
+    };
+    const stub = new Proxy(target, { get: (_target, prop) => {
+      if (prop === "then") return undefined;
+      if (Reflect.has(_target, prop)) return Reflect.get(_target, prop);
+      if (prop === "fetch") return doFetch;
+      if (typeof prop !== "string") return undefined;
+      if (__cell.compat.fetcherGetPutDelete &&
+          (prop === "get" || prop === "put" || prop === "delete"))
+        return __fetcherHelper(doFetch, prop);
+      // Fast path: this isolate owns the target cell — run the DO RPC
+      // in-isolate, avoiding the __rpc_call host round trip. Still a
+      // structured clone each way: Workerd extracts a copy even for a
+      // same-isolate call, and JSON round-tripped here before. The
+      // reply decodes inside invoke() so abort/exit markers rethrown
+      // from the envelope still trip the broken-stub sniffing.
+      if (__cell.owned[scope])
         return async (...args) => invoke(
-          async () => __rpcDes(await __rpc_call(
-            scope, dispatchName ?? null, prop, __rpcOut(args, true),
-          )),
+          async () => __rpcDes(await __dispatchRpc(
+            scope, prop, __rpcOut(args, true))),
         );
-      }});
-      return stub;
-    }
-  };
-  return namespace;
+      // The routed channel also lifts: same-process dispatch
+      // re-enters this isolate, where the markers revive; bytes
+      // that land elsewhere revive as loud foreign stubs.
+      return async (...args) => invoke(
+        async () => __rpcDes(await __rpc_call(
+          scope, dispatchName ?? null, prop, __rpcOut(args, true),
+        )),
+      );
+    }});
+    return stub;
+  }
 }
 const __attachResponseRequestCancellation = (
   response,
@@ -3030,26 +3309,32 @@ const __entrypointInstance = (name) => {
 // to that class's fetch, not the module's default export. A plain
 // object export (Workerd's non-class entrypoint) dispatches its
 // handler functions as fn(arg, env, ctx).
-globalThis.__dispatchEntrypointFetch = async (name, request) => {
+const __dispatchEntrypointMethod = async (name, method, arg) => {
   const handler = __cell.objectEntrypoints[name];
   if (handler !== undefined) {
-    if (typeof handler.fetch !== "function")
+    if (typeof handler[method] !== "function")
       throw new TypeError(
-        `Entrypoint ${JSON.stringify(name)} has no fetch handler`);
+        `Entrypoint ${JSON.stringify(name)} has no ${method} handler`);
     const ctx = __beginEvent();
     try {
       return await __ctxRun(undefined,
-        () => handler.fetch(request, __cell.env, ctx));
+        () => handler[method](arg, __cell.env, ctx));
     } finally {
       __endEvent();
     }
   }
+  // A class entrypoint's methods get env and ctx from its constructor,
+  // not as arguments.
   const inst = __entrypointInstance(name);
-  if (typeof inst.fetch !== "function")
+  if (typeof inst[method] !== "function")
     throw new TypeError(
-      `Entrypoint ${JSON.stringify(name)} has no fetch handler`);
-  return await __ctxRun(undefined, () => inst.fetch(request));
+      `Entrypoint ${JSON.stringify(name)} has no ${method} handler`);
+  return await __ctxRun(undefined, () => inst[method](arg));
 };
+globalThis.__dispatchEntrypointFetch = (name, request) =>
+  __dispatchEntrypointMethod(name, "fetch", request);
+globalThis.__dispatchEntrypointScheduled = (name, ctrl) =>
+  __dispatchEntrypointMethod(name, "scheduled", ctrl);
 // Workerd's simple-handler RPC rules (worker-rpc.c++): a non-class
 // handler method is called as fn(arg, env, ctx), the client must send
 // exactly one argument, and the handler must not declare more than
@@ -3303,7 +3588,7 @@ globalThis.__cf = {
   // the current event; outside any event this is Workerd's
   // global-scope error.
   waitUntil(promise) {
-    if (__eventStack.length === 0)
+    if (__event_depth() === 0)
       throw new Error(
         "Disallowed operation called within global scope.");
     globalThis.__registerWaitUntil(promise);
@@ -3569,11 +3854,18 @@ if (!globalThis.DOMException) {
   }
 }
 if (!globalThis.AbortSignal) {
+  const __abortBrand = Symbol("abortSignal");
   globalThis.AbortSignal = class AbortSignal extends EventTarget {
     // The Headers/Blob clone-poisoning brand: V8's structured
     // clone throws on functions, so a live signal reaches the
     // RPC lift instead of silently flattening to plain data.
     constructor() {
+      // Per spec AbortSignal has no constructor: it is only reachable
+      // through AbortController, AbortSignal.abort/timeout/any. The internal
+      // paths pass the brand to get past this.
+      if (arguments[0] !== __abortBrand) {
+        throw new TypeError("Illegal constructor");
+      }
       super();
       this.aborted = false;
       this.reason = undefined;
@@ -3600,7 +3892,7 @@ if (!globalThis.AbortSignal) {
     }
   };
   globalThis.AbortController = class AbortController {
-    constructor() { this.signal = new AbortSignal(); }
+    constructor() { this.signal = new AbortSignal(__abortBrand); }
     abort(reason = new DOMException("This operation was aborted", "AbortError")) {
       __abortSignal(this.signal, reason);
     }
@@ -3737,6 +4029,13 @@ if (!globalThis.FormData) {
 globalThis.__parseFormData = (text, contentType) => {
   const ct = String(contentType || "");
   if (/^\s*application\/x-www-form-urlencoded/i.test(ct)) {
+    // The body has already been decoded as UTF-8, so a declared charset that
+    // is not UTF-8 cannot be honoured. Refuse rather than mis-decode.
+    const charset = /;\s*charset\s*=\s*"?([^";]+)/i.exec(ct);
+    if (charset && !/^utf-?8$/i.test(charset[1].trim()))
+      throw new TypeError(
+        `Unsupported charset "${charset[1].trim()}". FormData can only ` +
+        "parse UTF-8 encoded bodies.");
     const form = new FormData();
     for (const [key, value] of new URLSearchParams(text))
       form.append(key, value);
@@ -3755,20 +4054,41 @@ globalThis.__parseFormData = (text, contentType) => {
   const boundary = (found[1] !== undefined ? found[1] : found[2]).trim();
   const form = new FormData();
   const delimiter = "--" + boundary;
-  // Parts are delimited by the boundary; the preamble before the first
-  // delimiter and the epilogue after the closing one are ignored.
-  const chunks = text.split(delimiter);
-  for (let i = 1; i < chunks.length; i++) {
-    let chunk = chunks[i];
-    if (chunk.startsWith("--")) break; // closing delimiter
-    chunk = chunk.replace(/^\r?\n/, "");
+  // Walk the delimiters rather than splitting on them, so that a truncated or
+  // corrupt body is refused instead of silently yielding the parts that
+  // happened to parse. The preamble before the first delimiter and the
+  // epilogue after the closing one are ignored.
+  let cursor = text.indexOf(delimiter);
+  if (cursor < 0)
+    throw new TypeError(
+      "No boundary delimiter was found in the multipart/form-data body.");
+  cursor += delimiter.length;
+  for (;;) {
+    // What follows a delimiter decides everything: "--" closes the body, a
+    // line break opens another part, and anything else is malformed.
+    if (text.startsWith("--", cursor)) break;
+    const lineBreak = text.startsWith("\r\n", cursor)
+      ? 2
+      : text.startsWith("\n", cursor) ? 1 : 0;
+    if (lineBreak === 0)
+      throw new TypeError(
+        "A boundary delimiter must be followed by CRLF, LF, or \"--\".");
+    cursor += lineBreak;
+    const next = text.indexOf(delimiter, cursor);
+    if (next < 0)
+      throw new TypeError(
+        "The multipart/form-data body ended without a closing boundary " +
+        "delimiter.");
+    // The line break before a delimiter belongs to the delimiter, not to the
+    // part it terminates.
+    const chunk = text.slice(cursor, next).replace(/\r?\n$/, "");
+    cursor = next + delimiter.length;
     const split = /\r?\n\r?\n/.exec(chunk);
-    if (!split) continue;
+    if (!split)
+      throw new TypeError(
+        "A FormData part's headers must be terminated by a blank line.");
     const rawHeaders = chunk.slice(0, split.index);
-    // Trim the CRLF that belongs to the following delimiter.
-    const body = chunk
-      .slice(split.index + split[0].length)
-      .replace(/\r?\n$/, "");
+    const body = chunk.slice(split.index + split[0].length);
     let disposition = null;
     let type = "";
     for (const line of rawHeaders.split(/\r?\n/)) {
@@ -4188,8 +4508,10 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
     }
   }
   serializeAttachment(value) {
+    // Structured clone, not JSON: Cloudflare accepts anything cloneable
+    // here, so a Date must come back a Date and a Map a Map.
     this._attachment = value;
-    __ws_attachment_set(this._id, JSON.stringify(value));
+    __ws_attachment_set(this._id, __sc_encode(value));
   }
   deserializeAttachment() { return this._attachment; }
   _dispatchMessage(data) {
@@ -4235,10 +4557,27 @@ globalThis.__socketFromRow = (row) => {
   ws._tags = row.tags || [];
   ws._hibernatable = true;
   if (row.attachment != null) {
-    try { ws._attachment = JSON.parse(row.attachment); } catch { ws._attachment = undefined; }
+    try {
+      ws._attachment = __sc_decode(new Uint8Array(row.attachment));
+    } catch {
+      ws._attachment = undefined;
+    }
   }
   return ws;
 };
+// Workerd's api::WebSocketRequestResponsePair (websocket.h): an immutable
+// request/response pair for state.setWebSocketAutoResponse.
+globalThis.WebSocketRequestResponsePair =
+  class WebSocketRequestResponsePair {
+    #request;
+    #response;
+    constructor(request, response) {
+      this.#request = String(request);
+      this.#response = String(response);
+    }
+    get request() { return this.#request; }
+    get response() { return this.#response; }
+  };
 globalThis.WebSocketPair = function WebSocketPair() {
   const id = __ws_alloc();
   const client = __makeSocket(id);
@@ -4308,10 +4647,8 @@ if (!globalThis.structuredClone) {
 // Web Crypto is installed after the rest of the harness so it can use
 // DOMException, structuredClone, and Buffer.
 // `Buffer` is read at call time, which materializes the lazy global.
-const __zlibSync = (mode, data) => Buffer.from(JSON.parse(__zlib(
-  mode,
-  JSON.stringify(Array.from(Buffer.from(data))),
-)));
+const __zlibSync = (mode, data) =>
+  Buffer.from(__zlib(mode, Buffer.from(data)));
 globalThis.__zlibModule = {
   constants: {
     Z_NO_FLUSH: 0,
@@ -4349,20 +4686,21 @@ globalThis.process.exit = (code = 0) => {
 globalThis.process.getBuiltinModule =
   (id) => __builtin_module(String(id));
 if (!globalThis.global) globalThis.global = globalThis;
-const __eventStack = [];
+// Events belong to the request, and the host owns the request. `__event_*`
+// and `__wait_until` operate on whichever context the host has made current
+// for this turn, so nothing here has to know which request is running — and
+// two requests sharing an isolate cannot pop each other's events.
 globalThis.__registerWaitUntil = (promise) => {
-  const event = __eventStack[__eventStack.length - 1];
   const tracked = Promise.resolve(promise).catch((error) => {
     console.error("waitUntil rejected", error);
   });
-  if (event) event.waitUntil.push(tracked);
+  __wait_until(tracked);
 };
 // `props` are the per-stub props a loopback service stub carries
 // (ctx.props); `exports` is built once, on first access.
 const __defaultProps = {};
 globalThis.__beginEvent = (props = __defaultProps) => {
-  const event = { waitUntil: [] };
-  __eventStack.push(event);
+  __event_begin();
   return {
     waitUntil: globalThis.__registerWaitUntil,
     passThroughOnException() {},
@@ -4371,11 +4709,7 @@ globalThis.__beginEvent = (props = __defaultProps) => {
     get exports() { return __ctxExports(); },
   };
 };
-globalThis.__endEvent = () => {
-  const event = __eventStack.pop();
-  if (!event || event.waitUntil.length === 0) return null;
-  return Promise.allSettled(event.waitUntil);
-};
+globalThis.__endEvent = () => __event_end();
 // fs stub that behaves like a no-filesystem env: reads throw ENOENT and
 // existsSync is false, so the common `try { readFileSync } catch (ENOENT)`
 // fallbacks in real deps (e.g. pi-agent config) take their default path.

@@ -38,24 +38,24 @@
 //! header checksum and rolled forward over each frame's 8-byte header prefix and
 //! then its page data, in the byte order chosen by the magic.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::{wal_checksum, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE};
 
 /// Required WAL format version (`3007000`), as found at header offset 4.
 ///
 /// Ported from litestream@v0.5.11 wal_reader.go:118.
-pub const WAL_VERSION: u32 = 3_007_000;
+const WAL_VERSION: u32 = 3_007_000;
 
 /// WAL header magic indicating checksums are computed **little-endian**.
 ///
 /// Ported from litestream@v0.5.11 wal_reader.go:101.
-pub const WAL_MAGIC_LITTLE_ENDIAN: u32 = 0x377f_0682;
+const WAL_MAGIC_LITTLE_ENDIAN: u32 = 0x377f_0682;
 
 /// WAL header magic indicating checksums are computed **big-endian**.
 ///
 /// Ported from litestream@v0.5.11 wal_reader.go:103.
-pub const WAL_MAGIC_BIG_ENDIAN: u32 = 0x377f_0683;
+const WAL_MAGIC_BIG_ENDIAN: u32 = 0x377f_0683;
 
 // ── Errors ────────────────────────────────────────────────────────────────────
 
@@ -181,7 +181,7 @@ impl From<WalError> for crate::Error {
 }
 
 /// `WalReader`'s `Result` alias.
-pub type WalResult<T> = std::result::Result<T, WalError>;
+type WalResult<T> = std::result::Result<T, WalError>;
 
 // ── WalReader ───────────────────────────────────────────────────────────────
 
@@ -208,10 +208,6 @@ pub struct WalReader<'a> {
     big_endian: bool,
     /// Page size from the header. Go field `pageSize`.
     page_size: u32,
-    /// Checkpoint sequence number from the header. Go field `seq`.
-    #[allow(dead_code)]
-    seq: u32,
-
     /// Header salt-1 / salt-2; frames must match these. Go fields `salt1/salt2`.
     salt1: u32,
     salt2: u32,
@@ -236,7 +232,6 @@ impl<'a> WalReader<'a> {
             frame_n: 0,
             big_endian: false,
             page_size: 0,
-            seq: 0,
             salt1: 0,
             salt2: 0,
             chksum1: 0,
@@ -274,7 +269,6 @@ impl<'a> WalReader<'a> {
             frame_n: 0,
             big_endian: false,
             page_size: 0,
-            seq: 0,
             salt1: 0,
             salt2: 0,
             chksum1: 0,
@@ -316,16 +310,6 @@ impl<'a> WalReader<'a> {
     #[inline]
     pub fn page_size(&self) -> u32 {
         self.page_size
-    }
-
-    /// Returns `true` when checksums for this WAL are big-endian (magic
-    /// `0x377f0683`), `false` when little-endian (`0x377f0682`).
-    ///
-    /// Exposed because the byte order is a load-bearing, hard-to-observe property
-    /// that the golden test asserts directly.
-    #[inline]
-    pub fn is_big_endian(&self) -> bool {
-        self.big_endian
     }
 
     /// Returns the header salt pair `(salt1, salt2)`.
@@ -397,7 +381,6 @@ impl<'a> WalReader<'a> {
         }
 
         self.page_size = be_u32(&hdr[8..]);
-        self.seq = be_u32(&hdr[12..]);
         self.salt1 = be_u32(&hdr[16..]);
         self.salt2 = be_u32(&hdr[20..]);
         self.chksum1 = chksum1;
@@ -549,11 +532,8 @@ impl<'a> WalReader<'a> {
     /// including those from superseded transactions.
     ///
     /// Ported from `FrameSaltsUntil` in litestream@v0.5.11 wal_reader.go:246-270.
-    pub fn frame_salts_until(
-        &self,
-        until: (u32, u32),
-    ) -> WalResult<std::collections::HashSet<(u32, u32)>> {
-        let mut m = std::collections::HashSet::new();
+    pub fn frame_salts_until(&self, until: (u32, u32)) -> HashSet<(u32, u32)> {
+        let mut m = HashSet::new();
         let step = WAL_FRAME_HEADER_SIZE as i64 + self.page_size as i64;
         let mut offset = WAL_HEADER_SIZE as i64;
         // The loop ends either when a frame-header read runs short (the Go
@@ -572,7 +552,7 @@ impl<'a> WalReader<'a> {
 
             offset += step;
         }
-        Ok(m)
+        m
     }
 }
 
@@ -868,9 +848,7 @@ mod tests {
 
         // No frame carries salt (0,0), so the scan runs to EOF and collects all
         // three distinct salt pairs present in the file.
-        let m = r
-            .frame_salts_until((0x0000_0000, 0x0000_0000))
-            .expect("frame salts");
+        let m = r.frame_salts_until((0x0000_0000, 0x0000_0000));
         assert_eq!(m.len(), 3, "len(m)");
         assert!(m.contains(&(0x1b9a_294b, 0x37f9_1916)), "salt 0 not found");
         assert!(m.contains(&(0x1b9a_294a, 0x031f_195e)), "salt 1 not found");
@@ -888,12 +866,6 @@ mod tests {
         assert_eq!(b.len(), 16_512, "fixture size changed unexpectedly");
 
         let mut r = WalReader::new(&b).expect("new reader over golden WAL");
-
-        // Byte order: magic 0x377f0682 => checksums little-endian.
-        assert!(
-            !r.is_big_endian(),
-            "golden WAL magic 0x377f0682 selects LITTLE-endian checksums"
-        );
 
         // Page size from the header.
         assert_eq!(r.page_size(), 4096, "golden WAL page size");

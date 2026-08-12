@@ -12,6 +12,7 @@ pub mod bucket;
 pub mod control_plane;
 pub mod dead_node_gc;
 pub mod deploy;
+pub mod env_vars;
 /// Test-only SQLite fault injection, ported from celld unchanged.
 ///
 /// Gated to an external conformance build rather than merely `#[cfg(test)]`:
@@ -23,20 +24,28 @@ mod fault;
 pub mod fleet;
 pub mod js;
 pub mod ltx_repl;
+mod otlp;
 pub mod ownership_store;
 pub mod peer_auth;
 pub mod peer_probe;
+pub mod pool;
 pub mod protocol;
 pub mod replication;
 pub mod runtime;
 pub mod startup;
 pub mod storage;
+pub mod telemetry;
 pub mod wake;
 pub mod ws_client;
 
 #[cfg(all(test, celld_internal_tests))]
 mod conformance_main_tests {
     include!(env!("CELLD_CONFORMANCE_MAIN_TESTS"));
+}
+
+#[cfg(all(test, celld_internal_tests))]
+mod conformance_replication_tests {
+    include!(env!("CELLD_CONFORMANCE_REPLICATION_TESTS"));
 }
 
 /// Completion token for a resident-isolate reservation made by the decision
@@ -83,22 +92,6 @@ pub enum WorkerJob {
 /// Temporary host seam required by the verbatim JS adapter. The runtime
 /// adapter will construct the real shared Worker queue; lifecycle policy does
 /// not move into this type.
-pub struct WorkerPool {
-    tx: std::sync::mpsc::Sender<WorkerJob>,
-}
-
-pub struct WorkerPoolStopped;
-
-impl WorkerPool {
-    pub(crate) fn new(tx: std::sync::mpsc::Sender<WorkerJob>) -> Self {
-        Self { tx }
-    }
-
-    pub fn send(&self, job: WorkerJob) -> Result<(), WorkerPoolStopped> {
-        self.tx.send(job).map_err(|_| WorkerPoolStopped)
-    }
-}
-
 /// Compatibility switches copied with the JS adapter. These are runtime
 /// semantics, not lifecycle decisions.
 pub fn worker_compat(metadata: &serde_json::Value) -> js::Compat {

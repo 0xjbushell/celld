@@ -4,8 +4,9 @@
 //! celld adapters.
 //!
 //! Listener policy is copied from celld's production startup path. Keeping it
-//! outside the executor matters: the socket is reserved before storage or V8
-//! work starts, and the executor receives an already-validated peer address.
+//! outside the executor matters: both sockets are reserved before storage or
+//! V8 work starts, and the executor receives an already-validated peer
+//! address for the internal socket.
 
 use anyhow::{anyhow, Context};
 use std::fmt;
@@ -27,11 +28,12 @@ const LISTEN_BACKLOG: u32 = 4_096;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Listen {
     AutoLoopback,
+    LoopbackEphemeral,
     Explicit(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RuntimeSettings {
+pub struct InternalListenerSettings {
     pub listen: Listen,
     pub advertise: Option<String>,
     pub unsafe_public_advertise: bool,
@@ -97,6 +99,12 @@ fn is_shared_overlay(address: Ipv4Addr) -> bool {
 pub struct BoundListener {
     pub listener: TcpListener,
     pub listen: SocketAddr,
+}
+
+#[derive(Debug)]
+pub struct BoundInternalListener {
+    pub listener: TcpListener,
+    pub listen: SocketAddr,
     pub advertise: Advertise,
 }
 
@@ -160,12 +168,12 @@ fn bind_tcp_listener(address: SocketAddr) -> std::io::Result<TcpListener> {
     socket.listen(LISTEN_BACKLOG)
 }
 
-pub async fn bind_listener(settings: &RuntimeSettings) -> anyhow::Result<BoundListener> {
-    let (listener, listen) = match &settings.listen {
+async fn bind_listener(listen: &Listen, option: &str) -> anyhow::Result<BoundListener> {
+    let (listener, listen) = match listen {
         Listen::Explicit(address) => {
-            let address = parse_socket_address(address, "--listen")?;
+            let address = parse_socket_address(address, option)?;
             let listener =
-                bind_tcp_listener(address).with_context(|| format!("bind --listen {address}"))?;
+                bind_tcp_listener(address).with_context(|| format!("bind {option} {address}"))?;
             let listen = listener.local_addr().context("read bound listen address")?;
             (listener, listen)
         }
@@ -194,13 +202,33 @@ pub async fn bind_listener(settings: &RuntimeSettings) -> anyhow::Result<BoundLi
                 )
             })?
         }
+        Listen::LoopbackEphemeral => {
+            let address = SocketAddr::from(([127, 0, 0, 1], 0));
+            let listener =
+                bind_tcp_listener(address).with_context(|| format!("bind {option} {address}"))?;
+            let listen = listener.local_addr().context("read bound listen address")?;
+            (listener, listen)
+        }
     };
+
+    Ok(BoundListener { listener, listen })
+}
+
+pub async fn bind_ingress_listener(listen: &Listen) -> anyhow::Result<BoundListener> {
+    bind_listener(listen, "--listen").await
+}
+
+pub async fn bind_internal_listener(
+    settings: &InternalListenerSettings,
+) -> anyhow::Result<BoundInternalListener> {
+    let bound = bind_listener(&settings.listen, "--internal-listen").await?;
+    let listen = bound.listen;
 
     let advertise = if let Some(address) = settings.advertise.as_deref() {
         parse_advertise(address)?
     } else if listen.ip().is_unspecified() {
         return Err(anyhow!(
-            "--advertise is required when --listen uses an unspecified address ({listen}).\n\
+            "--advertise is required when --internal-listen uses an unspecified address ({listen}).\n\
              Give the address peers should dial, for example --advertise \
              {}:{} or --advertise node1.example.com:{}",
             "10.0.0.1",
@@ -212,14 +240,15 @@ pub async fn bind_listener(settings: &RuntimeSettings) -> anyhow::Result<BoundLi
     };
     if advertise.is_public_ip() && !settings.unsafe_public_advertise {
         return Err(anyhow!(
-            "--advertise {advertise} is a public IP address; peer HTTP carries \
-             application data without built-in TLS. Use a private overlay, or \
-             pass --unsafe-public-advertise to accept this exposure explicitly"
+            "--advertise {advertise} is a public IP address; the internal listener \
+             has an unauthenticated operator API, and peer HTTP carries application \
+             data without built-in TLS. Use a private overlay, or pass \
+             --unsafe-public-advertise to accept this exposure explicitly"
         ));
     }
 
-    Ok(BoundListener {
-        listener,
+    Ok(BoundInternalListener {
+        listener: bound.listener,
         listen,
         advertise,
     })

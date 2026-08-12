@@ -1,42 +1,101 @@
 # Security
 
-celld is an alpha. It is not safe for hostile multi-tenant use, and
-security fixes go to the latest release only; older alpha builds do not
-receive fixes.
+celld is an alpha. It is not safe for hostile multi-tenant use. Security fixes
+apply to the latest release only, so older alpha builds do not receive fixes.
 
-## Trust starts at your bucket
+## Separate the public and internal listeners
 
-The S3-compatible bucket is the root of authority for the fleet. The
-ownership of each cell is a compare-and-swap lease in that bucket, which
-also holds the deployments, the cell state, the node leases, and the
-shared peer-authentication secret. The person who holds the bucket
-credentials controls the fleet, so handle the credentials as
-administrator access: give each credential the scope of one fleet bucket
-only, and replace a credential if you think that others know it.
+celld opens two HTTP listeners. The public listener serves the deployed Worker,
+and the internal listener serves the peer protocol and the operator API.
 
-## Peers authenticate, but do not encrypt
+Use `--listen` for the public listener. Expose only this listener through a load
+balancer, a reverse proxy, or a public firewall rule.
 
-Each node-to-node request has an HMAC, a body signature, a clock limit,
-and replay protection, so a false peer cannot get access and a captured
-request cannot be sent again. But celld does not terminate TLS on the
-peer protocol: that traffic is plain HTTP. Advertise the nodes only on a
-private network that you trust or on an encrypted overlay such as
-WireGuard or Tailscale, and do not show the peer listener to the public
-internet.
+Use `--internal-listen` for the internal listener. Its default address is
+`127.0.0.1:0`, so celld selects an available loopback port at each start.
+The startup output reports the selected address.
 
-## Single-writer isolation
+Use `--advertise` to give peers the address of the internal listener. Bind the
+internal listener to a private interface, or protect it with a private overlay.
+Do not expose this listener to the public internet.
 
-Each cell is a SQLite database with one writer: one node owns a cell at a
-time, and an ownership epoch fences each cell, so a node that lost its
-lease cannot damage the state. There is no shared multi-tenant scheduler
-and no shared placement layer. The damage limit of a fleet is its own
-machines, its own network, and its own bucket, never the workload of a
-different tenant, and a defective cell can only touch its own database.
+An explicit advertised address requires an explicit internal-listener address.
+Set both command-line options, or use their equivalent environment variables.
+celld also rejects an explicit non-loopback public listener without an explicit
+internal listener. This rule identifies an obsolete one-listener configuration.
 
-## The operator's responsibility
+celld cannot verify that an advertised hostname or a translated port reaches
+the internal listener. You must route the advertised address to the internal
+listener, and you must not route it to the public Worker listener.
 
-celld serves requests and coordinates ownership; it does not authenticate
-the end users of your application, and it does not terminate public TLS.
-Put your own authentication and TLS in front of your ingress, keep the
-peers on networks that you trust, and keep the bucket credentials secret.
-See the [limitations](limitations.md) for the full alpha boundary.
+The public listener reserves only `/__celld/health`. A healthy node returns a
+200 response with `{"ok":true}`, and an unhealthy node returns a 503 response.
+The deployed Worker owns `/health` and every other public path.
+
+The internal listener does not pass an unknown path to the Worker. It returns a
+404 response, so an operator request cannot become an application request.
+
+## Protect the internal listener
+
+The operator API does not authenticate its requests. A client that can reach
+the internal listener can inspect state, start direct work, evict a cell, or
+stop the process. Therefore, a firewall or a private overlay must restrict
+access to trusted operators and fleet nodes.
+
+Peer requests on the same listener keep their protocol authentication. Each
+peer request has an HMAC, a body signature, a clock limit, and replay
+protection. The private network adds protection, but it does not replace the
+peer authentication.
+
+celld does not terminate TLS on the internal listener. Use an encrypted overlay
+such as WireGuard or Tailscale when the private network does not provide the
+required confidentiality.
+
+## Internal operator API
+
+The internal operator API is available in the released binary. The API is an
+alpha interface, so a release can change its paths or response formats.
+
+- `/state` reports the current occupancy, eviction, and restoration values. It
+  remains available while a graceful shutdown drains existing work.
+- `/cell/NAME` resolves or activates a cell for an operator check.
+- `/evict/NAME` evicts a resident cell.
+- `/do/NAME` sends a direct Durable Object request.
+- `POST /shutdown` starts a graceful ownership handoff.
+- `POST /shutdown?handoff=preserve` prepares a clean same-node reload and keeps
+  the ownership records.
+- `/__celld/probe` serves the signed diagnostic probe.
+
+The peer protocol also uses reserved internal paths. An operator must not call
+these paths directly, and celld continues to authenticate each peer request.
+
+## Protect the fleet bucket
+
+The fleet bucket is the root of authority for the fleet. It stores the
+deployments, the cell state, the ownership leases, the node leases, and the
+shared peer-authentication secret.
+
+A person who holds the bucket credentials controls the fleet. Give each
+credential access to one fleet bucket only, and replace a credential after a
+suspected disclosure.
+
+## Keep one writer for each cell
+
+Each cell is a SQLite database with one writer. One node owns a cell at a time,
+and an ownership epoch fences each cell.
+
+A node that loses its lease cannot modify the current cell state. The
+[ownership and fencing](fencing.md) page describes this mechanism.
+
+A fleet has no shared multi-tenant scheduler or shared placement layer. A
+defective cell can access only its own database, but it can consume resources
+on its fleet nodes.
+
+## Protect the public application
+
+celld does not authenticate the users of the deployed application. It also does
+not terminate public TLS. Put the required authentication and TLS in front of
+the public listener.
+
+Keep the internal listener private, and keep the bucket credentials secret.
+See the [limitations](limitations.md) page for the complete alpha boundary.

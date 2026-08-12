@@ -7,40 +7,171 @@
 //! starting to externally dispatchable to closed.
 
 use crate::asyncrt;
-use crate::js::{
-    self, CellJob, FetchRequest, HttpResponse, Worker, WorkerConfig, WorkerConfigOptions,
-};
+use crate::js::{self, CellJob, HttpResponse, Worker, WorkerConfig, WorkerConfigOptions};
 use crate::ltx_repl::LtxRepl;
 use crate::replication::{ActivationOptions, StorageCredentials, SyncWait};
-use crate::storage;
 use crate::wake::WakeFlusher;
 use anyhow::{anyhow, Context};
+use futures_util::StreamExt as _;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{mpsc, Arc, Mutex, Once};
+use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
 const REMOTE_ABORT_TTL: Duration = Duration::from_secs(600);
+
+/// How often the isolate pool gives back what it no longer needs.
+const REAP_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How often a suspended request re-reads its cancellation flag. Matches the
+/// blocking run loop's own cap, which exists for the same reason: a client
+/// disconnect is raised on another thread and has nothing to wake this one.
+const CANCELLATION_TICK: Duration = Duration::from_millis(10);
+const CLEAN_RELOAD_MARKER: &str = ".clean-reload.json";
+
+#[derive(Deserialize, Serialize)]
+struct CleanReloadMarker<'a> {
+    node: &'a str,
+    generation: &'a str,
+}
+
+#[derive(Deserialize)]
+struct OwnedCleanReloadMarker {
+    node: String,
+    generation: String,
+}
+
+/// Read the fixed-size certificate left by a clean local shutdown. The node
+/// lease state machine still decides whether the named generation is live and
+/// can be replaced; this local value grants no authority by itself.
+pub fn take_clean_reload_generation(data_dir: &Path, node: &str) -> Option<String> {
+    let path = data_dir.join(CLEAN_RELOAD_MARKER);
+    let bytes = std::fs::read(&path).ok()?;
+    let _ = std::fs::remove_file(path);
+    let marker: OwnedCleanReloadMarker = serde_json::from_slice(&bytes).ok()?;
+    (marker.node == node).then_some(marker.generation)
+}
+
+pub fn write_clean_reload_marker(
+    data_dir: &Path,
+    node: &str,
+    generation: &str,
+) -> anyhow::Result<()> {
+    std::fs::create_dir_all(data_dir)?;
+    let marker = data_dir.join(CLEAN_RELOAD_MARKER);
+    let temporary = data_dir.join(".clean-reload.tmp");
+    let body = serde_json::to_vec(&CleanReloadMarker { node, generation })?;
+    std::fs::write(&temporary, body)?;
+    std::fs::rename(temporary, marker)?;
+    Ok(())
+}
 
 fn prune_remote_aborts(aborts: &mut HashMap<js::RequestId, Instant>) {
     aborts.retain(|_, created| created.elapsed() < REMOTE_ABORT_TTL);
 }
 
+/// The isolate pool's limits, built from the environment here because the
+/// decision core never reads it (wiki/designs/isolate-threading.md).
+///
+/// `max_requests` is the node's only bound on stateless memory, and it is
+/// live: `Slot::affiliate` counts an affiliation for a request's whole life,
+/// `observe` reports it, and `isolate::admit` refuses against it. Unset
+/// means unbounded, not unwired — `engine/load-under-pressure.md` measures
+/// `CELLD_MAX_REQUESTS=32` admitting 641 rps against a theoretical 640.
+/// How long a stateless request may wait for a free `max_requests` slot
+/// before it is refused. Zero restores the old refuse-at-once behaviour.
+/// The default is one second: long enough that a saturated node converts
+/// its refusal storm into kernel-buffer queueing, short enough that a
+/// caller learns the truth before it matters.
+pub fn admission_wait() -> std::time::Duration {
+    // Not `env_usize`, which filters zero out — zero is meaningful here.
+    let ms = crate::env_vars::with_default("CELLD_ADMISSION_WAIT_MS", 1000u64)
+        .expect("validated CELLD_ADMISSION_WAIT_MS");
+    std::time::Duration::from_millis(ms)
+}
+
+pub fn pool_limits() -> celld_logic::isolate::PoolLimits {
+    const GROW_AT: usize = 2;
+    const SHRINK_UNDER: usize = 1;
+    const MAX_CELLS_PER_ISOLATE: usize = 32;
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    celld_logic::isolate::PoolLimits {
+        // These thresholds form one hysteresis policy, so they are constants
+        // rather than two independently configurable values.
+        grow_at: GROW_AT,
+        shrink_under: SHRINK_UNDER,
+        max_stateless: env_usize("CELLD_MAX_STATELESS_ISOLATES").unwrap_or(cores),
+        max_requests: env_usize("CELLD_MAX_REQUESTS"),
+        // This is an engine blast-radius policy. The resident-cell and RSS
+        // limits are the operator controls for node memory.
+        max_cells: MAX_CELLS_PER_ISOLATE,
+    }
+}
+
+fn env_usize(name: &str) -> Option<usize> {
+    crate::env_vars::positive(name).expect("validated positive runtime limit")
+}
+
 #[derive(Clone)]
 struct StatelessRuntime {
-    pool: Arc<crate::WorkerPool>,
+    node: Arc<str>,
+    region: Arc<str>,
+    /// The isolates fetch runs on, entered one turn at a time from whichever
+    /// tokio worker is driving the request (wiki/designs/isolate-threading.md).
+    isolates: Arc<crate::pool::Pool>,
 }
 
 struct CellHandle {
     epoch: u64,
     startup_us: u64,
-    tx: mpsc::Sender<CellJob>,
-    stopped: tokio::sync::oneshot::Receiver<()>,
-    next_alarm_ms: Arc<AtomicI64>,
+    /// The cell's claim on the isolate holding its realm. An event knows
+    /// where to run from it, and dropping it gives the placement back.
+    residency: crate::pool::Residency,
+    /// The last alarm the reporter saw, `-1` for none: the cache behind
+    /// `alarm()`'s point query. Written only by the effect path — a turn
+    /// moves an alarm, its drive reports it — never by storage directly.
+    next_alarm_ms: AtomicI64,
 }
 
 pub type AlarmObserver = Arc<dyn Fn(String, Option<i64>) + Send + Sync>;
+
+/// How a turn's alarm move reaches the host. `drive_cell` calls it with
+/// what `take_alarm_moves` drained; it caches the value on the cell's
+/// handle and forwards a real change to the observer.
+pub(crate) type AlarmReporter = Arc<dyn Fn(String, i64) + Send + Sync>;
+
+/// Re-arming the same time is not a change the host needs to hear twice —
+/// the dedupe the old watcher's diffing provided, kept by the cache. A
+/// scope without a handle was stopped mid-flight; its ActivityFinished
+/// report is gone with it, so a move for it says nothing and is dropped.
+///
+/// The observer is called under the registry lock, and `with_alarm` reads
+/// and reports under the same lock, so what reaches the core is monotone
+/// with the cache: a stale end-of-request read cannot land *after* a
+/// fresher report and unarm an alarm the core just learned about — the
+/// core overwrites on observation and deletes the wake entry on `None`,
+/// so that ordering loses the alarm outright. The observer only sends on
+/// an unbounded channel, so holding the lock across it cannot block.
+fn alarm_reporter(cells: &Arc<Mutex<CellRegistry>>, observe: &AlarmObserver) -> AlarmReporter {
+    let cells_ = cells.clone();
+    let observe_ = observe.clone();
+    Arc::new(move |scope: String, at_ms: i64| {
+        let registry = cells_.lock().expect("cell registry poisoned");
+        let changed = registry
+            .published
+            .get(&scope)
+            .or_else(|| registry.starting.get(&scope))
+            .is_some_and(|handle| handle.next_alarm_ms.swap(at_ms, Ordering::AcqRel) != at_ms);
+        if changed {
+            observe_(scope, (at_ms >= 0).then_some(at_ms));
+        }
+    })
+}
 
 #[derive(Default)]
 struct CellRegistry {
@@ -53,7 +184,13 @@ pub struct RuntimeManager {
     stateless: StatelessRuntime,
     services: Arc<HashMap<String, StatelessRuntime>>,
     cell_configs: Arc<HashMap<String, Arc<WorkerConfig>>>,
+    /// The isolates a Worker script's cells live in — the same `Pool` the
+    /// stateless path admits into, because an isolate is an isolate. Cells
+    /// of one script share them, so cells of one class share module scope
+    /// exactly when they are colocated, which is what Durable Objects do.
+    cell_isolates: Arc<HashMap<String, Arc<crate::pool::Pool>>>,
     cells: Arc<Mutex<CellRegistry>>,
+    alarm_reporter: AlarmReporter,
     /// A peer abort can arrive before the forwarded fetch. The tombstone and
     /// cell enqueue share this lock so neither ordering can lose cancellation.
     remote_aborts: Arc<Mutex<HashMap<js::RequestId, Instant>>>,
@@ -70,7 +207,6 @@ pub struct CohostedWorker {
     pub options: WorkerConfigOptions,
     pub services: Vec<(String, String, Option<String>)>,
     pub asset_binding: Option<String>,
-    pub workers: usize,
 }
 
 pub struct RuntimeOptions {
@@ -79,7 +215,6 @@ pub struct RuntimeOptions {
     pub asset_binding: Option<String>,
     pub loader_binding: Option<String>,
     pub cohosted: Vec<CohostedWorker>,
-    pub workers: usize,
     pub data_dir: PathBuf,
     pub replication: Option<Replication>,
     pub wake: Option<Arc<WakeFlusher>>,
@@ -95,6 +230,11 @@ pub struct RuntimeFetch {
     pub body: Vec<u8>,
     pub headers: Vec<(String, String)>,
     pub request_id: Option<js::RequestId>,
+    /// Where this call sits in its caller's order for this cell.
+    pub order: Option<js::CallOrder>,
+    /// The dispatching Worker's trace context, so the cell's span joins
+    /// the caller's trace instead of rooting a disconnected one.
+    pub parent: Option<crate::telemetry::TraceIds>,
 }
 
 /// The node's replication engine: the in-process `celld-ltx` replicator,
@@ -115,7 +255,9 @@ impl Replication {
         Ok(Self {
             ltx: Arc::new(LtxRepl::start(
                 watch,
+                bucket.backend(),
                 bucket.name,
+                bucket.prefix,
                 endpoint,
                 region,
                 credentials,
@@ -133,6 +275,7 @@ impl Replication {
             epoch: spec.epoch,
             fresh: spec.fresh,
             took_over: spec.took_over,
+            resume_local: spec.resume_local,
         };
         let activated = self.ltx.activate(options).await?;
         Ok((activated.path, activated.restored))
@@ -146,22 +289,28 @@ impl Replication {
             .await
     }
 
-    /// True when the replicator actively refused to prove durability (as opposed
-    /// to a cell it does not track). Drives the consumed-alarm reconciliation.
-    pub async fn sync_refused(&self, cell: &str, epoch: u64) -> bool {
-        matches!(self.sync_wait(cell, epoch).await, SyncWait::Failed)
-    }
-
     pub fn process_status(&self) -> std::io::Result<Option<std::process::ExitStatus>> {
         self.ltx.process_status()
     }
 
-    /// Enforce the byte ceiling on preserved hibernation snapshots.
+    /// Enforce the byte ceiling on preserved eviction snapshots.
     ///
     /// The directory walk is synchronous, so callers must run this on a
     /// blocking executor rather than the runtime's serving thread.
     pub fn prune_local_cache(&self, max_bytes: u64) -> (usize, usize, u64) {
         self.ltx.prune_local_cache(max_bytes)
+    }
+
+    pub fn close_for_reload(&self, cell: &str, epoch: u64) -> anyhow::Result<()> {
+        self.ltx.close_for_reload(cell, epoch)
+    }
+
+    pub fn local_cells(&self) -> Vec<celld_logic::LocalCell> {
+        self.ltx.local_cells()
+    }
+
+    pub fn prune_stale_live(&self, keep: &BTreeSet<(String, u64)>) -> anyhow::Result<usize> {
+        self.ltx.prune_stale_live(keep)
     }
 
     /// Copy the exact published epoch into a private read-only snapshot.
@@ -199,7 +348,7 @@ impl Replication {
         if !replicated {
             return Err(anyhow!(
                 "no replica objects for {cell} epoch {epoch}; refusing to \
-                 hibernate state the bucket cannot restore"
+                 evict state the bucket cannot restore"
             ));
         }
         Ok(())
@@ -213,8 +362,8 @@ impl Replication {
         self.ltx.await_durable(cell, epoch, position).await
     }
 
-    async fn hibernate(&self, cell: &str, epoch: u64, preserve_local: bool) {
-        self.ltx.hibernate(cell, epoch, preserve_local).await
+    async fn evict(&self, cell: &str, epoch: u64, preserve_local: bool) {
+        self.ltx.evict(cell, epoch, preserve_local).await
     }
 }
 
@@ -241,7 +390,6 @@ impl RuntimeManager {
             asset_binding,
             loader_binding,
             cohosted,
-            workers,
             data_dir,
             replication,
             wake,
@@ -249,11 +397,7 @@ impl RuntimeManager {
             node,
             region,
         } = options;
-        if workers == 0 {
-            return Err(anyhow!("stateless runtime requires at least one worker"));
-        }
-        static V8_INIT: Once = Once::new();
-        V8_INIT.call_once(js::Engine::init);
+        init_v8();
 
         let node: Arc<str> = Arc::from(node);
         let region: Arc<str> = Arc::from(region);
@@ -267,8 +411,7 @@ impl RuntimeManager {
                 .with_asset_binding(asset_binding)
                 .with_loader(loader_binding),
         );
-        let stateless =
-            StatelessRuntime::start(config.clone(), workers, node.clone(), region.clone())?;
+        let stateless = StatelessRuntime::start(config.clone(), node.clone(), region.clone())?;
         let mut service_pools = HashMap::from([(primary_script, stateless.clone())]);
         let mut cell_configs = HashMap::new();
         for class in primary_classes {
@@ -284,12 +427,7 @@ impl RuntimeManager {
                     .with_services(target.services)
                     .with_asset_binding(target.asset_binding),
             );
-            let pool = StatelessRuntime::start(
-                config.clone(),
-                target.workers,
-                node.clone(),
-                region.clone(),
-            )?;
+            let pool = StatelessRuntime::start(config.clone(), node.clone(), region.clone())?;
             if service_pools.insert(script.clone(), pool).is_some() {
                 return Err(anyhow!("duplicate co-hosted Worker script {script}"));
             }
@@ -301,11 +439,48 @@ impl RuntimeManager {
                 }
             }
         }
+        let cells = Arc::new(Mutex::new(CellRegistry::default()));
+        let alarm_reporter = alarm_reporter(&cells, &alarm_observer);
+        let cell_isolates: Arc<HashMap<String, Arc<crate::pool::Pool>>> = Arc::new(
+            cell_configs
+                .values()
+                .map(|config| {
+                    let config = config.clone();
+                    let build = config.clone();
+                    (
+                        config.script_name.clone(),
+                        Arc::new(crate::pool::Pool::new(
+                            pool_limits(),
+                            admission_wait(),
+                            Box::new(move || load_cell_isolate(build.clone())),
+                        )),
+                    )
+                })
+                .collect(),
+        );
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let reaping = cell_isolates.clone();
+            handle.spawn(async move {
+                let mut tick = tokio::time::interval_at(
+                    tokio::time::Instant::now() + REAP_INTERVAL,
+                    REAP_INTERVAL,
+                );
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    for pool in reaping.values() {
+                        pool.reap_empty();
+                    }
+                }
+            });
+        }
         Ok(Self {
             stateless,
             services: Arc::new(service_pools),
+            cell_isolates,
             cell_configs: Arc::new(cell_configs),
-            cells: Arc::new(Mutex::new(CellRegistry::default())),
+            cells,
+            alarm_reporter,
             remote_aborts: Arc::new(Mutex::new(HashMap::new())),
             data_dir: Arc::new(data_dir),
             default_do_class,
@@ -367,29 +542,44 @@ impl RuntimeManager {
             body,
             headers,
             request_id,
+            // A resident Worker fetch is not a cell event; its inbound
+            // traceparent is honored by the drive, from the headers.
+            order: _,
+            parent: _,
         } = request;
         let request_id = request_id.context("resident Worker fetch requires a request id")?;
-        let tx = self
+        let isolate = self
             .cells
             .lock()
             .expect("cell registry poisoned")
             .published
             .get(&cell)
             .filter(|handle| handle.epoch == epoch)
-            .map(|handle| handle.tx.clone())
+            .map(|handle| handle.residency.slot().clone())
             .ok_or_else(|| anyhow!("cell runtime is not published at epoch {epoch}: {cell}"))?;
+        // The Worker entry, run in the isolate that hosts the cell it will
+        // route to, so `env.NS.get(ownScope)` resolves in-isolate instead of
+        // going back out through the host.
+        //
+        // It needs no rescheduling any more. A Worker fetch could not be
+        // nested inside an actor event, and delivery used to nest, so a job
+        // that arrived mid-event had to be handed back to the stateless
+        // pool. Events no longer nest: this is an entry like any other, and
+        // it waits for its turn rather than for the isolate to go idle.
         let (reply, receive) = tokio::sync::oneshot::channel();
-        tx.send(CellJob::WorkerFetch {
-            request_id,
+        let job = crate::WorkerJob::Fetch {
+            queued_at: Instant::now(),
             url,
             method,
             body,
             headers,
-            inline_activity,
-            fallback_workers: self.stateless.pool.clone(),
+            request_id: Some(request_id),
             reply,
-        })
-        .map_err(|_| anyhow!("cell isolate stopped"))?;
+        };
+        tokio::spawn(async move {
+            let _inline_activity = inline_activity;
+            drive_worker_on_cell(isolate, job).await;
+        });
         receive
             .await
             .context("cell isolate dropped Worker response")?
@@ -476,12 +666,34 @@ impl RuntimeManager {
         cell: &str,
         path: &std::path::Path,
     ) -> Option<celld_logic::RestoredAlarm> {
-        let (at_ms, ..) = crate::storage::persisted_alarm(&path.to_string_lossy(), cell)?;
+        let persisted = crate::storage::persisted_alarm(&path.to_string_lossy(), cell);
+        let at_ms = match persisted {
+            Some((at_ms, ..)) => at_ms,
+            None => -1,
+        };
+        if at_ms < 0 {
+            // The durable truth this activation just restored has NO alarm —
+            // but a wake entry may still be tracked (the due scan adopts the
+            // entry that woke the cell). That entry disagrees with durable
+            // truth: an arm whose commit never replicated, or a consume whose
+            // delete was lost. Left alone it is immortal — one spurious
+            // activation per waker tick, forever (the item-6 audit's cost
+            // leak). Reconciling against the empty truth deletes it;
+            // `take_delete` re-checks at execution time, so an arm racing
+            // this activation cancels the delete.
+            if crate::js::wake_entry_tracked(cell) {
+                let cell_ = cell.to_string();
+                crate::asyncrt::op_handle().spawn(async move {
+                    crate::js::reconcile_wake_entry(&cell_, -1, true).await;
+                });
+            }
+            return None;
+        }
         // The entry this alarm already has in the bucket was written by
-        // whoever armed it, which is not this process once the cell has
-        // hibernated. Claim it now, while the alarm is in hand.
+        // whoever armed it, which is not this process once the cell went
+        // inactive. Claim it now, while the alarm is in hand.
         crate::js::adopt_wake_entry(cell, at_ms);
-        (at_ms >= 0).then(|| celld_logic::RestoredAlarm {
+        Some(celld_logic::RestoredAlarm {
             at_ms,
             covered: self.alarm_covered(cell, Some(at_ms)),
         })
@@ -491,20 +703,56 @@ impl RuntimeManager {
         self.replication.clone()
     }
 
+    /// Read the filesystem inventory after the core has replaced the exact
+    /// clean predecessor lease generation.
+    pub fn local_reload_cells(&self) -> anyhow::Result<Vec<celld_logic::LocalCell>> {
+        let replication = self
+            .replication
+            .as_ref()
+            .context("local reload requires replication")?;
+        Ok(replication.local_cells())
+    }
+
+    /// Close every resident runtime, retain its exact database path, remove
+    /// stale live-named epochs, and publish one node-level local certificate.
+    /// The caller has already stopped admission and drained request effects.
+    pub async fn prepare_clean_reload(
+        &self,
+        cells: &[celld_logic::PresenceCell],
+    ) -> anyhow::Result<usize> {
+        let replication = self
+            .replication
+            .as_ref()
+            .context("clean reload requires replication")?;
+        let keep: BTreeSet<_> = cells
+            .iter()
+            .map(|cell| (cell.id.clone(), cell.epoch))
+            .collect();
+        anyhow::ensure!(
+            keep.len() == cells.len(),
+            "clean reload resident inventory contains duplicates"
+        );
+        let mut closes = futures_util::stream::iter(cells.iter().cloned())
+            .map(|cell| {
+                let runtime = self.clone();
+                let replication = replication.clone();
+                async move {
+                    runtime.stop_cell(&cell.id, cell.epoch, false, true).await;
+                    replication.close_for_reload(&cell.id, cell.epoch)
+                }
+            })
+            .buffer_unordered(128);
+        while let Some(result) = closes.next().await {
+            result?;
+        }
+        let pruned = replication.prune_stale_live(&keep)?;
+        Ok(pruned)
+    }
+
     pub fn replication_status(&self) -> std::io::Result<Option<std::process::ExitStatus>> {
         match &self.replication {
             Some(replication) => replication.process_status(),
             None => Ok(None),
-        }
-    }
-
-    /// Did the replicator refuse to prove this commit durable? Distinct from
-    /// `ensure_durable`: an absent control socket is not a refusal here, it is
-    /// the historical ungated behaviour.
-    pub async fn sync_refused(&self, cell: &str, epoch: u64) -> bool {
-        match &self.replication {
-            Some(replication) => replication.sync_refused(cell, epoch).await,
-            None => false,
         }
     }
 
@@ -533,9 +781,6 @@ impl RuntimeManager {
     /// Materialize an isolate and retain it as non-routable until publication.
     pub async fn start_cell(&self, cell: String, epoch: u64, fresh: bool) -> anyhow::Result<()> {
         let db_path = self.db_path(&cell, epoch);
-        let (tx, rx) = mpsc::channel::<CellJob>();
-        let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
-        let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel();
         let class = cell
             .split_once(':')
             .map(|(class, _)| class)
@@ -545,10 +790,6 @@ impl RuntimeManager {
             .get(class)
             .cloned()
             .ok_or_else(|| anyhow!("no Worker exports Durable Object class {class}"))?;
-        let thread_tx = tx.clone();
-        let next_alarm_ms = Arc::new(AtomicI64::new(-1));
-        let thread_alarm = next_alarm_ms.clone();
-        let alarm_observer = self.alarm_observer.clone();
         let startup_timing = CellIsolateStartupTiming {
             started: Instant::now(),
             scope: cell.clone(),
@@ -557,71 +798,75 @@ impl RuntimeManager {
             epoch,
             fresh,
         };
-        std::thread::Builder::new()
-            .name(format!("celld-cell-{cell}"))
-            .spawn(move || {
-                run_cell(
-                    db_path,
-                    config,
-                    rx,
-                    startup_tx,
-                    thread_alarm,
-                    alarm_observer,
-                    startup_timing,
-                );
-                let _ = stopped_tx.send(());
-            })
-            .with_context(|| format!("spawn cell isolate {cell}"))?;
+
+        let isolates = self
+            .cell_isolates
+            .get(&config.script_name)
+            .cloned()
+            .ok_or_else(|| anyhow!("no cell isolates for script {}", config.script_name))?;
+        // Building an isolate compiles the script, so it runs on a blocking
+        // thread: the pool builds before taking its lock, but the caller is a
+        // tokio worker either way.
+        let placed = {
+            let isolates = isolates.clone();
+            tokio::task::spawn_blocking(move || isolates.place_cell())
+                .await
+                .context("cell placement panicked")?
+        };
+        let residency = match placed {
+            Ok(residency) => residency,
+            Err(error) => {
+                startup_timing.emit("error", "worker_load");
+                return Err(error);
+            }
+        };
+        let isolate = residency.slot().clone();
+
+        // Everything the cell needs that the isolate must do: open its
+        // SQLite — which the isolate owns, not the caller — restore its
+        // persisted id name, and record `__cell.owned` so the harness can
+        // dispatch to it without a host round trip.
+        //
+        // A direct call rather than a job: adoption is not an event, it runs
+        // no handler, and it needs one turn.
+        let adopted = isolate
+            .turn(|worker| worker.own_cell(&cell, Some(path_text(&db_path)), true))
+            .await;
+        let alarm = match adopted {
+            Ok(alarm) => alarm,
+            Err(error) => {
+                startup_timing.emit("error", "storage_open");
+                return Err(error);
+            }
+        };
+        (self.alarm_observer)(cell.clone(), alarm);
+        let startup_us = startup_timing.emit("ready", "");
 
         {
             let mut cells = self.cells.lock().expect("cell registry poisoned");
             if cells.starting.contains_key(&cell) || cells.published.contains_key(&cell) {
-                let _ = thread_tx.send(CellJob::Shutdown);
                 return Err(anyhow!("cell runtime already exists: {cell}"));
             }
             cells.starting.insert(
                 cell.clone(),
                 CellHandle {
                     epoch,
-                    startup_us: 0,
-                    tx: thread_tx,
-                    stopped: stopped_rx,
-                    next_alarm_ms,
+                    startup_us,
+                    residency,
+                    next_alarm_ms: AtomicI64::new(alarm.unwrap_or(-1)),
                 },
             );
+            Ok(())
         }
-
-        let result = match startup_rx.await {
-            Ok(result) => result,
-            Err(error) => {
-                self.remove_starting(&cell, epoch);
-                return Err(error).context("cell isolate exited during startup");
-            }
-        };
-        let startup_us = match result {
-            Ok(startup_us) => startup_us,
-            Err(error) => {
-                self.remove_starting(&cell, epoch);
-                return Err(error);
-            }
-        };
-        let mut cells = self.cells.lock().expect("cell registry poisoned");
-        let handle = cells
-            .starting
-            .get_mut(&cell)
-            .filter(|handle| handle.epoch == epoch)
-            .ok_or_else(|| anyhow!("started cell runtime disappeared: {cell} epoch {epoch}"))?;
-        handle.startup_us = startup_us;
-        Ok(())
     }
 
     /// Make the exact started generation visible to request dispatch.
     pub fn publish_cell(&self, cell: &str, epoch: u64) -> anyhow::Result<()> {
         let mut cells = self.cells.lock().expect("cell registry poisoned");
-        if !cells
+        if cells
             .starting
             .get(cell)
-            .is_some_and(|handle| handle.epoch == epoch)
+            .is_none_or(|handle| handle.epoch != epoch)
         {
             return Err(anyhow!("no started cell runtime for {cell} epoch {epoch}"));
         }
@@ -631,7 +876,9 @@ impl RuntimeManager {
             .expect("checked started runtime");
         let startup_us = handle.startup_us;
         if let Some(replaced) = cells.published.insert(cell.to_string(), handle) {
-            let _ = replaced.tx.send(CellJob::Shutdown);
+            // Nothing to shut down: the isolate serves other cells, and
+            // dropping the handle drops the residency that held its place.
+            drop(replaced);
             return Err(anyhow!("replaced published cell runtime for {cell}"));
         }
         drop(cells);
@@ -649,7 +896,7 @@ impl RuntimeManager {
         Ok(())
     }
 
-    pub async fn stop_cell(&self, cell: &str, epoch: u64, hibernate: bool, preserve_local: bool) {
+    pub async fn stop_cell(&self, cell: &str, epoch: u64, evict: bool, preserve_local: bool) {
         let mut stopped = Vec::new();
         {
             let mut cells = self.cells.lock().expect("cell registry poisoned");
@@ -674,12 +921,24 @@ impl RuntimeManager {
         }
         let stopped_runtime = !stopped.is_empty();
         for handle in stopped {
-            let _ = handle.tx.send(CellJob::Shutdown);
-            let _ = handle.stopped.await;
+            // Give the cell back rather than shutting the isolate down: it
+            // serves other cells. Taking the isolate for this turn is the
+            // barrier — an event of this cell either finished its turn
+            // before it, or has not started one — so closing its SQLite
+            // cannot land under a handler that is mid-turn.
+            let _ = handle
+                .residency
+                .slot()
+                .turn(|worker| worker.own_cell(cell, None, false))
+                .await;
+            // Dropping the handle drops its residency, which is what gives
+            // the isolate its place back — and what lets `retire` reclaim
+            // the isolate once no cell is left in it.
+            drop(handle);
         }
-        if stopped_runtime && hibernate {
+        if stopped_runtime && evict {
             if let Some(replication) = &self.replication {
-                replication.hibernate(cell, epoch, preserve_local).await;
+                replication.evict(cell, epoch, preserve_local).await;
             }
         }
     }
@@ -697,29 +956,22 @@ impl RuntimeManager {
             body,
             headers,
             request_id,
+            order,
+            parent,
         } = request;
-        let tx = self
-            .cells
-            .lock()
-            .expect("cell registry poisoned")
-            .published
-            .get(&cell)
-            .map(|handle| handle.tx.clone())
-            .ok_or_else(|| anyhow!("cell runtime is not published: {cell}"))?;
+        let isolate = self.cell_isolate(&cell)?;
         let (reply, mut receive) = tokio::sync::oneshot::channel();
         let scope = cell.clone();
-        let send = || {
-            tx.send(CellJob::Fetch {
-                request_id,
-                scope: cell,
-                name,
-                url,
-                method,
-                body,
-                headers,
-                reply,
-            })
-            .map_err(|_| anyhow!("cell isolate stopped"))
+        let job = CellJob::Fetch {
+            request_id,
+            scope: cell,
+            name,
+            url,
+            method,
+            body,
+            headers,
+            reply,
+            order,
         };
         if let Some(request_id) = request_id {
             let mut aborts = self.remote_aborts.lock().expect("abort registry poisoned");
@@ -727,16 +979,21 @@ impl RuntimeManager {
             if aborts.remove(&request_id).is_some() {
                 return Err(anyhow!("the client disconnected before dispatch"));
             }
-            send()?;
-        } else {
-            send()?;
         }
+        tokio::spawn(drive_cell(
+            isolate,
+            job,
+            Some(self.alarm_reporter.clone()),
+            parent,
+        ));
         let result = match (request_id, cancel) {
             (Some(request_id), Some(mut cancel)) => tokio::select! {
                 result = &mut receive => result,
                 cancelled = &mut cancel => {
                     if cancelled.is_ok() {
-                        let _ = tx.send(CellJob::AbortFetch { request_id });
+                        // The drive re-reads this between turns and enters
+                        // the isolate only once it has really fired.
+                        js::abort_request(request_id);
                     }
                     receive.await
                 }
@@ -766,16 +1023,9 @@ impl RuntimeManager {
         let mut aborts = self.remote_aborts.lock().expect("abort registry poisoned");
         prune_remote_aborts(&mut aborts);
         aborts.insert(request_id, Instant::now());
-        let tx = self
-            .cells
-            .lock()
-            .expect("cell registry poisoned")
-            .published
-            .get(cell)
-            .map(|handle| handle.tx.clone());
-        if let Some(tx) = tx {
-            let _ = tx.send(CellJob::AbortFetch { request_id });
-        }
+        drop(aborts);
+        js::abort_request(request_id);
+        let _ = cell;
     }
 
     pub fn published_epoch(&self, cell: &str) -> Option<u64> {
@@ -788,14 +1038,22 @@ impl RuntimeManager {
     }
 
     pub fn alarm(&self, cell: &str) -> Option<i64> {
+        self.with_alarm(cell, |at_ms| at_ms)
+    }
+
+    /// Read the cell's alarm cache and call `f` before the registry lock is
+    /// released. The reporter sends under the same lock, so whatever `f`
+    /// sends is ordered with the reporter's sends: a read taken here cannot
+    /// reach the core after a fresher report (see `alarm_reporter`).
+    pub fn with_alarm<T>(&self, cell: &str, f: impl FnOnce(Option<i64>) -> T) -> T {
         let cells = self.cells.lock().expect("cell registry poisoned");
         let at_ms = cells
             .published
             .get(cell)
-            .or_else(|| cells.starting.get(cell))?
-            .next_alarm_ms
-            .load(Ordering::Acquire);
-        (at_ms >= 0).then_some(at_ms)
+            .or_else(|| cells.starting.get(cell))
+            .map(|handle| handle.next_alarm_ms.load(Ordering::Acquire))
+            .filter(|at_ms| *at_ms >= 0);
+        f(at_ms)
     }
 
     pub fn alarm_covered(&self, cell: &str, at_ms: Option<i64>) -> bool {
@@ -811,44 +1069,33 @@ impl RuntimeManager {
         &self,
         cell: String,
         scheduled_ms: i64,
-    ) -> anyhow::Result<(Option<i64>, bool)> {
-        let tx = self
-            .cells
-            .lock()
-            .expect("cell registry poisoned")
-            .published
-            .get(&cell)
-            .map(|handle| handle.tx.clone())
-            .ok_or_else(|| anyhow!("cell runtime is not published: {cell}"))?;
+    ) -> anyhow::Result<(Option<i64>, bool, Option<u64>)> {
         let (reply, receive) = tokio::sync::oneshot::channel();
-        tx.send(CellJob::Alarm {
+        let job = CellJob::Alarm {
             scope: cell.clone(),
             scheduled_ms,
+            claim: js::AlarmDispatch::Due,
             reply,
-        })
-        .map_err(|_| anyhow!("cell isolate stopped"))?;
-        let at_ms = receive
-            .await
-            .context("cell isolate dropped alarm result")??;
+        };
+        let (at_ms, wrote) = self
+            .cell_event(&cell, job, receive, "cell isolate dropped alarm result")
+            .await?;
         js::drain_arm_gates(&cell)
             .await
             .map_err(|error| anyhow!(error))?;
-        Ok((at_ms, self.alarm_covered(&cell, at_ms)))
+        Ok((at_ms, self.alarm_covered(&cell, at_ms), wrote))
     }
 
     pub async fn ws_open(&self, cell: String, ws_id: u64, protocol: String) -> anyhow::Result<()> {
-        let tx = self.cell_sender(&cell)?;
         let (reply, receive) = tokio::sync::oneshot::channel();
-        tx.send(CellJob::WsOpen {
-            scope: cell,
+        let job = CellJob::WsOpen {
+            scope: cell.clone(),
             ws_id,
             protocol,
             reply,
-        })
-        .map_err(|_| anyhow!("cell isolate stopped"))?;
-        receive
+        };
+        self.cell_event(&cell, job, receive, "cell isolate dropped WebSocket open")
             .await
-            .context("cell isolate dropped WebSocket open")?
     }
 
     pub async fn rpc(
@@ -857,18 +1104,17 @@ impl RuntimeManager {
         name: Option<String>,
         method: String,
         args: js::RpcData,
-    ) -> anyhow::Result<js::RpcData> {
-        let tx = self.cell_sender(&cell)?;
+    ) -> anyhow::Result<js::RpcOutcome> {
         let (reply, receive) = tokio::sync::oneshot::channel();
-        tx.send(CellJob::Rpc {
-            scope: cell,
+        let job = CellJob::Rpc {
+            scope: cell.clone(),
             name,
             method,
             args,
             reply,
-        })
-        .map_err(|_| anyhow!("cell isolate stopped"))?;
-        receive.await.context("cell isolate dropped RPC result")?
+        };
+        self.cell_event(&cell, job, receive, "cell isolate dropped RPC result")
+            .await
     }
 
     pub async fn ws_message(
@@ -877,18 +1123,20 @@ impl RuntimeManager {
         ws_id: u64,
         data: js::WsIn,
     ) -> anyhow::Result<js::WsDispatch> {
-        let tx = self.cell_sender(&cell)?;
         let (reply, receive) = tokio::sync::oneshot::channel();
-        tx.send(CellJob::WsMessage {
-            scope: cell,
+        let job = CellJob::WsMessage {
+            scope: cell.clone(),
             ws_id,
             data,
             reply,
-        })
-        .map_err(|_| anyhow!("cell isolate stopped"))?;
-        receive
-            .await
-            .context("cell isolate dropped WebSocket message")?
+        };
+        self.cell_event(
+            &cell,
+            job,
+            receive,
+            "cell isolate dropped WebSocket message",
+        )
+        .await
     }
 
     pub async fn ws_closed(
@@ -899,30 +1147,50 @@ impl RuntimeManager {
         reason: String,
         was_clean: bool,
     ) -> anyhow::Result<()> {
-        let tx = self.cell_sender(&cell)?;
         let (reply, receive) = tokio::sync::oneshot::channel();
-        tx.send(CellJob::WsClosed {
-            scope: cell,
+        let job = CellJob::WsClosed {
+            scope: cell.clone(),
             ws_id,
             code,
             reason,
             was_clean,
             reply,
-        })
-        .map_err(|_| anyhow!("cell isolate stopped"))?;
-        receive
+        };
+        self.cell_event(&cell, job, receive, "cell isolate dropped WebSocket close")
             .await
-            .context("cell isolate dropped WebSocket close")?
     }
 
-    fn cell_sender(&self, cell: &str) -> anyhow::Result<mpsc::Sender<CellJob>> {
+    /// The isolate a published cell's events run in.
+    fn cell_isolate(&self, cell: &str) -> anyhow::Result<Arc<crate::pool::Slot>> {
         self.cells
             .lock()
             .expect("cell registry poisoned")
             .published
             .get(cell)
-            .map(|handle| handle.tx.clone())
+            .map(|handle| handle.residency.slot().clone())
             .ok_or_else(|| anyhow!("cell runtime is not published: {cell}"))
+    }
+
+    /// Start one cell event and wait for its answer.
+    ///
+    /// The event is driven by its own task, so this future holds nothing
+    /// while it waits: the isolate is taken and given back one turn at a
+    /// time by `drive_cell`.
+    async fn cell_event<T>(
+        &self,
+        cell: &str,
+        job: CellJob,
+        receive: tokio::sync::oneshot::Receiver<anyhow::Result<T>>,
+        dropped: &'static str,
+    ) -> anyhow::Result<T> {
+        let isolate = self.cell_isolate(cell)?;
+        tokio::spawn(drive_cell(
+            isolate,
+            job,
+            Some(self.alarm_reporter.clone()),
+            None,
+        ));
+        receive.await.context(dropped)?
     }
 
     fn db_path(&self, cell: &str, epoch: u64) -> PathBuf {
@@ -932,148 +1200,358 @@ impl RuntimeManager {
             .join(format!("e{epoch}"))
             .join("db.sqlite")
     }
+}
 
-    fn remove_starting(&self, cell: &str, epoch: u64) {
-        let handle = {
-            let mut cells = self.cells.lock().expect("cell registry poisoned");
-            if cells
-                .starting
-                .get(cell)
-                .is_some_and(|handle| handle.epoch == epoch)
-            {
-                cells.starting.remove(cell)
-            } else {
-                None
+/// The caller's trace context, when the ingress request carried one.
+/// Malformed headers are ignored; nothing here is trusted for anything
+/// but correlation and (under parentbased samplers, deliberately) the
+/// sampling decision.
+fn inbound_parent(job: &crate::WorkerJob) -> Option<crate::telemetry::ParentContext> {
+    if !crate::telemetry::active() {
+        return None;
+    }
+    let crate::WorkerJob::Fetch { headers, .. } = job else {
+        return None;
+    };
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("traceparent"))
+        .and_then(|(_, value)| crate::telemetry::parse_traceparent(value))
+}
+
+/// An op in flight, carrying the id of the promise it will resolve.
+type PendingOp = std::pin::Pin<
+    Box<dyn std::future::Future<Output = (u64, Result<asyncrt::OpOut, String>)> + Send>,
+>;
+
+/// The ops one request is waiting on. Per request, not per isolate: that is
+/// what deleting the pump means, and it is why no attribution table exists.
+type Ops = futures_util::stream::FuturesUnordered<PendingOp>;
+
+fn adopt(ops: &mut Ops, started: Vec<js::Op>) {
+    for (id, future) in started {
+        ops.push(Box::pin(async move { (id, future.await) }));
+    }
+}
+
+/// Drive one stateless request to completion, one turn at a time.
+///
+/// The loop the pump used to run, owned by the request instead. Between turns
+/// it holds no isolate — only its affiliation, which is memory rather than
+/// CPU — so a handler awaiting I/O stops nothing else in that isolate.
+pub(crate) async fn drive(
+    slot: Arc<crate::pool::Slot>,
+    job: crate::WorkerJob,
+    telemetry: Option<(Arc<str>, Arc<str>)>,
+) {
+    drive_affiliated(slot.affiliate(), job, telemetry).await;
+}
+
+async fn drive_affiliated(
+    affiliation: crate::pool::Affiliation,
+    job: crate::WorkerJob,
+    telemetry: Option<(Arc<str>, Arc<str>)>,
+) {
+    let slot = affiliation.slot().clone();
+    // One sampling decision per request, shared by the SERVER span and
+    // the turn context the handler's console/fetch children inherit. A
+    // caller's traceparent is honored per the spec: ids adopted either
+    // way, its sampled flag deciding only under a parentbased sampler.
+    let remote = telemetry.as_ref().and_then(|_| inbound_parent(&job));
+    let trace = telemetry
+        .as_ref()
+        .and_then(|_| crate::telemetry::start_trace_with_parent(remote.as_ref()));
+    let mut timing = telemetry
+        .map(|(node, region)| FetchTiming::start(&job, slot.id, node, region, trace, remote));
+    // Admission created `affiliation` before returning the isolate. It stays
+    // here for the request's whole life, so maintenance cannot free the heap
+    // between placement and this first turn or while a promise is suspended.
+    let _affiliation = affiliation;
+    let budget = js::handler_budget();
+    let mut ops = Ops::new();
+
+    let (begun, started) = slot.turn(|worker| worker.turn_begin(job, trace)).await;
+    adopt(&mut ops, started);
+    // Nothing is in flight; the reply already carries the error.
+    let Some(mut entry) = begun else { return };
+    if let Some(timing) = &mut timing {
+        timing.answered(&entry);
+    }
+
+    while !entry.finished() {
+        let started = match wake(&mut ops, &entry, budget).await {
+            Wake::Op(op, result) => {
+                slot.turn(|worker| worker.turn_deliver(&mut entry, op, result))
+                    .await
             }
+            Wake::Cancelled => slot.turn(|worker| worker.turn_cancel(&mut entry)).await,
+            Wake::Expired => {
+                entry.time_out(budget);
+                break;
+            }
+            Wake::Idle => {
+                entry.stuck();
+                break;
+            }
+            Wake::Poll => slot.turn(|worker| worker.turn_poll(&mut entry)).await,
         };
-        if let Some(handle) = handle {
-            let _ = handle.tx.send(CellJob::Shutdown);
+        adopt(&mut ops, started);
+        if let Some(timing) = &mut timing {
+            timing.answered(&entry);
+        }
+    }
+
+    // Dropping `ops` aborts whatever is still pending, which is what a region
+    // does on every exit path; their resolvers have to go with them.
+    entry.abandon();
+}
+
+/// What next moves a suspended request.
+enum Wake {
+    /// One of its own ops finished.
+    Op(u64, Result<asyncrt::OpOut, String>),
+    /// Its client hung up.
+    Cancelled,
+    /// It ran past the handler budget without answering.
+    Expired,
+    /// Nothing outstanding could ever move it.
+    Idle,
+    /// Nothing of its own is outstanding, but another event of the same cell
+    /// still could settle it. Look in and see.
+    Poll,
+}
+
+/// Wait for whichever comes first, holding no isolate.
+///
+/// This is the whole of what a request does between turns, and it is
+/// deliberately the only place that waits: everything else in `drive` either
+/// holds the isolate or is arithmetic.
+async fn wake(ops: &mut Ops, entry: &js::InFlight, budget: Duration) -> Wake {
+    loop {
+        let Some(left) = entry.remaining(budget) else {
+            // Answered already, so this is `waitUntil` work: not charged the
+            // handler budget, and with no client left to hang up.
+            return match ops.next().await {
+                Some((op, result)) => Wake::Op(op, result),
+                None => Wake::Idle,
+            };
+        };
+        // A disconnect is raised on another thread with nothing to wake this
+        // one, so the wait is capped and the flag re-read — as the blocking
+        // run loop capped its own. The difference is that reading it costs no
+        // isolate, so a request enters V8 only once the client has really gone.
+        let capped = if entry.cancellable() {
+            left.min(CANCELLATION_TICK)
+        } else {
+            left
+        };
+        // Nothing of this entry's own is outstanding, so there is no future
+        // to wait on — only the chance that some *other* entry in this
+        // isolate has settled it since the last look. That is an ordinary
+        // thing rather than a stall: a cell awaits the alarm it armed, and a
+        // Worker awaits a Durable Object it dispatched to in-isolate. Both
+        // used to resolve inside the caller's own run loop, so there was
+        // nothing to wait for; both are separate entries now.
+        //
+        // So "waiting on nothing" is a verdict the budget reaches, not one
+        // an empty op set proves.
+        if ops.is_empty() {
+            if left.is_zero() {
+                return Wake::Idle;
+            }
+            tokio::time::sleep(capped.min(CANCELLATION_TICK)).await;
+            // Re-read the flag on this path too. A request with nothing
+            // outstanding can still have its client hang up, and only the
+            // branch below used to look.
+            if js::take_request_cancellation(entry.request_id()) {
+                return Wake::Cancelled;
+            }
+            return Wake::Poll;
+        }
+        match tokio::time::timeout(capped, ops.next()).await {
+            Ok(Some((op, result))) => return Wake::Op(op, result),
+            Ok(None) => return Wake::Idle,
+            Err(_) if js::take_request_cancellation(entry.request_id()) => return Wake::Cancelled,
+            // The wait was the whole remaining budget, so it is spent.
+            Err(_) if capped == left => return Wake::Expired,
+            // Only a cancellation tick elapsed; keep waiting.
+            Err(_) => continue,
         }
     }
 }
 
-impl StatelessRuntime {
+/// One stateless request's canonical timing event.
+///
+/// The phases still mean what they always did, but what they measure has
+/// moved: `queue_wait_us` was the wait for a free worker thread and is now
+/// the wait for admission and the isolate's async gate, and `execution_us`
+/// spans every turn the request took rather than one uninterrupted run.
+struct FetchTiming {
+    queued_at: Instant,
+    request_id: Option<js::RequestId>,
+    node: Arc<str>,
+    region: Arc<str>,
+    isolate: usize,
+    admitted: Instant,
+    emitted: bool,
+    /// Sampled at creation: `None` is off or unsampled, and nothing more
+    /// is ever built for this request (wiki/designs/otel.md).
+    trace: Option<crate::telemetry::TraceIds>,
+    /// The caller's span, when the request arrived with a traceparent.
+    remote_parent: Option<crate::telemetry::ParentContext>,
+    /// Why the handler failed, read from the entry when it was answered.
+    failure: Option<String>,
+}
+
+impl FetchTiming {
     fn start(
-        config: Arc<WorkerConfig>,
-        workers: usize,
+        job: &crate::WorkerJob,
+        isolate: usize,
         node: Arc<str>,
         region: Arc<str>,
-    ) -> anyhow::Result<Self> {
-        let (tx, rx) = mpsc::channel::<crate::WorkerJob>();
-        let pool = Arc::new(crate::WorkerPool::new(tx));
-        let rx = Arc::new(Mutex::new(rx));
-        let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
-
-        for worker_index in 0..workers {
-            let config = config.clone();
-            let jobs = rx.clone();
-            let ready = ready_tx.clone();
-            let node = node.clone();
-            let region = region.clone();
-            std::thread::Builder::new()
-                .name(format!("celld-worker-{worker_index}"))
-                .spawn(move || {
-                    asyncrt::init();
-                    let mut worker = match Worker::load_config(config, &[]) {
-                        Ok(worker) => {
-                            let _ = ready.send(Ok(()));
-                            worker
-                        }
-                        Err(error) => {
-                            let _ = ready.send(Err(format!("{error:#}")));
-                            return;
-                        }
-                    };
-                    loop {
-                        let job = {
-                            let receiver = jobs.lock().expect("stateless worker queue poisoned");
-                            receiver.recv()
-                        };
-                        let Ok(job) = job else {
-                            break;
-                        };
-                        match job {
-                            crate::WorkerJob::Fetch {
-                                queued_at,
-                                url,
-                                method,
-                                body,
-                                headers,
-                                request_id,
-                                reply,
-                            } => {
-                                let execution_started = Instant::now();
-                                let result = worker.fetch_and_reply_id(
-                                    &url,
-                                    &method,
-                                    &body,
-                                    &headers,
-                                    request_id,
-                                    reply,
-                                );
-                                // Per-request timing rides the off-by-default
-                                // `timing` target: an info!-per-request costs real
-                                // throughput on the hot path, and the `enabled!`
-                                // guard skips the elapsed math and formatting when
-                                // the target is off. The lab turns it on with
-                                // RUST_LOG=info,timing=debug.
-                                if let Some(request_id) = request_id.filter(|_| {
-                                    tracing::enabled!(target: "timing", tracing::Level::DEBUG)
-                                }) {
-                                    let queue_wait_us = queued_at.elapsed().as_micros() as u64;
-                                    let execution_us =
-                                        execution_started.elapsed().as_micros() as u64;
-                                    tracing::debug!(
-                                        target: "timing",
-                                        event = "worker_fetch_timing",
-                                        outcome = if result.is_ok() {
-                                            "completed"
-                                        } else {
-                                            "reload_error"
-                                        },
-                                        request_id = %js::request_id_string(request_id),
-                                        node = %node,
-                                        region = %region,
-                                        runtime_version = env!("CARGO_PKG_VERSION"),
-                                        total_us = queued_at.elapsed().as_micros() as u64,
-                                        queue_wait_us,
-                                        execution_us,
-                                        worker_index,
-                                        "stateless Worker fetch completed"
-                                    );
-                                }
-                                if let Err(error) = result {
-                                    tracing::warn!(%error, worker_index, "stateless Worker reload failed");
-                                }
-                            }
-                            crate::WorkerJob::Rpc {
-                                entrypoint,
-                                method,
-                                args,
-                                reply,
-                            } => {
-                                let _ = reply.send(
-                                    worker.dispatch_entrypoint_rpc(&entrypoint, &method, args),
-                                );
-                            }
-                        }
-                    }
-                })
-                .with_context(|| format!("spawn stateless worker {worker_index}"))?;
+        trace: Option<crate::telemetry::TraceIds>,
+        remote_parent: Option<crate::telemetry::ParentContext>,
+    ) -> Self {
+        let (queued_at, request_id) = match job {
+            crate::WorkerJob::Fetch {
+                queued_at,
+                request_id,
+                ..
+            } => (*queued_at, *request_id),
+            _ => (Instant::now(), None),
+        };
+        FetchTiming {
+            queued_at,
+            request_id,
+            node,
+            region,
+            isolate,
+            admitted: Instant::now(),
+            emitted: false,
+            trace,
+            remote_parent,
+            failure: None,
         }
-        drop(ready_tx);
-        for _ in 0..workers {
-            match ready_rx
-                .recv()
-                .context("stateless Worker exited during startup")?
-            {
-                Ok(()) => {}
-                Err(error) => return Err(anyhow!("stateless Worker failed to load: {error}")),
-            }
-        }
-        Ok(Self { pool })
     }
 
+    /// Emit once, the first time the client has been answered. `waitUntil`
+    /// work continues afterwards and is not part of the response's timing.
+    fn answered(&mut self, entry: &js::InFlight) {
+        if self.emitted || !entry.answered() {
+            return;
+        }
+        self.emitted = true;
+        self.failure = entry.failure().map(str::to_string);
+        self.emit();
+    }
+
+    fn emit(&self) {
+        if let Some(ids) = self.trace {
+            let total_us = self.queued_at.elapsed().as_micros() as i64;
+            let mut span =
+                crate::telemetry::Span::new(ids, "celld.fetch", crate::telemetry::KIND_SERVER);
+            span.start_unix_us = crate::telemetry::now_unix_us() - total_us;
+            span.duration_us = total_us;
+            span.ok = self.failure.is_none();
+            span.error = self.failure.clone();
+            span.request_id = self.request_id.map(js::request_id_string);
+            span.isolate = Some(self.isolate as u64);
+            span.parent_span_id = self.remote_parent.map(|parent| parent.span_id);
+            span.parent_remote = self.remote_parent.map(|_| true);
+            span.queue_wait_us =
+                Some(self.admitted.duration_since(self.queued_at).as_micros() as i64);
+            crate::telemetry::record(span);
+        }
+        // An info!-per-request costs real throughput on the hot path, so the
+        // `enabled!` guard skips the elapsed math and the formatting when the
+        // target is off. The lab turns it on with RUST_LOG=info,timing=debug.
+        let Some(request_id) = self
+            .request_id
+            .filter(|_| tracing::enabled!(target: "timing", tracing::Level::DEBUG))
+        else {
+            return;
+        };
+        tracing::debug!(
+            target: "timing",
+            event = "worker_fetch_timing",
+            outcome = "completed",
+            request_id = %js::request_id_string(request_id),
+            node = %self.node,
+            region = %self.region,
+            runtime_version = env!("CARGO_PKG_VERSION"),
+            total_us = self.queued_at.elapsed().as_micros() as u64,
+            queue_wait_us = self.admitted.duration_since(self.queued_at).as_micros() as u64,
+            execution_us = self.admitted.elapsed().as_micros() as u64,
+            isolate = self.isolate,
+            "stateless Worker fetch completed"
+        );
+    }
+}
+
+/// Initialise V8, at most once.
+///
+/// **Must run before any thread that will enter an isolate is created.**
+/// V8 protects its pointer tables with a memory protection key, and the
+/// `PKRU` register granting access to that key is per-thread and inherited
+/// at thread creation. A thread created before this runs never receives
+/// access, so its first read of a dispatch table traps with `SEGV_PKUERR`
+/// on any CPU that supports protection keys. See
+/// `wiki/designs/segfault-on-zen4.md`.
+pub fn init_v8() {
+    static V8_INIT: Once = Once::new();
+    V8_INIT.call_once(js::Engine::init);
+}
+
+impl StatelessRuntime {
+    fn start(config: Arc<WorkerConfig>, node: Arc<str>, region: Arc<str>) -> anyhow::Result<Self> {
+        let build = {
+            let config = config.clone();
+            move || Worker::load_config(config.clone(), &[])
+        };
+        let isolates = Arc::new(crate::pool::Pool::new(
+            pool_limits(),
+            admission_wait(),
+            Box::new(build),
+        ));
+        // Eagerly, so a script that does not load fails here rather than on
+        // every request, and so the first request does not pay for compiling
+        // it. Growth past this one stays lazy.
+        isolates.warm().context("stateless Worker failed to load")?;
+        // Give isolates back when the burst that grew them is over. Without
+        // this the pool only grows, and every heap a burst created is held
+        // for the life of the process. Long relative to a request, because
+        // retiring is not urgent and a short period would thrash a pool that
+        // is about to be busy again.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let reaping = isolates.clone();
+            handle.spawn(async move {
+                // `interval` fires its first tick immediately, which
+                // reaped the isolate `warm` had just built and handed the
+                // first request the compile cost warming exists to avoid.
+                let mut tick = tokio::time::interval_at(
+                    tokio::time::Instant::now() + REAP_INTERVAL,
+                    REAP_INTERVAL,
+                );
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    reaping.reap();
+                }
+            });
+        }
+        Ok(Self {
+            isolates,
+            node,
+            region,
+        })
+    }
+
+    /// Serve one stateless request, entering an isolate once per turn.
+    ///
+    /// The request drives itself: it is admitted and placed, runs its first
+    /// turn, then awaits its *own* ops with no isolate held, re-entering for
+    /// each completion. Nothing multiplexes and nothing demultiplexes, which
+    /// is what deleting the pump buys (wiki/designs/deleting-the-pump.md).
     async fn fetch(
         &self,
         url: String,
@@ -1082,39 +1560,72 @@ impl StatelessRuntime {
         headers: Vec<(String, String)>,
         request_id: Option<js::RequestId>,
     ) -> anyhow::Result<HttpResponse> {
+        let shedding = crate::ownership_store::node_is_shedding();
+        let affiliation = self.isolates.admit_or_wait(shedding).await?;
         let (reply, receive) = tokio::sync::oneshot::channel();
-        self.pool
-            .send(crate::WorkerJob::Fetch {
-                queued_at: Instant::now(),
-                url,
-                method,
-                body,
-                headers,
-                request_id,
-                reply,
-            })
-            .map_err(|_| anyhow!("stateless Worker pool stopped"))?;
-        receive.await.context("stateless Worker dropped response")?
+        let job = crate::WorkerJob::Fetch {
+            queued_at: Instant::now(),
+            url,
+            method,
+            body,
+            headers,
+            request_id,
+            reply,
+        };
+        // Spawned rather than awaited inline, because the response and the
+        // request are not the same event: `waitUntil` work outlives the
+        // answer, and the driver keeps turning until it settles.
+        let driving = tokio::spawn(drive_affiliated(
+            affiliation,
+            job,
+            Some((self.node.clone(), self.region.clone())),
+        ));
+        match receive.await {
+            Ok(response) => response,
+            // The driver dropped the reply without sending. Joining it here —
+            // and only here — turns a bare "channel closed" into the panic
+            // that actually caused it, at no cost on the path that works.
+            Err(_) => match driving.await {
+                Err(error) => Err(anyhow!("stateless request task died: {error}")),
+                Ok(()) => Err(anyhow!("stateless Worker dropped response")),
+            },
+        }
     }
 
+    /// An entrypoint RPC, on the isolate pool like fetch.
+    ///
+    /// It used to go to the worker threads, because the old RPC dispatcher
+    /// blocked while the handler awaited — and a
+    /// blocking call cannot hold a pool slot without parking a tokio worker
+    /// on V8. Turning it into `begin`/`drive` removes the blocking, and with
+    /// it the last reason `WorkerPool` existed.
     async fn rpc(
         &self,
         entrypoint: String,
         method: String,
         args: Vec<u8>,
     ) -> anyhow::Result<Vec<u8>> {
+        let shedding = crate::ownership_store::node_is_shedding();
+        let affiliation = self.isolates.admit_or_wait(shedding).await?;
         let (reply, receive) = tokio::sync::oneshot::channel();
-        self.pool
-            .send(crate::WorkerJob::Rpc {
-                entrypoint,
-                method,
-                args,
-                reply,
-            })
-            .map_err(|_| anyhow!("stateless Worker pool stopped"))?;
-        receive
-            .await
-            .context("stateless Worker dropped RPC result")?
+        let job = crate::WorkerJob::Rpc {
+            entrypoint,
+            method,
+            args,
+            reply,
+        };
+        let driving = tokio::spawn(drive_affiliated(
+            affiliation,
+            job,
+            Some((self.node.clone(), self.region.clone())),
+        ));
+        match receive.await {
+            Ok(result) => result,
+            Err(_) => match driving.await {
+                Err(error) => Err(anyhow!("stateless RPC task died: {error}")),
+                Ok(()) => Err(anyhow!("stateless Worker dropped RPC result")),
+            },
+        }
     }
 }
 
@@ -1130,6 +1641,20 @@ struct CellIsolateStartupTiming {
 impl CellIsolateStartupTiming {
     fn emit(&self, outcome: &str, failure_phase: &str) -> u64 {
         let total_us = self.started.elapsed().as_micros() as u64;
+        if let Some(ids) = crate::telemetry::start_trace() {
+            let mut span = crate::telemetry::Span::new(
+                ids,
+                "celld.cell_startup",
+                crate::telemetry::KIND_INTERNAL,
+            );
+            span.start_unix_us = crate::telemetry::now_unix_us() - total_us as i64;
+            span.duration_us = total_us as i64;
+            span.ok = outcome == "ready";
+            span.error = (!span.ok).then(|| failure_phase.to_string());
+            span.cell = Some(self.scope.clone());
+            span.epoch = Some(self.epoch);
+            crate::telemetry::record(span);
+        }
         tracing::info!(
             event = "cell_isolate_startup_timing",
             outcome,
@@ -1147,207 +1672,270 @@ impl CellIsolateStartupTiming {
     }
 }
 
-fn run_cell(
-    db_path: PathBuf,
-    config: Arc<WorkerConfig>,
-    rx: mpsc::Receiver<CellJob>,
-    startup: tokio::sync::oneshot::Sender<anyhow::Result<u64>>,
-    next_alarm_ms: Arc<AtomicI64>,
-    alarm_observer: AlarmObserver,
-    startup_timing: CellIsolateStartupTiming,
-) {
-    let cell = startup_timing.scope.clone();
-    asyncrt::init();
+/// Build one isolate for a Worker script's cells.
+///
+/// No cells yet: `Worker::own_cell` fills in `__cell.owned` as each is
+/// placed here, because this isolate outlives any of them.
+fn load_cell_isolate(config: Arc<WorkerConfig>) -> anyhow::Result<Worker> {
     #[cfg(debug_assertions)]
     if let Ok(barrier) = std::env::var("CELLD_TEST_CELL_STARTUP_BARRIER") {
         while !Path::new(&barrier).exists() {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
-    let opened = storage::open(&cell, path_text(&db_path));
-    if let Err(error) = opened {
-        startup_timing.emit("error", "storage_open");
-        let _ = startup.send(Err(error.context("cell storage open failed")));
-        return;
-    }
     #[cfg(debug_assertions)]
     if std::env::var("CELLD_TEST_CELL_STARTUP_FAILURE").as_deref() == Ok("1") {
-        let error = anyhow!("injected cell isolate startup failure");
-        startup_timing.emit("error", "worker_load");
-        storage::close(&cell);
-        let _ = startup.send(Err(error));
-        return;
+        return Err(anyhow!("injected cell isolate startup failure"));
     }
-    storage::watch_alarm(&cell, next_alarm_ms);
-    alarm_observer(cell.clone(), storage::get_alarm(&cell));
-    let mut worker = match Worker::load_config(config, std::slice::from_ref(&cell)) {
-        Ok(worker) => worker,
-        Err(error) => {
-            startup_timing.emit("error", "worker_load");
-            storage::close(&cell);
-            let _ = startup.send(Err(error.context("cell isolate load failed")));
-            return;
+    Worker::load_config(config, &[]).map_err(|error| error.context("cell isolate load failed"))
+}
+
+/// Drive the Worker entry in a cell's isolate.
+///
+/// The stateless `drive` loop, with the isolate named rather than admitted:
+/// this request must run *here*, because the cell it will route to lives
+/// here and routing to it in-isolate is the point.
+async fn drive_worker_on_cell(slot: Arc<crate::pool::Slot>, job: crate::WorkerJob) {
+    let remote = inbound_parent(&job);
+    let trace = crate::telemetry::start_trace_with_parent(remote.as_ref());
+    let span_started = trace.map(|_| (Instant::now(), crate::telemetry::now_unix_us()));
+    let budget = js::handler_budget();
+    let mut ops = Ops::new();
+    let (begun, started) = slot.turn(|worker| worker.turn_begin(job, trace)).await;
+    adopt(&mut ops, started);
+    let Some(mut entry) = begun else {
+        return;
+    };
+    while !entry.finished() {
+        let started = match wake(&mut ops, &entry, budget).await {
+            Wake::Op(op, result) => {
+                slot.turn(|worker| worker.turn_deliver(&mut entry, op, result))
+                    .await
+            }
+            Wake::Cancelled => slot.turn(|worker| worker.turn_cancel(&mut entry)).await,
+            Wake::Expired => {
+                entry.time_out(budget);
+                break;
+            }
+            Wake::Idle => {
+                entry.stuck();
+                break;
+            }
+            Wake::Poll => slot.turn(|worker| worker.turn_poll(&mut entry)).await,
+        };
+        adopt(&mut ops, started);
+    }
+    if let (Some(ids), Some((started, start_unix))) = (trace, span_started) {
+        let mut span =
+            crate::telemetry::Span::new(ids, "celld.fetch", crate::telemetry::KIND_SERVER);
+        span.start_unix_us = start_unix;
+        span.duration_us = started.elapsed().as_micros() as i64;
+        span.ok = entry.finished() && entry.failure().is_none();
+        span.error = entry.failure().map(str::to_string);
+        span.parent_span_id = remote.map(|parent| parent.span_id);
+        span.parent_remote = remote.map(|_| true);
+        crate::telemetry::record(span);
+    }
+    entry.abandon();
+}
+
+/// Report a turn's alarm moves to the host.
+///
+/// The host otherwise hears about a cell's alarm only when the request
+/// finishes, because `ActivityGuard` reports it on drop. That is too late
+/// for a handler that arms an alarm and then *awaits* it: the timer would
+/// not be scheduled until the request ended, and the request cannot end
+/// until the alarm fires. The blocking run loop hid this by polling
+/// `get_alarm` between turns and firing a due alarm inline; with events as
+/// entries, the host has to be told as soon as the arming turn returns.
+fn report_alarm_moves(report: &Option<AlarmReporter>, moves: Vec<(String, i64)>) {
+    if let Some(report) = report {
+        for (scope, at_ms) in moves {
+            report(scope, at_ms);
+        }
+    }
+}
+
+/// Drive one cell event to completion, one turn at a time.
+///
+/// The same loop as `drive`, and deliberately so: what makes a cell event
+/// different is which realm its turns enter and that it waits for the input
+/// gate first — not how it is pumped. Between turns it holds no isolate, so
+/// a handler awaiting I/O stops neither its own cell's next event nor any
+/// other cell sharing the isolate.
+pub(crate) async fn drive_cell(
+    slot: Arc<crate::pool::Slot>,
+    mut job: CellJob,
+    report: Option<AlarmReporter>,
+    parent: Option<crate::telemetry::TraceIds>,
+) {
+    // Two calls a caller made back-to-back reach the cell in that order.
+    // This is the only place that can hold it: everything upstream is a
+    // race, and everything downstream has already been delivered. Held
+    // until the event *begins*, not until it finishes — a handler that
+    // waits must not stop the next call arriving, or cell events would
+    // stop interleaving and the DO contract with them.
+    let mut order = job.take_order();
+    if let Some(order) = order.as_mut() {
+        order.wait().await;
+    }
+    // Join the dispatching Worker's trace when there is one — the root
+    // already made the sampling decision — else decide a fresh root.
+    // The seed is captured before the job moves, recorded once the entry
+    // settles.
+    let trace = match parent.as_ref() {
+        Some(parent) => crate::telemetry::child_of(parent),
+        None => crate::telemetry::start_trace(),
+    };
+    let span_seed = trace.map(|_| {
+        let name = match &job {
+            CellJob::Fetch { .. } => "celld.cell_fetch",
+            CellJob::Alarm { .. } => "celld.alarm",
+            CellJob::Rpc { .. } => "celld.rpc",
+            CellJob::WsOpen { .. } => "celld.ws_open",
+            CellJob::WsMessage { .. } => "celld.ws_message",
+            CellJob::WsClosed { .. } => "celld.ws_close",
+        };
+        (
+            name,
+            job.scope().to_string(),
+            Instant::now(),
+            crate::telemetry::now_unix_us(),
+        )
+    });
+    let budget = js::handler_budget();
+    let mut ops = Ops::new();
+    // `blockConcurrencyWhile` shuts the cell's gate, and a shut gate means no
+    // event reaches that cell until it opens. The blocking loop left a
+    // refused job on the channel; there is no channel now, so the event waits
+    // here.
+    //
+    // Asked *inside* the turn, which is the whole of it. A handler shuts the
+    // gate while holding the isolate, so a check made before taking the
+    // isolate can pass and then queue behind the very block it should have
+    // waited for. On an idle machine the blocking event always won that race
+    // and the bug was invisible; under load it is not.
+    //
+    // `cell_gate_wait` tests and enqueues under the gate's own lock, so the
+    // ticket cannot be missed by a release landing between the two. Only the
+    // waiting happens out here, because a turn may not await.
+    let mut pending = Some(job);
+    let (begun, started, moves) = loop {
+        let mut waiting = None;
+        let taken = slot
+            .turn(|worker| {
+                let job = pending.take().expect("one job per attempt");
+                if let Some(open) = js::cell_gate_wait(job.scope()) {
+                    waiting = Some(open);
+                    pending = Some(job);
+                    return None;
+                }
+                let (begun, started) = worker.turn_begin_cell(job, trace);
+                Some((begun, started, worker.take_alarm_moves()))
+            })
+            .await;
+        match taken {
+            Some(taken) => break taken,
+            None => match waiting {
+                None => {}
+                Some(open) => match open.await {
+                    // The gate opened normally; try for the isolate again.
+                    Ok(Ok(())) => {}
+                    // The critical section this event queued behind failed,
+                    // which reset the cell. Delivering now would run against
+                    // state that no longer exists, so refuse instead and say
+                    // why the caller is being refused.
+                    Ok(Err(failure)) => {
+                        if let Some(job) = pending.take() {
+                            job.fail(anyhow!(failure));
+                        }
+                        return;
+                    }
+                    // The cell stopped while this event waited.
+                    Err(_) => return,
+                },
+            },
         }
     };
-    match storage::get_actor_name(&cell) {
-        Ok(Some(name)) => {
-            if let Err(error) = worker.set_id_name(&cell, &name) {
-                startup_timing.emit("error", "actor_name_restore");
-                storage::close(&cell);
-                let _ = startup.send(Err(error.context("restore actor name")));
-                return;
-            }
-        }
-        Ok(None) => {}
-        Err(error) => {
-            startup_timing.emit("error", "actor_name_read");
-            storage::close(&cell);
-            let _ = startup.send(Err(error.context("read actor name")));
-            return;
-        }
+    // Delivered. Whatever the caller sent next may go.
+    if let Some(order) = order.as_mut() {
+        order.delivered();
     }
-    let startup_us = startup_timing.emit("ready", "");
-    if startup.send(Ok(startup_us)).is_err() {
-        storage::close(&cell);
+    drop(order);
+    adopt(&mut ops, started);
+    report_alarm_moves(&report, moves);
+    // Nothing is in flight; the reply already carries the error.
+    let Some(mut entry) = begun else {
         return;
+    };
+
+    while !entry.finished() {
+        let (started, moves) = match wake(&mut ops, &entry, budget).await {
+            Wake::Op(op, result) => {
+                slot.turn(|worker| {
+                    let started = worker.turn_deliver(&mut entry, op, result);
+                    (started, worker.take_alarm_moves())
+                })
+                .await
+            }
+            Wake::Cancelled => {
+                slot.turn(|worker| {
+                    let started = worker.turn_cancel(&mut entry);
+                    (started, worker.take_alarm_moves())
+                })
+                .await
+            }
+            Wake::Expired => {
+                entry.time_out(budget);
+                break;
+            }
+            Wake::Idle => {
+                entry.stuck();
+                break;
+            }
+            Wake::Poll => {
+                slot.turn(|worker| {
+                    let started = worker.turn_poll(&mut entry);
+                    (started, worker.take_alarm_moves())
+                })
+                .await
+            }
+        };
+        adopt(&mut ops, started);
+        // A turn that ran JS may have armed an alarm this very request is
+        // waiting on, so the host hears about it now rather than when the
+        // request ends.
+        report_alarm_moves(&report, moves);
     }
 
-    for job in &rx {
-        match job {
-            CellJob::Fetch {
-                request_id,
-                scope,
-                name,
-                url,
-                method,
-                body,
-                headers,
-                reply,
-            } => {
-                if let Some(name) = name {
-                    if let Err(error) = worker.set_id_name(&scope, &name) {
-                        let _ = reply.send(Err(error));
-                        continue;
-                    }
-                }
-                worker.dispatch_to_and_reply(
-                    &scope,
-                    FetchRequest {
-                        url: &url,
-                        method: &method,
-                        body: &body,
-                        headers: &headers,
-                        request_id,
-                    },
-                    &rx,
-                    reply,
-                );
-            }
-            CellJob::WorkerFetch {
-                request_id,
-                url,
-                method,
-                body,
-                headers,
-                inline_activity: _inline_activity,
-                fallback_workers: _fallback_workers,
-                reply,
-            } => {
-                if let Err(error) = worker.worker_fetch_and_reply(
-                    FetchRequest {
-                        url: &url,
-                        method: &method,
-                        body: &body,
-                        headers: &headers,
-                        request_id: Some(request_id),
-                    },
-                    &rx,
-                    reply,
-                ) {
-                    tracing::warn!(%error, cell, "cell Worker isolate reload failed");
-                    break;
-                }
-            }
-            // An abort observed by the outer loop arrived after the request
-            // stopped pumping. The cross-thread pending-abort registry has
-            // already made it visible while the handler was live.
-            CellJob::AbortFetch { .. } => {}
-            CellJob::Alarm {
-                scope,
-                scheduled_ms,
-                reply,
-            } => {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as i64;
-                let result = if now < scheduled_ms {
-                    Err(anyhow!("alarm dispatched before its deadline"))
-                } else {
-                    if let Some((scheduled_at, retry)) = storage::due_alarm_entry(&scope, now) {
-                        storage::begin_alarm_handler(&scope, scheduled_at);
-                        match worker.fire_alarm(&scope, retry, &rx) {
-                            Ok(()) => storage::finish_alarm_handler(&scope, true, now),
-                            Err(error) => storage::finish_alarm_handler_with_retry_policy(
-                                &scope,
-                                false,
-                                now,
-                                error.counts_against_limit(),
-                            ),
-                        }
-                    }
-                    Ok(storage::get_alarm(&scope))
-                };
-                let _ = reply.send(result);
-            }
-            CellJob::WsOpen {
-                scope,
-                ws_id,
-                protocol,
-                reply,
-            } => {
-                let result = worker.dispatch_ws_open(&scope, ws_id, &protocol, &rx);
-                let _ = reply.send(result);
-            }
-            CellJob::Rpc {
-                scope,
-                name,
-                method,
-                args,
-                reply,
-            } => {
-                let result = name
-                    .as_deref()
-                    .map_or(Ok(()), |name| worker.set_id_name(&scope, name))
-                    .and_then(|()| worker.dispatch_rpc_data(&scope, &method, args, &rx));
-                let _ = reply.send(result);
-            }
-            CellJob::WsMessage {
-                scope,
-                ws_id,
-                data,
-                reply,
-            } => {
-                let result = worker.dispatch_ws(&scope, ws_id, data, &rx);
-                let _ = reply.send(result);
-            }
-            CellJob::WsClosed {
-                scope,
-                ws_id,
-                code,
-                reason,
-                was_clean,
-                reply,
-            } => {
-                let result =
-                    worker.dispatch_ws_closed(&scope, ws_id, code, &reason, was_clean, &rx);
-                let _ = reply.send(result);
-            }
-            CellJob::Shutdown => break,
-        }
+    // An alarm that ended without running JS again still owes its outcome,
+    // and recording it is storage only the isolate can reach.
+    if entry.owes_alarm() {
+        let moves = slot
+            .turn(|worker| {
+                worker.turn_finish_alarm(&mut entry);
+                worker.take_alarm_moves()
+            })
+            .await;
+        report_alarm_moves(&report, moves);
     }
-    storage::unwatch_alarm(&cell);
-    storage::close(&cell);
+    if let (Some(ids), Some((name, cell, started, start_unix))) = (trace, span_seed) {
+        let kind = if name == "celld.cell_fetch" {
+            crate::telemetry::KIND_SERVER
+        } else {
+            crate::telemetry::KIND_INTERNAL
+        };
+        let mut span = crate::telemetry::Span::new(ids, name, kind);
+        span.start_unix_us = start_unix;
+        span.duration_us = started.elapsed().as_micros() as i64;
+        span.ok = entry.finished() && entry.failure().is_none();
+        span.error = entry.failure().map(str::to_string);
+        span.cell = Some(cell);
+        span.parent_span_id = parent.map(|parent| parent.span_id);
+        span.parent_remote = parent.map(|_| false);
+        crate::telemetry::record(span);
+    }
+    entry.abandon();
 }
 
 fn path_text(path: &Path) -> &str {

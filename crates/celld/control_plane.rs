@@ -33,8 +33,8 @@ const MAX_MANAGED_MODULES: usize = 64;
 const MAX_MANAGED_MODULE_BYTES: usize = 25 * 1024 * 1024;
 
 fn restart_on_deployment_enabled() -> bool {
-    !std::env::var("CELLD_CLOUD_RESTART_ON_DEPLOY")
-        .is_ok_and(|value| value.eq_ignore_ascii_case("off"))
+    crate::env_vars::flag("CELLD_CLOUD_RESTART_ON_DEPLOY", true)
+        .expect("validated CELLD_CLOUD_RESTART_ON_DEPLOY")
 }
 
 #[cfg(unix)]
@@ -917,15 +917,14 @@ async fn presence_session(
         advertise = %runtime.advertise,
         "node session connected to the Managed Control Plane"
     );
-    let heartbeat_period = std::env::var("CELLD_PRESENCE_HEARTBEAT_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| (50..=30_000).contains(value))
-        .map(Duration::from_millis)
-        .unwrap_or(Duration::from_secs(30));
+    let heartbeat_period = Duration::from_millis(
+        crate::env_vars::with_default("CELLD_PRESENCE_HEARTBEAT_MS", 30_000)
+            .expect("validated CELLD_PRESENCE_HEARTBEAT_MS"),
+    );
     let mut heartbeat = tokio::time::interval(heartbeat_period);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let shadow_presence = std::env::var("CELLD_PRESENCE_SHADOW").as_deref() == Ok("on");
+    let shadow_presence = crate::env_vars::flag("CELLD_PRESENCE_SHADOW", false)
+        .expect("validated CELLD_PRESENCE_SHADOW");
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
@@ -1080,11 +1079,7 @@ fn lazy_lease_shadow_json(batch: &celld_logic::LeaseLifecycleShadowBatch) -> ser
 /// into the core or changes whether the node serves.
 async fn lease_shadow_observation(runtime: &PresenceRuntime) -> serde_json::Value {
     let checked_at_ms = crate::ownership_store::now_ms();
-    let ownership = crate::ownership_store::S3Ownership::new(
-        runtime.s3.clone(),
-        runtime.node_session_id.clone(),
-    );
-    match ownership.read_node_lease(&runtime.node_session_id).await {
+    match crate::ownership_store::load_node_lease(&runtime.s3, &runtime.node_session_id).await {
         Ok(Some(record)) => serde_json::json!({
             "bucket_status": if record.expires_ms > checked_at_ms { "live" } else { "expired" },
             "node": record.node,
@@ -1476,9 +1471,17 @@ fn presence_request(
         HeaderName::from_static("x-cells-version"),
         HeaderValue::from_static(env!("CARGO_PKG_VERSION")),
     );
+    // Deployment features come from the shared list so the advertised
+    // capabilities can never drift from what apply_deployment accepts.
+    let capabilities = crate::protocol::SUPPORTED_DEPLOYMENT_FEATURES
+        .iter()
+        .copied()
+        .chain(["sqlite-explorer-v1", "sqlite-explorer-v2"])
+        .collect::<Vec<_>>()
+        .join(",");
     headers.insert(
         HeaderName::from_static("x-cells-capabilities"),
-        HeaderValue::from_static("assets-v1,sqlite-explorer-v1,sqlite-explorer-v2"),
+        HeaderValue::from_str(&capabilities)?,
     );
     headers.insert(
         HeaderName::from_static("x-cells-hostname"),
@@ -1711,11 +1714,7 @@ async fn apply_deployment(
     }
     validate_managed_module_envelope(deployment)?;
     validate_managed_class_migrations(&deployment.manifest)?;
-    for feature in &deployment.manifest.required_features {
-        if feature != "assets-v1" {
-            return Err(anyhow!("unsupported deployment feature: {feature}"));
-        }
-    }
+    crate::protocol::validate_required_features(&deployment.manifest.required_features)?;
 
     let mut asset_files = 0_u32;
     let mut asset_bytes = 0_u64;
@@ -2073,7 +2072,7 @@ fn validate_managed_class_migrations(manifest: &Manifest) -> anyhow::Result<()> 
     }
     for tag in ["old_tag", "new_tag"] {
         if let Some(value) = migrations.get(tag) {
-            if !value.is_null() && !value.as_str().is_some_and(|value| !value.is_empty()) {
+            if !value.is_null() && value.as_str().is_none_or(str::is_empty) {
                 return Err(anyhow!(
                     "managed manifest migrations.{tag} must be null or a non-empty string"
                 ));
@@ -2631,10 +2630,12 @@ struct EnrollmentLock {
 
 async fn try_acquire_enrollment_lock(config: &Path) -> anyhow::Result<Option<EnrollmentLock>> {
     let (file, lock_path) = open_enrollment_lock(config).await?;
-    tokio::task::spawn_blocking(move || match fs2::FileExt::try_lock_exclusive(&file) {
+    tokio::task::spawn_blocking(move || match file.try_lock() {
         Ok(()) => Ok(Some(EnrollmentLock { _file: file })),
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
-        Err(error) => Err(error).with_context(|| format!("lock {}", lock_path.display())),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => {
+            Err(error).with_context(|| format!("lock {}", lock_path.display()))
+        }
     })
     .await
     .context("join enrollment try-lock task")?
@@ -2643,7 +2644,7 @@ async fn try_acquire_enrollment_lock(config: &Path) -> anyhow::Result<Option<Enr
 async fn acquire_enrollment_lock(config: &Path) -> anyhow::Result<EnrollmentLock> {
     let (file, lock_path) = open_enrollment_lock(config).await?;
     tokio::task::spawn_blocking(move || {
-        fs2::FileExt::lock_exclusive(&file)
+        file.lock()
             .with_context(|| format!("lock {}", lock_path.display()))?;
         Ok(EnrollmentLock { _file: file })
     })

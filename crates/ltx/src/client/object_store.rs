@@ -12,16 +12,13 @@
 //!     (s3/replica_client.go:99 + the Go uploader default);
 //!   * list + seek-skip on `min_txid < seek`, ascending TXID order
 //!     (s3/replica_client.go:1530-1533);
-//!   * the `litestream-timestamp` header-timestamp metadata, written on every
-//!     PUT and (on `use_metadata=true`) read back via a parallel `head` fan-out
-//!     (s3/replica_client.go:53, 679-683, 1384-1455);
 //!   * `NoSuchKey` → `os.ErrNotExist` error mapping
 //!     (s3/replica_client.go:647-649, 1662-1668);
 //!   * batch DELETE up to 1000 keys per call with per-key error surfacing
 //!     (s3/replica_client.go:1028-1101).
 //!
-//! The provider-defaults table (`ParseHost`, R2 concurrency, path-style flags,
-//! endpoint env var) is a faithful port of `NewReplicaClientFromURL`
+//! The provider-defaults table (`ParseHost`, path-style flags, endpoint env
+//! var) is a faithful port of `NewReplicaClientFromURL`
 //! (s3/replica_client.go:133-314) so a `s3://…` URL configures the same way.
 //!
 //! This whole module is gated behind `#[cfg(feature = "s3")]` because it needs
@@ -31,11 +28,12 @@
 
 use std::sync::Arc;
 
-use futures_util::stream::{FuturesUnordered, StreamExt, TryStreamExt};
+use chrono::{DateTime, SecondsFormat};
+use futures_util::stream::{StreamExt, TryStreamExt};
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as ObjPath;
 use object_store::{
-    Attribute, AttributeValue, Attributes, GetOptions, GetRange, ObjectStore, PutMultipartOpts,
+    Attribute, AttributeValue, Attributes, ClientOptions, ObjectStore, PutMultipartOpts,
     PutOptions, PutPayload,
 };
 
@@ -48,27 +46,14 @@ use crate::TXID;
 
 use super::ReplicaClient;
 
-/// The replica backend type string, matching `ReplicaClientType` ("s3").
-pub const REPLICA_CLIENT_TYPE: &str = "s3";
-
-/// S3 metadata key carrying the LTX-header timestamp (RFC3339Nano), so accurate
-/// timestamps survive across restores. Ported from `MetadataKeyTimestamp`
-/// (s3/replica_client.go:53).
-pub const METADATA_KEY_TIMESTAMP: &str = "litestream-timestamp";
+/// The standard Litestream S3 metadata key for an LTX header timestamp.
+const METADATA_KEY_TIMESTAMP: &str = "litestream-timestamp";
 
 /// Max keys S3 operates on per batch DELETE. `MaxKeys` (s3/replica_client.go:56).
 pub const MAX_KEYS: usize = 1000;
 
 /// Region used when none is specified. `DefaultRegion` (s3/replica_client.go:59).
 pub const DEFAULT_REGION: &str = "us-east-1";
-
-/// Default parallel `head` calls for timestamp-based restore.
-/// `DefaultMetadataConcurrency` (s3/replica_client.go:64).
-pub const DEFAULT_METADATA_CONCURRENCY: usize = 50;
-
-/// Default concurrent multipart parts for Cloudflare R2 (strict limits).
-/// `DefaultR2Concurrency` (s3/replica_client.go:68).
-pub const DEFAULT_R2_CONCURRENCY: usize = 2;
 
 /// Multipart upload threshold: data at or above this size is uploaded with
 /// `put_multipart`; below it, a single `put`. Matches the Go uploader's 5 MiB
@@ -105,8 +90,6 @@ pub struct ObjectStoreConfig {
     pub skip_verify: bool,
     /// Multipart part size in bytes; 0 = default (5 MiB).
     pub part_size: u64,
-    /// Concurrent multipart parts; 0 = default. R2 endpoints default to 2.
-    pub concurrency: usize,
 }
 
 impl ObjectStoreConfig {
@@ -114,8 +97,8 @@ impl ObjectStoreConfig {
     /// (s3/replica_client.go:133-314): host → bucket/region/endpoint/path-style
     /// (or ARN), query-param overrides (camelCase ↔ hyphenated aliases), the
     /// `AWS_*`/`LITESTREAM_*` env credentials, the `LITESTREAM_S3_ENDPOINT` env
-    /// fallback, and the provider-specific defaults (R2 concurrency; path-style
-    /// for MinIO/Backblaze/Filebase/Supabase).
+    /// fallback, and the provider-specific path-style defaults for
+    /// MinIO/Backblaze/Filebase/Supabase.
     pub fn from_url(parsed: &ParsedReplicaUrl) -> Result<Self> {
         let host = &parsed.host;
         let query = &parsed.query;
@@ -152,15 +135,6 @@ impl ObjectStoreConfig {
             skip_verify = v;
         }
 
-        let mut concurrency: usize = 0;
-        let v = query.get("concurrency");
-        if !v.is_empty() {
-            if let Ok(n) = v.parse::<usize>() {
-                if n > 0 {
-                    concurrency = n;
-                }
-            }
-        }
         let mut part_size: u64 = 0;
         let v = query.get("partSize");
         let v2 = query.get("part-size");
@@ -220,14 +194,8 @@ impl ObjectStoreConfig {
         let is_backblaze = replica_url::is_backblaze_endpoint(&endpoint);
         let is_minio = replica_url::is_minio_endpoint(&endpoint);
         let is_supabase = replica_url::is_supabase_endpoint(&endpoint);
-        let is_r2 = replica_url::is_cloudflare_r2_endpoint(&endpoint);
-
         if !force_path_style_set && (is_filebase || is_backblaze || is_minio || is_supabase) {
             force_path_style = true;
-        }
-        if is_r2 {
-            // R2 has strict per-bucket multipart concurrency limits.
-            concurrency = DEFAULT_R2_CONCURRENCY;
         }
 
         Ok(ObjectStoreConfig {
@@ -241,14 +209,9 @@ impl ObjectStoreConfig {
             force_path_style,
             skip_verify,
             part_size,
-            concurrency,
         })
     }
 
-    /// Build the configured `AmazonS3` store. Ported from the relevant subset of
-    /// `Init` (s3/replica_client.go:322-477): bucket validation, region default,
-    /// custom endpoint, path-style toggle, static credentials, and `allow_http`
-    /// for plaintext/local endpoints.
     /// Build the backing `Arc<dyn ObjectStore>` for this config. Public so a host
     /// can build one store for a bucket and share it across many
     /// [`ObjectStoreClient::with_store`] clients that differ only by key prefix
@@ -268,18 +231,25 @@ impl ObjectStoreConfig {
             .with_bucket_name(&self.bucket)
             .with_region(region)
             // Path-style ⇔ NOT virtual-hosted-style (s3/replica_client.go:258-263).
-            .with_virtual_hosted_style_request(!self.force_path_style);
+            .with_virtual_hosted_style_request(!self.force_path_style)
+            // object_store ships with conditional puts DISABLED for S3 and
+            // answers PutMode::Create with NotImplemented. The epoch seal is a
+            // conditional create (first restorer wins), and every provider on
+            // the support matrix speaks the If-None-Match/If-Match headers
+            // this enables (wiki/engine/ownership.md's CAS matrix).
+            .with_conditional_put(object_store::aws::S3ConditionalPut::ETagMatch);
 
         if !self.endpoint.is_empty() {
-            // A plaintext (http://) or local endpoint must allow non-TLS, and
-            // skip_verify likewise permits http (object_store gates http behind
-            // allow_http rather than a TLS-verify toggle).
+            // A plaintext or local endpoint must allow HTTP. skip_verify applies
+            // only to TLS certificate validation.
             let allow_http = self.endpoint.starts_with("http://")
-                || self.skip_verify
                 || replica_url::is_local_endpoint(&self.endpoint);
+            let client_options = ClientOptions::new()
+                .with_allow_http(allow_http)
+                .with_allow_invalid_certificates(self.skip_verify);
             builder = builder
                 .with_endpoint(&self.endpoint)
-                .with_allow_http(allow_http);
+                .with_client_options(client_options);
         }
 
         if !self.access_key_id.is_empty() {
@@ -459,7 +429,10 @@ fn match_filebase(host: &str) -> Option<String> {
 // ── Client ────────────────────────────────────────────────────────────────────
 
 /// Concrete S3/R2/MinIO backend, wrapping a lazily-initialised
-/// `Arc<dyn ObjectStore>`.
+/// `Arc<dyn ObjectStore>`. The config-driven path builds an S3 store, but
+/// [`Self::with_store`] accepts any prebuilt `ObjectStore` — the five
+/// replica operations are provider-neutral, and a host can inject e.g. a
+/// GCS or in-memory store.
 ///
 /// Mirrors Go `ReplicaClient` (s3/replica_client.go:78-116). The inner store is
 /// created on the first call that needs it (`OnceCell`, mirroring `Init`,
@@ -496,17 +469,6 @@ impl ObjectStoreClient {
             store: cell,
             config,
         }
-    }
-
-    /// The configuration this client was built with.
-    pub fn config(&self) -> &ObjectStoreConfig {
-        &self.config
-    }
-
-    /// Force early initialisation; idempotent (mirrors `Init`,
-    /// s3/replica_client.go:322-477).
-    pub async fn init(&self) -> Result<()> {
-        self.store().await.map(|_| ())
     }
 
     /// Get-or-build the inner store, once.
@@ -550,35 +512,31 @@ fn map_os_error(e: object_store::Error) -> Error {
 
 #[async_trait::async_trait]
 impl ReplicaClient for ObjectStoreClient {
-    fn type_name(&self) -> &str {
-        REPLICA_CLIENT_TYPE
+    async fn ltx_files(&self, level: i32, seek: TXID) -> Result<Vec<FileInfo>> {
+        self.ltx_files_bounded(level, seek, usize::MAX).await
     }
 
-    async fn init(&self) -> Result<()> {
-        ObjectStoreClient::init(self).await
-    }
-
-    async fn ltx_files(&self, level: i32, seek: TXID, use_metadata: bool) -> Result<Vec<FileInfo>> {
+    async fn ltx_files_bounded(
+        &self,
+        level: i32,
+        seek: TXID,
+        limit: usize,
+    ) -> Result<Vec<FileInfo>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let store = self.store().await?;
         let prefix = ObjPath::from(self.level_prefix(level));
-
-        // List everything under the level prefix. object_store yields keys in
-        // lexicographic order; since TXID hex is zero-padded to 16 digits,
-        // lexicographic == numeric ascending (brief §5.10). We still sort
-        // defensively after collecting, because the listing of an L0 level is
-        // bounded and small.
-        let metas: Vec<object_store::ObjectMeta> = store
-            .list(Some(&prefix))
-            .map_err(map_os_error)
-            .try_collect()
-            .await?;
-
-        // Parse filenames, applying the seek-skip filter (min_txid < seek).
-        // Done as a post-parse filter, NOT via a list prefix, because S3 prefix
-        // listing is lexicographic on the full key (brief §5.4).
-        let mut entries: Vec<(object_store::ObjectMeta, TXID, TXID)> =
-            Vec::with_capacity(metas.len());
-        for meta in metas {
+        // The offset ends immediately before every filename with this minimum
+        // TXID. S3 and GCS can push it into the listing request, so an additive
+        // compaction does not scan the complete retained L0 history. The
+        // supported production stores return each page in lexical order. The
+        // compactor validates continuity and fails closed for an unordered
+        // custom store.
+        let offset = ObjPath::from(format!("{}{:016x}", self.level_prefix(level), seek.0));
+        let mut listed = store.list_with_offset(Some(&prefix), &offset);
+        let mut infos = Vec::with_capacity(limit.min(256));
+        while let Some(meta) = listed.try_next().await.map_err(map_os_error)? {
             let name = meta.location.filename().unwrap_or("");
             let (min_txid, max_txid) = match ltx::parse_filename(name) {
                 Ok(t) => t,
@@ -587,46 +545,18 @@ impl ReplicaClient for ObjectStoreClient {
             if min_txid < seek {
                 continue;
             }
-            entries.push((meta, min_txid, max_txid));
+            infos.push(FileInfo {
+                level,
+                min_txid,
+                max_txid,
+                size: meta.size as i64,
+                created_at: Some(std::time::SystemTime::from(meta.last_modified)),
+                ..Default::default()
+            });
+            if infos.len() == limit {
+                break;
+            }
         }
-
-        // Timestamp source: when use_metadata is requested, read the
-        // litestream-timestamp attribute back via a parallel `head` fan-out
-        // (concurrency DEFAULT_METADATA_CONCURRENCY); otherwise fall back to the
-        // listing's last_modified. Ported from s3/replica_client.go:1384-1455,
-        // 1543-1553.
-        let mut header_ts: std::collections::HashMap<String, std::time::SystemTime> =
-            std::collections::HashMap::new();
-        if use_metadata && !entries.is_empty() {
-            let keys: Vec<String> = entries
-                .iter()
-                .map(|(m, _, _)| m.location.to_string())
-                .collect();
-            header_ts = fetch_timestamp_metadata(store.as_ref(), &keys).await;
-        }
-
-        let mut infos: Vec<FileInfo> = entries
-            .into_iter()
-            .map(|(meta, min_txid, max_txid)| {
-                let key = meta.location.to_string();
-                let created_at = if use_metadata {
-                    header_ts
-                        .get(&key)
-                        .copied()
-                        .or_else(|| Some(std::time::SystemTime::from(meta.last_modified)))
-                } else {
-                    Some(std::time::SystemTime::from(meta.last_modified))
-                };
-                FileInfo {
-                    level,
-                    min_txid,
-                    max_txid,
-                    size: meta.size as i64,
-                    created_at,
-                    ..Default::default()
-                }
-            })
-            .collect();
 
         // Iterator contract: ascending by (level, min_txid, max_txid).
         infos.sort_by(|a, b| {
@@ -635,50 +565,18 @@ impl ReplicaClient for ObjectStoreClient {
         Ok(infos)
     }
 
-    async fn open_ltx_file(
-        &self,
-        level: i32,
-        min_txid: TXID,
-        max_txid: TXID,
-        offset: i64,
-        size: i64,
-    ) -> Result<Vec<u8>> {
+    async fn open_ltx_file(&self, level: i32, min_txid: TXID, max_txid: TXID) -> Result<Vec<u8>> {
         let store = self.store().await?;
         let key = ObjPath::from(self.ltx_key(level, min_txid, max_txid));
 
-        // Range: bytes=offset-(offset+size-1) when size>0, else bytes=offset-
-        // (s3/replica_client.go:620-625).
-        let off = offset.max(0) as usize;
-        let range = if size > 0 {
-            GetRange::Bounded(off..(off + size as usize))
-        } else {
-            GetRange::Offset(off)
-        };
-
-        let opts = GetOptions {
-            range: Some(range),
-            ..Default::default()
-        };
-
-        let result = match store.get_opts(&key, opts).await {
+        let result = match store.get(&key).await {
             Ok(r) => r,
             Err(object_store::Error::NotFound { .. }) => {
                 return Err(Error::Io(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
-                    format!("s3: get object {key}: not found"),
+                    format!("replica: get object {key}: not found"),
                 )));
             }
-            // DECISION: an `offset >= object_size` range yields HTTP 416 from
-            // S3/MinIO (object_store surfaces it as a Generic "Range Not
-            // Satisfiable" error). The Go client would propagate that 416 as an
-            // error; our file client (T6) instead returns an empty slice when
-            // `offset >= len`. We mirror the *file client* here so both backends
-            // are interchangeable under `run_client_suite` (the T7 DoD). No real
-            // read path requests a past-EOF offset (restore reads the in-bounds
-            // page-index tail), so this only affects the degenerate case, and a
-            // genuine read error (anything not 416) still propagates below.
-            // Logged in OPEN_QUESTIONS.md.
-            Err(e) if is_range_not_satisfiable(&e) => return Ok(Vec::new()),
             Err(e) => return Err(map_os_error(e)),
         };
 
@@ -695,19 +593,17 @@ impl ReplicaClient for ObjectStoreClient {
     ) -> Result<FileInfo> {
         let store = self.store().await?;
 
-        // Peek the LTX header timestamp (preserved as litestream-timestamp).
-        // Ported from s3/replica_client.go:662-683.
+        // Preserve the LTX header timestamp in the standard Litestream object
+        // metadata. This costs no extra request and lets Litestream perform an
+        // accurate timestamp restore without downloading every candidate file.
         let header = ltx::Header::parse(data)?;
         let created_at = std::time::UNIX_EPOCH
             + std::time::Duration::from_millis(header.timestamp.max(0) as u64);
-        let ts_rfc3339 = format_rfc3339_nano(header.timestamp);
-
         let mut attributes = Attributes::new();
         attributes.insert(
             Attribute::Metadata(METADATA_KEY_TIMESTAMP.into()),
-            AttributeValue::from(ts_rfc3339),
+            AttributeValue::from(format_rfc3339_nano(header.timestamp)?),
         );
-
         let key = ObjPath::from(self.ltx_key(level, min_txid, max_txid));
 
         // Multipart threshold: < 5 MiB → single PUT; ≥ 5 MiB → multipart with
@@ -716,35 +612,36 @@ impl ReplicaClient for ObjectStoreClient {
         let part_size = self.config.effective_part_size();
         if data.len() < MULTIPART_THRESHOLD {
             let payload = PutPayload::from(data.to_vec());
-            let opts = PutOptions {
+            let options = PutOptions {
                 attributes,
                 ..Default::default()
             };
             store
-                .put_opts(&key, payload, opts)
+                .put_opts(&key, payload, options)
                 .await
-                .map_err(|e| Error::Other(format!("s3: upload to {key}: {e}").into()))?;
+                .map_err(|e| Error::Other(format!("replica: upload to {key}: {e}").into()))?;
         } else {
-            let opts = PutMultipartOpts {
+            let options = PutMultipartOpts {
                 attributes,
                 ..Default::default()
             };
             let mut upload = store
-                .put_multipart_opts(&key, opts)
+                .put_multipart_opts(&key, options)
                 .await
-                .map_err(|e| Error::Other(format!("s3: upload to {key}: {e}").into()))?;
+                .map_err(|e| Error::Other(format!("replica: upload to {key}: {e}").into()))?;
             // Upload in fixed-size parts (each ≥ 5 MiB except possibly the last,
             // matching object_store's part-size requirement).
             for chunk in data.chunks(part_size.max(MULTIPART_THRESHOLD)) {
                 upload
                     .put_part(PutPayload::from(chunk.to_vec()))
                     .await
-                    .map_err(|e| Error::Other(format!("s3: upload part to {key}: {e}").into()))?;
+                    .map_err(|e| {
+                        Error::Other(format!("replica: upload part to {key}: {e}").into())
+                    })?;
             }
-            upload
-                .complete()
-                .await
-                .map_err(|e| Error::Other(format!("s3: complete upload to {key}: {e}").into()))?;
+            upload.complete().await.map_err(|e| {
+                Error::Other(format!("replica: complete upload to {key}: {e}").into())
+            })?;
         }
 
         Ok(FileInfo {
@@ -796,17 +693,6 @@ impl ReplicaClient for ObjectStoreClient {
     }
 }
 
-/// Returns `true` if the error is S3's "range not satisfiable" (HTTP 416),
-/// which object_store surfaces as a `Generic`/`NotModified`-shaped error when a
-/// requested range begins at or after the object's end.
-fn is_range_not_satisfiable(e: &object_store::Error) -> bool {
-    // object_store does not expose a dedicated variant; match on the rendered
-    // message, which includes the upstream status. This only affects the
-    // offset-past-EOF parity case; a real read error still propagates.
-    let msg = e.to_string();
-    msg.contains("Range Not Satisfiable") || msg.contains("416")
-}
-
 /// Delete a batch of keys via `delete_stream`, surfacing per-key errors.
 ///
 /// When `ignore_missing` is set, `NotFound` is tolerated (delete is idempotent —
@@ -833,194 +719,98 @@ async fn delete_batch(
     Ok(())
 }
 
-/// Fetch the `litestream-timestamp` header timestamp for each key via a parallel
-/// `head` fan-out, bounded to `DEFAULT_METADATA_CONCURRENCY` in-flight requests.
-///
-/// A missing/unparseable attribute or a failed `head` is non-fatal (the key is
-/// simply absent from the map, and the caller falls back to `last_modified`),
-/// matching the Go behavior (s3/replica_client.go:1427-1442).
-async fn fetch_timestamp_metadata(
-    store: &dyn ObjectStore,
-    keys: &[String],
-) -> std::collections::HashMap<String, std::time::SystemTime> {
-    use std::collections::HashMap;
-    let mut out: HashMap<String, std::time::SystemTime> = HashMap::new();
-    let mut in_flight = FuturesUnordered::new();
-    let mut iter = keys.iter();
+/// Format a Unix-millisecond timestamp like Go's `time.RFC3339Nano`.
+fn format_rfc3339_nano(unix_millis: i64) -> Result<String> {
+    let mut timestamp = DateTime::from_timestamp_millis(unix_millis.max(0))
+        .ok_or_else(|| Error::Other("LTX timestamp is outside the RFC3339 range".into()))?
+        .to_rfc3339_opts(SecondsFormat::AutoSi, true);
 
-    // Prime the pump up to the concurrency limit.
-    for _ in 0..DEFAULT_METADATA_CONCURRENCY {
-        match iter.next() {
-            Some(k) => in_flight.push(head_timestamp(store, k.clone())),
-            None => break,
+    // Chrono keeps millisecond precision as three digits. Go removes trailing
+    // zeros, so `.500Z` becomes `.5Z`.
+    if timestamp.contains('.') {
+        // The pop must stay outside debug_assert!, which vanishes in release
+        // builds and would leave the Z in place to be doubled below.
+        let suffix = timestamp.pop();
+        debug_assert_eq!(suffix, Some('Z'));
+        while timestamp.ends_with('0') {
+            timestamp.pop();
         }
+        timestamp.push('Z');
     }
-
-    while let Some((key, ts)) = in_flight.next().await {
-        if let Some(ts) = ts {
-            out.insert(key, ts);
-        }
-        if let Some(k) = iter.next() {
-            in_flight.push(head_timestamp(store, k.clone()));
-        }
-    }
-    out
-}
-
-/// `head` one key and parse its `litestream-timestamp` attribute, if present.
-async fn head_timestamp(
-    store: &dyn ObjectStore,
-    key: String,
-) -> (String, Option<std::time::SystemTime>) {
-    let path = ObjPath::from(key.clone());
-    let opts = GetOptions {
-        head: true,
-        ..Default::default()
-    };
-    match store.get_opts(&path, opts).await {
-        Ok(result) => {
-            let attr = result
-                .attributes
-                .get(&Attribute::Metadata(METADATA_KEY_TIMESTAMP.into()))
-                .map(|v| v.as_ref().to_string());
-            let ts = attr.as_deref().and_then(parse_rfc3339_nano);
-            (key, ts)
-        }
-        // Non-fatal: fall back to LastModified for this key.
-        Err(_) => (key, None),
-    }
-}
-
-// ── RFC3339Nano timestamp (de)serialisation ──────────────────────────────────
-//
-// Go stores `time.UnixMilli(hdr.Timestamp).UTC().Format(time.RFC3339Nano)` in
-// the metadata (s3/replica_client.go:671-681) and parses it back with
-// `time.Parse(time.RFC3339Nano, ts)` (s3/replica_client.go:1435). We don't pull
-// in a date crate (AGENTS.md rule 7); these two helpers round-trip the exact
-// shape we write — `YYYY-MM-DDTHH:MM:SS[.fffffffff]Z` — which is all the
-// `use_metadata` restore path needs, since it only ever reads timestamps that
-// this same client wrote.
-
-/// Format `unix_millis` as an RFC3339Nano UTC string (`…Z`, fractional seconds
-/// trimmed of trailing zeros, matching Go's `time.RFC3339Nano`).
-fn format_rfc3339_nano(unix_millis: i64) -> String {
-    // Decompose into whole seconds + millisecond remainder (>= 0).
-    let millis = unix_millis.max(0);
-    let secs = millis / 1000;
-    let ms = (millis % 1000) as u32;
-
-    let (year, month, day, hour, min, sec) = civil_from_unix_secs(secs);
-    if ms == 0 {
-        format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z")
-    } else {
-        // RFC3339Nano trims trailing zeros; milliseconds → up to 3 digits.
-        let mut frac = format!("{ms:03}");
-        while frac.ends_with('0') {
-            frac.pop();
-        }
-        format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}.{frac}Z")
-    }
-}
-
-/// Parse an RFC3339Nano UTC string (as produced by [`format_rfc3339_nano`])
-/// back into a `SystemTime`. Returns `None` on any shape we don't recognise.
-fn parse_rfc3339_nano(s: &str) -> Option<std::time::SystemTime> {
-    // Expect: YYYY-MM-DDTHH:MM:SS[.fraction]Z
-    let s = s.strip_suffix('Z')?;
-    let (date, time) = s.split_once('T')?;
-    let mut dparts = date.split('-');
-    let year: i64 = dparts.next()?.parse().ok()?;
-    let month: u32 = dparts.next()?.parse().ok()?;
-    let day: u32 = dparts.next()?.parse().ok()?;
-    if dparts.next().is_some() {
-        return None;
-    }
-
-    let (hms, frac) = match time.split_once('.') {
-        Some((hms, frac)) => (hms, Some(frac)),
-        None => (time, None),
-    };
-    let mut tparts = hms.split(':');
-    let hour: u32 = tparts.next()?.parse().ok()?;
-    let min: u32 = tparts.next()?.parse().ok()?;
-    let sec: u32 = tparts.next()?.parse().ok()?;
-    if tparts.next().is_some() {
-        return None;
-    }
-
-    let secs = unix_secs_from_civil(year, month, day, hour, min, sec)?;
-    let nanos: u32 = match frac {
-        Some(frac) => {
-            if frac.is_empty() || frac.len() > 9 || !frac.bytes().all(|b| b.is_ascii_digit()) {
-                return None;
-            }
-            let mut padded = frac.to_string();
-            while padded.len() < 9 {
-                padded.push('0');
-            }
-            padded.parse().ok()?
-        }
-        None => 0,
-    };
-
-    if secs < 0 {
-        return None;
-    }
-    Some(std::time::UNIX_EPOCH + std::time::Duration::new(secs as u64, nanos))
-}
-
-/// Convert a Unix timestamp (whole seconds, >= 0) to a civil
-/// `(year, month, day, hour, min, sec)` in UTC. Uses Howard Hinnant's
-/// days-from-civil inverse (public-domain algorithm), exact for all dates.
-fn civil_from_unix_secs(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
-    let days = secs.div_euclid(86_400);
-    let rem = secs.rem_euclid(86_400);
-    let hour = (rem / 3600) as u32;
-    let min = ((rem % 3600) / 60) as u32;
-    let sec = (rem % 60) as u32;
-
-    // civil_from_days (days since 1970-01-01).
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
-    let year = if m <= 2 { y + 1 } else { y };
-    (year, m, d, hour, min, sec)
-}
-
-/// Inverse of [`civil_from_unix_secs`]: civil UTC → Unix seconds. Returns `None`
-/// for an out-of-range month/day. Uses Howard Hinnant's days_from_civil.
-fn unix_secs_from_civil(
-    year: i64,
-    month: u32,
-    day: u32,
-    hour: u32,
-    min: u32,
-    sec: u32,
-) -> Option<i64> {
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 60 {
-        return None;
-    }
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400; // [0, 399]
-    let m = month as i64;
-    let d = day as i64;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1; // [0, 365]
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
-    let days = era * 146_097 + doe - 719_468;
-    Some(days * 86_400 + hour as i64 * 3600 + min as i64 * 60 + sec as i64)
+    Ok(timestamp)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::replica_url::parse_replica_url_with_query;
+
+    #[test]
+    fn timestamp_metadata_matches_go_rfc3339_nano() {
+        assert_eq!(
+            format_rfc3339_nano(1_609_459_200_000).unwrap(),
+            "2021-01-01T00:00:00Z"
+        );
+        assert_eq!(
+            format_rfc3339_nano(1_609_459_200_500).unwrap(),
+            "2021-01-01T00:00:00.5Z"
+        );
+        assert_eq!(
+            format_rfc3339_nano(1_609_459_200_123).unwrap(),
+            "2021-01-01T00:00:00.123Z"
+        );
+        assert!(format_rfc3339_nano(i64::MAX).is_err());
+    }
+
+    #[tokio::test]
+    async fn write_preserves_the_litestream_timestamp_metadata() {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let client = ObjectStoreClient::with_store(
+            ObjectStoreConfig {
+                bucket: "bucket".into(),
+                path: "replica".into(),
+                ..Default::default()
+            },
+            store.clone(),
+        );
+        let data = ltx::Header {
+            version: ltx::VERSION,
+            flags: ltx::HEADER_FLAG_NO_CHECKSUM,
+            page_size: 512,
+            commit: 1,
+            min_txid: TXID(1),
+            max_txid: TXID(1),
+            timestamp: 1_609_459_200_123,
+            pre_apply_checksum: 0,
+            wal_offset: 0,
+            wal_size: 0,
+            wal_salt1: 0,
+            wal_salt2: 0,
+            node_id: 0,
+        }
+        .marshal();
+
+        client
+            .write_ltx_file(0, TXID(1), TXID(1), &data)
+            .await
+            .expect("write LTX object");
+
+        let result = store
+            .get_opts(
+                &ObjPath::from("replica/0000/0000000000000001-0000000000000001.ltx"),
+                object_store::GetOptions {
+                    head: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("read object metadata");
+        let value = result
+            .attributes
+            .get(&Attribute::Metadata(METADATA_KEY_TIMESTAMP.into()))
+            .expect("litestream timestamp metadata");
+        assert_eq!(value.as_ref(), "2021-01-01T00:00:00.123Z");
+    }
 
     // ── ParseHost (port of TestParseHost, s3/replica_client_test.go:1071) ──────
     #[test]
@@ -1086,28 +876,6 @@ mod tests {
         ObjectStoreConfig::from_url(&parsed).unwrap()
     }
 
-    // ── R2 concurrency default (port of TestReplicaClient_R2ConcurrencyDefault,
-    //    s3/replica_client_test.go:1795) ─────────────────────────────────────────
-    #[test]
-    fn r2_concurrency_default() {
-        assert_eq!(
-            cfg_from_url("s3://mybucket/path?endpoint=https://account123.r2.cloudflarestorage.com")
-                .concurrency,
-            2,
-            "R2 endpoint defaults concurrency to 2"
-        );
-        assert_eq!(
-            cfg_from_url("s3://mybucket/path").concurrency,
-            0,
-            "AWS: no concurrency override"
-        );
-        assert_eq!(
-            cfg_from_url("s3://mybucket/path?endpoint=http://localhost:9000").concurrency,
-            0,
-            "MinIO: no concurrency override"
-        );
-    }
-
     // ── URL query param aliases (port of
     //    TestNewReplicaClientFromURL_QueryParamAliases, test:1940) ───────────────
     #[test]
@@ -1128,20 +896,16 @@ mod tests {
         let c = cfg_from_url("s3://mybucket/path?skip-verify=true");
         assert!(c.skip_verify);
 
-        let c = cfg_from_url("s3://mybucket/path?concurrency=3");
-        assert_eq!(c.concurrency, 3);
-
         let c = cfg_from_url("s3://mybucket/path?part-size=10485760");
         assert_eq!(c.part_size, 10_485_760);
         let c = cfg_from_url("s3://mybucket/path?partSize=10485760");
         assert_eq!(c.part_size, 10_485_760);
 
         let c = cfg_from_url(
-            "s3://mybucket/path?force-path-style=true&skip-verify=true&concurrency=4&part-size=8388608",
+            "s3://mybucket/path?force-path-style=true&skip-verify=true&part-size=8388608",
         );
         assert!(c.force_path_style);
         assert!(c.skip_verify);
-        assert_eq!(c.concurrency, 4);
         assert_eq!(c.part_size, 8_388_608);
     }
 
@@ -1202,14 +966,6 @@ mod tests {
         }
     }
 
-    // ── Bucket validation (port of TestReplicaClient_Init_BucketValidation,
-    //    test:468). Empty bucket → build error. ────────────────────────────────
-    #[tokio::test]
-    async fn empty_bucket_errors_on_init() {
-        let client = ObjectStoreClient::new(ObjectStoreConfig::default());
-        assert!(client.init().await.is_err(), "empty bucket must error");
-    }
-
     // ── Key construction (wire-compat requirement D-1, test:629/677/1040) ─────
     #[test]
     fn ltx_key_scheme() {
@@ -1241,51 +997,5 @@ mod tests {
             Error::Io(io) => assert_eq!(io.kind(), std::io::ErrorKind::NotFound),
             other => panic!("expected Io(NotFound), got {other:?}"),
         }
-    }
-
-    // ── RFC3339Nano round-trip (the timestamp metadata path, test:671/1435) ───
-    #[test]
-    fn rfc3339_nano_round_trip() {
-        // 2021-01-01T00:00:00Z = 1609459200000 ms.
-        assert_eq!(
-            format_rfc3339_nano(1_609_459_200_000),
-            "2021-01-01T00:00:00Z"
-        );
-        // With a millisecond fraction (trailing zeros trimmed).
-        assert_eq!(
-            format_rfc3339_nano(1_609_459_200_500),
-            "2021-01-01T00:00:00.5Z"
-        );
-        assert_eq!(format_rfc3339_nano(0), "1970-01-01T00:00:00Z");
-
-        for ms in [
-            0i64,
-            1_000,
-            1_609_459_200_000,
-            1_609_459_200_123,
-            1_700_000_000_777,
-        ] {
-            let s = format_rfc3339_nano(ms);
-            let back = parse_rfc3339_nano(&s).expect("parse our own format");
-            let got = back
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as i64;
-            assert_eq!(got, ms, "round trip for {ms} via {s:?}");
-        }
-
-        // Reject malformed inputs.
-        assert!(parse_rfc3339_nano("not-a-date").is_none());
-        assert!(parse_rfc3339_nano("2021-01-01T00:00:00").is_none()); // missing Z
-        assert!(parse_rfc3339_nano("2021-13-01T00:00:00Z").is_none()); // bad month
-    }
-
-    #[test]
-    fn type_name_is_s3() {
-        let client = ObjectStoreClient::new(ObjectStoreConfig {
-            bucket: "b".into(),
-            ..Default::default()
-        });
-        assert_eq!(client.type_name(), "s3");
     }
 }

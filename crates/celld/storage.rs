@@ -6,33 +6,175 @@
 //! We expose synchronous Rust ops to V8 and wrap them in `async` in the JS
 //! harness — same contract, no thread-hopping. Each cell is its OWN db file
 //! (its own replicated, epoch-fenced bucket prefix), so the JS thread holds a
-//! `scope -> Connection` map: `open` on activate, `close` on hibernate. The
+//! `scope -> Connection` map: `open` on activate, `close` on evict. The
 //! `scope` column survives from the single-db era and still keys rows, but a
 //! db now holds exactly one cell.
 use rusqlite::{Connection, OptionalExtension};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+/// The storage of every cell one isolate hosts.
+///
+/// This state was thread-local, which was correct while a cell isolate *was*
+/// a thread. It is not correct once a cell event is driven by a tokio task:
+/// its turns run on whatever worker holds the isolate, so state keyed by
+/// thread would be invisible to the next turn. The state therefore belongs
+/// to the isolate, which is the thing a cell truly lives in.
+///
+/// Nothing here is synchronised, and it does not need to be: a turn holds
+/// the isolate lock, so exactly one thread can reach these maps at a time.
+/// That is the same guarantee the thread gave, obtained from the isolate
+/// instead. See `wiki/designs/deleting-the-pump.md`.
+#[derive(Default)]
+pub struct Cells {
+    dbs: RefCell<HashMap<String, Connection>>,
+    active_alarms: RefCell<HashMap<String, ActiveAlarm>>,
+    /// Committed alarm mutations no turn has taken yet, `-1` for a delete.
+    /// The turn that committed one drains it (`take_alarm_moves`) and the
+    /// drive reports it to the host: the alarm move is a turn *output*,
+    /// like the ops a turn starts, not a side channel to poll.
+    alarm_moves: RefCell<HashMap<String, i64>>,
+    alarm_dirty: RefCell<HashSet<String>>,
+    sync_list_cursors: RefCell<HashMap<u64, SyncListCursor>>,
+    sql_cursors: RefCell<HashMap<u64, SqlCursor>>,
+    sql_statement_caches: RefCell<HashMap<String, SqlStatementCache>>,
+    sql_critical_errors: RefCell<HashMap<String, String>>,
+    /// The schema cookie last read for a cell, and what it was read against.
+    schema_cookies: RefCell<HashMap<String, SchemaCookie>>,
+}
+
+/// A cached `PRAGMA schema_version`, and the two things that can invalidate
+/// it.
+///
+/// The pragma is a real query: it takes a shared pager lock, which is an
+/// `fcntl` on the database file. `write_position` samples it twice per cell
+/// event — once before the handler and once to take the write delta — so a
+/// handler that touches no storage at all still paid two locked reads. A
+/// profile of `/c/hello` found them; they were the single largest term the
+/// stateless path does not have.
+///
+/// The cookie cannot move unless a statement runs on the connection, so a
+/// sample that sees neither a new prepare nor a new completed change can
+/// reuse the last value. Both counters are cheap: one atomic load and one
+/// `sqlite3_total_changes64` call, neither of which touches the file.
+struct SchemaCookie {
+    cookie: u64,
+    changes: u64,
+    prepares: u64,
+}
+
+/// Statements prepared across every cell in the process.
+///
+/// Bumped by the SQL authorizer, which SQLite calls while preparing each
+/// statement, so it counts exactly the events that can move a schema
+/// cookie. Process-wide rather than per cell because the authorizer is a
+/// bare function with no scope in hand — which only costs a cell an extra
+/// pragma when *another* cell ran SQL, and never returns a stale answer.
+static SQL_PREPARES: AtomicU64 = AtomicU64::new(0);
+
+/// SAFETY: the cursors and statement caches hold raw SQLite handles, so this
+/// is not `Send` by inference. It is `Send` in fact: the handles move
+/// between threads only with the isolate that owns them, and a thread
+/// reaches them only while it holds that isolate's lock.
+unsafe impl Send for Cells {}
+
 thread_local! {
-    static DBS: RefCell<HashMap<String, Connection>> =
-        RefCell::new(HashMap::new());
-    static ACTIVE_ALARMS: RefCell<HashMap<String, ActiveAlarm>> =
-        RefCell::new(HashMap::new());
-    static ALARM_WATCHERS: RefCell<HashMap<String, Arc<AtomicI64>>> =
-        RefCell::new(HashMap::new());
-    static ALARM_DIRTY_TRANSACTIONS: RefCell<HashSet<String>> =
-        RefCell::new(HashSet::new());
-    static SYNC_LIST_CURSORS: RefCell<HashMap<u64, SyncListCursor>> =
-        RefCell::new(HashMap::new());
-    static SQL_CURSORS: RefCell<HashMap<u64, SqlCursor>> =
-        RefCell::new(HashMap::new());
-    static SQL_STATEMENT_CACHES: RefCell<HashMap<String, SqlStatementCache>> =
-        RefCell::new(HashMap::new());
-    static SQL_CRITICAL_ERRORS: RefCell<HashMap<String, String>> =
-        RefCell::new(HashMap::new());
+    /// The cells of the isolate this thread currently holds, or null.
+    ///
+    /// A pointer rather than the state itself: the state belongs to the
+    /// isolate and only its address is thread business. `install` sets it
+    /// for one turn, so the pointer is live exactly when a turn is running.
+    static CURRENT_CELLS: std::cell::Cell<*const Cells> =
+        const { std::cell::Cell::new(std::ptr::null()) };
+    /// Set once a test has given this thread cells of its own. Production
+    /// never sets it, because no thread there owns a cell's storage.
+    static THREAD_OWNS_CELLS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+impl Cells {
+    /// Make these cells reachable by the storage API for one turn.
+    ///
+    /// Restores whatever was installed before, so a nested entry — which the
+    /// blocking cell run loop still does — leaves the outer turn's cells in
+    /// place on the way out.
+    pub fn install(&self) -> Installed {
+        if THREAD_OWNS_CELLS.get() {
+            // A test opened this cell's database on the thread, before the
+            // isolate that serves it existed. There the thread's cells are
+            // the isolate's, so entering must not shadow them.
+            return Installed(CURRENT_CELLS.get());
+        }
+        Installed(CURRENT_CELLS.replace(self))
+    }
+}
+
+pub struct Installed(*const Cells);
+
+impl Drop for Installed {
+    fn drop(&mut self) {
+        CURRENT_CELLS.set(self.0);
+    }
+}
+
+/// Give this thread cells of its own, as though it were an isolate.
+///
+/// A test drives the storage API directly and has no isolate to own the
+/// state. Production has one and must use it: `cells` asserts rather than
+/// falling back to a per-thread map, so a storage call that escapes a turn
+/// fails loudly instead of quietly reading state no cell can see.
+pub fn install_for_test() {
+    thread_local! {
+        static OWN: Cells = Cells::default();
+    }
+    OWN.with(|cells| CURRENT_CELLS.set(cells));
+    THREAD_OWNS_CELLS.set(true);
+}
+
+/// Reach the current isolate's cells.
+fn cells<T>(f: impl FnOnce(&Cells) -> T) -> T {
+    let cells = CURRENT_CELLS.get();
+    assert!(!cells.is_null(), "cell storage reached outside a turn");
+    // SAFETY: non-null only between `Cells::install` and dropping its guard,
+    // which spans one turn and therefore holds the isolate lock. The isolate
+    // owns the state and outlives the turn.
+    f(unsafe { &*cells })
+}
+
+// One accessor per map, so a call site names the state it wants and nothing
+// else. Each takes the closure the thread-local `with` took, unchanged.
+fn dbs<T>(f: impl FnOnce(&RefCell<HashMap<String, Connection>>) -> T) -> T {
+    cells(|c| f(&c.dbs))
+}
+
+fn active_alarms<T>(f: impl FnOnce(&RefCell<HashMap<String, ActiveAlarm>>) -> T) -> T {
+    cells(|c| f(&c.active_alarms))
+}
+
+fn alarm_moves<T>(f: impl FnOnce(&RefCell<HashMap<String, i64>>) -> T) -> T {
+    cells(|c| f(&c.alarm_moves))
+}
+
+fn alarm_dirty<T>(f: impl FnOnce(&RefCell<HashSet<String>>) -> T) -> T {
+    cells(|c| f(&c.alarm_dirty))
+}
+
+fn sync_list_cursors<T>(f: impl FnOnce(&RefCell<HashMap<u64, SyncListCursor>>) -> T) -> T {
+    cells(|c| f(&c.sync_list_cursors))
+}
+
+fn sql_cursors<T>(f: impl FnOnce(&RefCell<HashMap<u64, SqlCursor>>) -> T) -> T {
+    cells(|c| f(&c.sql_cursors))
+}
+
+fn sql_statement_caches<T>(f: impl FnOnce(&RefCell<HashMap<String, SqlStatementCache>>) -> T) -> T {
+    cells(|c| f(&c.sql_statement_caches))
+}
+
+fn sql_critical_errors<T>(f: impl FnOnce(&RefCell<HashMap<String, String>>) -> T) -> T {
+    cells(|c| f(&c.sql_critical_errors))
 }
 
 const SQL_STATEMENT_CACHE_MAX_SIZE: usize = 1024 * 1024;
@@ -111,7 +253,75 @@ impl Drop for SqlCursor {
 }
 
 fn schema(c: &Connection) -> anyhow::Result<()> {
+    // OFF while schema() runs, then NORMAL for the steady state. schema()
+    // writes only pragmas and celld's own tables, never user data, so a
+    // crash mid-schema loses nothing a re-open does not rebuild. The point
+    // is the fsync the next line would otherwise force: switching a fresh
+    // database to WAL is durable, so SQLite fsyncs the header under every
+    // synchronous level except OFF — and that lone fsync, serialized by the
+    // filesystem journal, capped cold-cell creation near 1,000/s at idle
+    // CPU while warm cells ran at 22k (engine/pathological-load.md).
+    c.pragma_update(None, "synchronous", "OFF")?;
     c.pragma_update(None, "journal_mode", "WAL")?;
+    // celld shipped these as `kv`, `alarms` and `cell_metadata` until
+    // 2026-08-06 -- names a userland table can collide with, and which a
+    // library that drops everything except `_cf_*` will happily delete
+    // (denoland/celld#122). Cloudflare's own names are `_cf_KV`, `_cf_ALARM`
+    // and `_cf_METADATA`; adopt them and carry existing cells across. The
+    // rename is a metadata-only operation, and it runs before the CREATE
+    // statements so an already-migrated cell falls straight through.
+    for (legacy, current) in [
+        ("kv", "_cf_KV"),
+        ("alarms", "_cf_ALARM"),
+        ("cell_metadata", "_cf_METADATA"),
+    ] {
+        let exists = |name: &str| -> rusqlite::Result<bool> {
+            c.query_row(
+                "SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1",
+                [name],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|found| found.is_some())
+        };
+        if exists(legacy)? && !exists(current)? {
+            c.execute_batch(&format!("ALTER TABLE {legacy} RENAME TO {current}"))?;
+        }
+    }
+    c.execute(
+        "CREATE TABLE IF NOT EXISTS _cf_KV \
+         (scope TEXT, k TEXT, v TEXT, PRIMARY KEY(scope,k))",
+        [],
+    )?;
+    c.execute(
+        "CREATE TABLE IF NOT EXISTS _cf_ALARM \
+         (scope TEXT PRIMARY KEY, at_ms INTEGER, retry INTEGER DEFAULT 0, \
+          counted_retry INTEGER NOT NULL DEFAULT 0, \
+          generation INTEGER NOT NULL DEFAULT 0)",
+        [],
+    )?;
+    c.execute(
+        "CREATE TABLE IF NOT EXISTS _cf_METADATA \
+         (scope TEXT PRIMARY KEY, actor_name TEXT)",
+        [],
+    )?;
+    let alarm_columns = {
+        let mut statement = c.prepare("PRAGMA table_info(_cf_ALARM)")?;
+        let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+        columns.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if !alarm_columns.iter().any(|column| column == "generation") {
+        c.execute(
+            "ALTER TABLE _cf_ALARM ADD COLUMN generation INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !alarm_columns.iter().any(|column| column == "counted_retry") {
+        c.execute(
+            "ALTER TABLE _cf_ALARM ADD COLUMN counted_retry INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
     // NORMAL, not the FULL default: with WAL, commits then skip the
     // per-commit WAL fsync (measured 1.4ms -> 19us per put on cloud
     // disks; the fsync was the entire single-cell write budget).
@@ -120,46 +330,32 @@ fn schema(c: &Connection) -> anyhow::Result<()> {
     // loss is LTX replication either way, and replicated-WAL setups
     // conventionally run NORMAL.
     c.pragma_update(None, "synchronous", "NORMAL")?;
-    c.execute(
-        "CREATE TABLE IF NOT EXISTS kv \
-         (scope TEXT, k TEXT, v TEXT, PRIMARY KEY(scope,k))",
-        [],
-    )?;
-    c.execute(
-        "CREATE TABLE IF NOT EXISTS alarms \
-         (scope TEXT PRIMARY KEY, at_ms INTEGER, retry INTEGER DEFAULT 0, \
-          counted_retry INTEGER NOT NULL DEFAULT 0, \
-          generation INTEGER NOT NULL DEFAULT 0)",
-        [],
-    )?;
-    c.execute(
-        "CREATE TABLE IF NOT EXISTS cell_metadata \
-         (scope TEXT PRIMARY KEY, actor_name TEXT)",
-        [],
-    )?;
-    let alarm_columns = {
-        let mut statement = c.prepare("PRAGMA table_info(alarms)")?;
-        let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
-        columns.collect::<rusqlite::Result<Vec<_>>>()?
-    };
-    if !alarm_columns.iter().any(|column| column == "generation") {
-        c.execute(
-            "ALTER TABLE alarms ADD COLUMN generation INTEGER NOT NULL DEFAULT 0",
-            [],
-        )?;
-    }
-    if !alarm_columns.iter().any(|column| column == "counted_retry") {
-        c.execute(
-            "ALTER TABLE alarms ADD COLUMN counted_retry INTEGER NOT NULL DEFAULT 0",
-            [],
-        )?;
-    }
     Ok(())
 }
 
+thread_local! {
+    /// True only while a statement the application authored is running.
+    /// The `_cf_` reservation exists to keep application SQL out of celld's
+    /// own tables, and celld's tables now carry that prefix
+    /// (denoland/celld#122), so the engine's own statements must not be
+    /// judged by it. Everything else the authorizer denies -- pragmas,
+    /// ATTACH, load_extension -- stays denied for both.
+    static USER_SQL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `callback` with application-SQL restrictions in force.
+fn as_user_sql<T>(callback: impl FnOnce() -> T) -> T {
+    USER_SQL.with(|flag| flag.set(true));
+    let result = callback();
+    USER_SQL.with(|flag| flag.set(false));
+    result
+}
+
 fn is_reserved_sql_name(name: &str) -> bool {
-    name.get(..4)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("_cf_"))
+    USER_SQL.with(std::cell::Cell::get)
+        && name
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("_cf_"))
 }
 
 fn valid_sql_boolean(value: &str) -> bool {
@@ -190,7 +386,14 @@ fn valid_sql_i32(value: &str) -> bool {
 fn allowed_sql_pragma(name: &str, value: Option<&str>) -> bool {
     let name = name.to_ascii_lowercase();
     match name.as_str() {
-        "data_version" | "table_list" => value.is_none(),
+        // `schema_version` (read-only) is a deliberate one-pragma divergence
+        // from workerd's list: `write_position` reads the schema cookie on
+        // this connection under the normal authorizer, because toggling the
+        // authorizer off and on around the read expires prepared statements
+        // and must not run concurrently with an active one — and
+        // `write_position` is called from egress paths that can overlap a
+        // cursor.
+        "data_version" | "table_list" | "schema_version" => value.is_none(),
         "case_sensitive_like"
         | "foreign_keys"
         | "defer_foreign_keys"
@@ -212,7 +415,18 @@ fn allowed_sql_pragma(name: &str, value: Option<&str>) -> bool {
 fn authorize_sql(context: rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization {
     use rusqlite::hooks::{AuthAction, Authorization};
 
+    // SQLite calls this while preparing a statement, which makes it the one
+    // place that sees everything able to move a schema cookie. See
+    // `SchemaCookie`.
+    SQL_PREPARES.fetch_add(1, Ordering::Relaxed);
+
     let prohibited = match context.action {
+        // The Attach deny is also the only thing blocking VACUUM and VACUUM
+        // INTO: SQLite emits no distinct authorizer action for VACUUM and
+        // implements it via an internal ATTACH, which lands here. Relaxing
+        // Attach (or raising SQLITE_LIMIT_ATTACHED from 0) silently unblocks
+        // whole-file rewrites against a replicating database and, via VACUUM
+        // INTO, arbitrary file writes from cell SQL.
         AuthAction::Transaction { .. }
         | AuthAction::Savepoint { .. }
         | AuthAction::Attach { .. }
@@ -284,8 +498,14 @@ fn authorize_sql(context: rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::
         | AuthAction::Delete { table_name }
         | AuthAction::DropTable { table_name }
         | AuthAction::DropTempTable { table_name }
-        | AuthAction::Insert { table_name }
-        | AuthAction::Analyze { table_name } => is_reserved_sql_name(table_name),
+        | AuthAction::Insert { table_name } => is_reserved_sql_name(table_name),
+        // ANALYZE is allowed on every table, reserved ones included, which is
+        // what workerd does (`sqlite.c++:1104`) and for its reason: a bare
+        // `ANALYZE` analyzes all tables, and `PRAGMA optimize` issues one, so
+        // name-checking it denies both outright. What ANALYZE writes is
+        // `sqlite_stat1` — index names and row counts, not rows — so a
+        // reserved table leaks metadata here and no data.
+        AuthAction::Analyze { .. } => false,
         AuthAction::CreateView { view_name }
         | AuthAction::CreateTempView { view_name }
         | AuthAction::DropView { view_name }
@@ -383,31 +603,35 @@ fn finish_open(scope: &str, c: Connection) -> anyhow::Result<()> {
     close_sync_list_cursors(scope);
     close_sql_cursors(scope);
     close_sql_statement_cache(scope);
-    SQL_CRITICAL_ERRORS.with(|errors| errors.borrow_mut().remove(scope));
-    DBS.with(|d| d.borrow_mut().insert(scope.to_string(), c));
+    sql_critical_errors(|errors| errors.borrow_mut().remove(scope));
+    dbs(|d| d.borrow_mut().insert(scope.to_string(), c));
     Ok(())
 }
 
-/// Drop `scope`'s connection (hibernate) so the replicator can release the
+/// Drop `scope`'s connection (evict) so the replicator can release the
 /// file.
 pub fn close(scope: &str) {
     close_sync_list_cursors(scope);
     close_sql_cursors(scope);
     close_sql_statement_cache(scope);
-    SQL_CRITICAL_ERRORS.with(|errors| errors.borrow_mut().remove(scope));
-    DBS.with(|d| d.borrow_mut().remove(scope));
-    ACTIVE_ALARMS.with(|alarms| alarms.borrow_mut().remove(scope));
-    ALARM_DIRTY_TRANSACTIONS.with(|dirty| {
+    sql_critical_errors(|errors| errors.borrow_mut().remove(scope));
+    cells(|c| c.schema_cookies.borrow_mut().remove(scope));
+    dbs(|d| d.borrow_mut().remove(scope));
+    active_alarms(|alarms| alarms.borrow_mut().remove(scope));
+    alarm_moves(|moves| {
+        moves.borrow_mut().remove(scope);
+    });
+    alarm_dirty(|dirty| {
         dirty.borrow_mut().remove(scope);
     });
 }
 
 fn with<T>(scope: &str, f: impl FnOnce(&Connection) -> T) -> Option<T> {
-    DBS.with(|d| d.borrow().get(scope).map(f))
+    dbs(|d| d.borrow().get(scope).map(f))
 }
 
 fn with_mut<T>(scope: &str, f: impl FnOnce(&mut Connection) -> T) -> Option<T> {
-    DBS.with(|d| d.borrow_mut().get_mut(scope).map(f))
+    dbs(|d| d.borrow_mut().get_mut(scope).map(f))
 }
 
 static NEXT_BATCH_SAVEPOINT: AtomicU64 = AtomicU64::new(1);
@@ -477,12 +701,65 @@ fn total_changes(connection: &Connection) -> u64 {
     unsafe { total_changes_for_handle(connection.handle()) }
 }
 
-/// The cell's committed-write position: SQLite's total completed row changes on
-/// this connection, monotonic for the life of the activation. The output gate
-/// samples it around a handler to tell a write from a read. `None` when the
-/// scope has no open connection (a Worker with no Durable Object storage).
+/// The schema cookie, which every DDL statement increments. `total_changes`
+/// counts only row changes, so a handler whose sole mutation is `deleteAll()`
+/// (a `DROP TABLE` sweep) or user DDL would otherwise look read-only to the
+/// output gate and be acknowledged with no durability proof — workerd
+/// explicitly forces confirmation on deleteAll (actor-sqlite.c++:863).
+///
+/// Read under the normal authorizer (`schema_version` is allowlisted
+/// read-only for exactly this) and with a fresh statement, never a cached
+/// one: this runs from egress paths that can overlap an active cursor, where
+/// toggling the authorizer or borrowing the statement cache is not safe.
+fn schema_version(connection: &Connection) -> u64 {
+    connection
+        .query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0))
+        .unwrap_or(0) as u64
+}
+
+/// The cell's committed-write position: SQLite's total completed row changes
+/// plus the schema cookie, monotonic for the life of the activation. The
+/// output gate samples it around a handler to tell a write from a read; the
+/// cookie term makes DDL-only mutations (deleteAll, user DDL) count as
+/// writes. Widened only after the gated-frame flush learned to outlive its
+/// dispatch — before that, counting DDL turned every lazily-CREATE-ing
+/// connect handler into a "writer" whose held frames were silently lost.
+/// `None` when the scope has no open connection (a Worker with no Durable
+/// Object storage).
 pub fn write_position(scope: &str) -> Option<u64> {
-    with(scope, total_changes)
+    with(scope, |c| total_changes(c) + schema_cookie(scope, c))
+}
+
+/// The cell's schema cookie, re-read only when something could have moved it.
+fn schema_cookie(scope: &str, connection: &Connection) -> u64 {
+    let changes = total_changes(connection);
+    let prepares = SQL_PREPARES.load(Ordering::Relaxed);
+    let cached = cells(|c| {
+        c.schema_cookies
+            .borrow()
+            .get(scope)
+            .filter(|seen| seen.changes == changes && seen.prepares == prepares)
+            .map(|seen| seen.cookie)
+    });
+    if let Some(cookie) = cached {
+        return cookie;
+    }
+    let cookie = schema_version(connection);
+    // Read the counter *after* the pragma, not before: preparing it calls
+    // the authorizer too, so a count taken beforehand is already stale by
+    // the time it is stored and every later sample misses.
+    let prepares = SQL_PREPARES.load(Ordering::Relaxed);
+    cells(|c| {
+        c.schema_cookies.borrow_mut().insert(
+            scope.to_string(),
+            SchemaCookie {
+                cookie,
+                changes,
+                prepares,
+            },
+        )
+    });
+    cookie
 }
 
 unsafe fn total_changes_for_handle(database: *mut rusqlite::ffi::sqlite3) -> u64 {
@@ -514,31 +791,33 @@ type SqlExec = (Vec<String>, Vec<Vec<serde_json::Value>>, u64);
 pub fn sql_exec(scope: &str, query: &str, binds: &[serde_json::Value]) -> Result<SqlExec, String> {
     require_sql_healthy(scope)?;
     let run = with(scope, |c| {
-        let changes_before = total_changes(c);
-        if binds.is_empty() && query.matches(';').count() > 1 {
-            c.execute_batch(query).map_err(|e| e.to_string())?;
-            return Ok((
-                Vec::new(),
-                Vec::new(),
-                total_changes(c).saturating_sub(changes_before),
-            ));
-        }
-        let mut stmt = c.prepare(query).map_err(|e| e.to_string())?;
-        let cols: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
-        let n = cols.len();
-        let params = rusqlite::params_from_iter(binds.iter().map(json_to_sql));
-        let mut rows = stmt.query(params).map_err(|e| e.to_string())?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-            let mut r = Vec::with_capacity(n);
-            for i in 0..n {
-                r.push(vref_to_json(row.get_ref(i).map_err(|e| e.to_string())?));
+        as_user_sql(|| {
+            let changes_before = total_changes(c);
+            if binds.is_empty() && query.matches(';').count() > 1 {
+                c.execute_batch(query).map_err(|e| e.to_string())?;
+                return Ok((
+                    Vec::new(),
+                    Vec::new(),
+                    total_changes(c).saturating_sub(changes_before),
+                ));
             }
-            out.push(r);
-        }
-        drop(rows);
-        drop(stmt);
-        Ok((cols, out, total_changes(c).saturating_sub(changes_before)))
+            let mut stmt = c.prepare(query).map_err(|e| e.to_string())?;
+            let cols: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+            let n = cols.len();
+            let params = rusqlite::params_from_iter(binds.iter().map(json_to_sql));
+            let mut rows = stmt.query(params).map_err(|e| e.to_string())?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+                let mut r = Vec::with_capacity(n);
+                for i in 0..n {
+                    r.push(vref_to_json(row.get_ref(i).map_err(|e| e.to_string())?));
+                }
+                out.push(r);
+            }
+            drop(rows);
+            drop(stmt);
+            Ok((cols, out, total_changes(c).saturating_sub(changes_before)))
+        })
     });
     run.unwrap_or_else(|| Err(format!("no db for {scope}")))
 }
@@ -552,99 +831,103 @@ pub fn sql_ingest(scope: &str, input: &str) -> Result<(String, u64, u64), String
     require_sql_healthy(scope)?;
     let sql = CString::new(input).map_err(|error| error.to_string())?;
     let result = with(scope, |connection| -> anyhow::Result<_> {
-        // SAFETY: `sql` remains alive for the entire loop. Every prepared
-        // statement is finalized on all paths, and SQLite's tail points within
-        // the same NUL-terminated allocation.
-        unsafe {
-            let database = connection.handle();
-            let started_in_transaction = rusqlite::ffi::sqlite3_get_autocommit(database) == 0;
-            let start = sql.as_ptr();
-            let mut source = start;
-            let changes_before = total_changes_for_handle(database);
-            let mut statement_count = 0_u64;
+        // Application SQL, exactly like `sql_exec`: the `_cf_` reservation
+        // must hold here too, or the ingest path is a way around it.
+        as_user_sql(|| {
+            // SAFETY: `sql` remains alive for the entire loop. Every prepared
+            // statement is finalized on all paths, and SQLite's tail points within
+            // the same NUL-terminated allocation.
+            unsafe {
+                let database = connection.handle();
+                let started_in_transaction = rusqlite::ffi::sqlite3_get_autocommit(database) == 0;
+                let start = sql.as_ptr();
+                let mut source = start;
+                let changes_before = total_changes_for_handle(database);
+                let mut statement_count = 0_u64;
 
-            loop {
-                let offset = source.offset_from(start) as usize;
-                let remainder = input
-                    .get(offset..)
-                    .ok_or_else(|| anyhow::anyhow!("SQLite returned an invalid SQL tail"))?;
-                let mut statement = std::ptr::null_mut();
-                let mut tail = std::ptr::null();
-                let prepare = rusqlite::ffi::sqlite3_prepare_v2(
-                    database,
-                    source,
-                    -1,
-                    &mut statement,
-                    &mut tail,
-                );
-                if prepare != rusqlite::ffi::SQLITE_OK {
-                    if !statement.is_null() {
-                        rusqlite::ffi::sqlite3_finalize(statement);
+                loop {
+                    let offset = source.offset_from(start) as usize;
+                    let remainder = input
+                        .get(offset..)
+                        .ok_or_else(|| anyhow::anyhow!("SQLite returned an invalid SQL tail"))?;
+                    let mut statement = std::ptr::null_mut();
+                    let mut tail = std::ptr::null();
+                    let prepare = rusqlite::ffi::sqlite3_prepare_v2(
+                        database,
+                        source,
+                        -1,
+                        &mut statement,
+                        &mut tail,
+                    );
+                    if prepare != rusqlite::ffi::SQLITE_OK {
+                        if !statement.is_null() {
+                            rusqlite::ffi::sqlite3_finalize(statement);
+                        }
+                        if rusqlite::ffi::sqlite3_complete(source) == 0 {
+                            return Ok((
+                                remainder.to_string(),
+                                total_changes_for_handle(database).saturating_sub(changes_before),
+                                statement_count,
+                            ));
+                        }
+                        return Err(sqlite_operation_failure(
+                            scope,
+                            database,
+                            started_in_transaction,
+                            prepare,
+                            "prepare ingested SQL",
+                        ));
                     }
-                    if rusqlite::ffi::sqlite3_complete(source) == 0 {
+                    if statement.is_null() {
                         return Ok((
                             remainder.to_string(),
                             total_changes_for_handle(database).saturating_sub(changes_before),
                             statement_count,
                         ));
                     }
-                    return Err(sqlite_operation_failure(
-                        scope,
-                        database,
-                        started_in_transaction,
-                        prepare,
-                        "prepare ingested SQL",
-                    ));
-                }
-                if statement.is_null() {
-                    return Ok((
-                        remainder.to_string(),
-                        total_changes_for_handle(database).saturating_sub(changes_before),
-                        statement_count,
-                    ));
-                }
-                if tail.is_null() || tail < source {
-                    rusqlite::ffi::sqlite3_finalize(statement);
-                    return Err(anyhow::anyhow!("SQLite returned an invalid SQL tail"));
-                }
+                    if tail.is_null() || tail < source {
+                        rusqlite::ffi::sqlite3_finalize(statement);
+                        return Err(anyhow::anyhow!("SQLite returned an invalid SQL tail"));
+                    }
 
-                let consumed_length = tail.offset_from(source) as usize;
-                let consumed = CString::new(std::slice::from_raw_parts(
-                    source.cast::<u8>(),
-                    consumed_length,
-                ))?;
-                if rusqlite::ffi::sqlite3_complete(consumed.as_ptr()) == 0 {
-                    rusqlite::ffi::sqlite3_finalize(statement);
-                    return Ok((
-                        remainder.to_string(),
-                        total_changes_for_handle(database).saturating_sub(changes_before),
-                        statement_count,
-                    ));
-                }
+                    let consumed_length = tail.offset_from(source) as usize;
+                    let consumed = CString::new(std::slice::from_raw_parts(
+                        source.cast::<u8>(),
+                        consumed_length,
+                    ))?;
+                    if rusqlite::ffi::sqlite3_complete(consumed.as_ptr()) == 0 {
+                        rusqlite::ffi::sqlite3_finalize(statement);
+                        return Ok((
+                            remainder.to_string(),
+                            total_changes_for_handle(database).saturating_sub(changes_before),
+                            statement_count,
+                        ));
+                    }
 
-                loop {
-                    let step = rusqlite::ffi::sqlite3_step(statement);
-                    match step {
-                        rusqlite::ffi::SQLITE_ROW => {}
-                        rusqlite::ffi::SQLITE_DONE => break,
-                        _ => {
-                            let error = sqlite_operation_failure(
-                                scope,
-                                database,
-                                started_in_transaction,
-                                step,
-                                "step ingested SQL",
-                            );
-                            rusqlite::ffi::sqlite3_finalize(statement);
-                            return Err(error);
+                    loop {
+                        let step = rusqlite::ffi::sqlite3_step(statement);
+                        match step {
+                            rusqlite::ffi::SQLITE_ROW => {}
+                            rusqlite::ffi::SQLITE_DONE => break,
+                            _ => {
+                                let error = sqlite_operation_failure(
+                                    scope,
+                                    database,
+                                    started_in_transaction,
+                                    step,
+                                    "step ingested SQL",
+                                );
+                                rusqlite::ffi::sqlite3_finalize(statement);
+                                return Err(error);
+                            }
                         }
                     }
+                    rusqlite::ffi::sqlite3_finalize(statement);
+                    statement_count += 1;
+                    source = tail;
                 }
-                rusqlite::ffi::sqlite3_finalize(statement);
-                statement_count += 1;
-                source = tail;
             }
-        }
+        })
     });
     result
         .unwrap_or_else(|| Err(anyhow::anyhow!("no db for {scope}")))
@@ -715,7 +998,7 @@ enum SqlStatementCacheLookup {
 }
 
 fn take_cached_sql_statement(scope: &str, query: &str) -> SqlStatementCacheLookup {
-    SQL_STATEMENT_CACHES.with(|caches| {
+    sql_statement_caches(|caches| {
         let mut caches = caches.borrow_mut();
         let Some(cache) = caches.get_mut(scope) else {
             return SqlStatementCacheLookup::Miss;
@@ -749,7 +1032,7 @@ fn take_cached_sql_statement(scope: &str, query: &str) -> SqlStatementCacheLooku
 }
 
 fn register_cached_sql_statement(scope: &str, query: &str) -> Option<Arc<str>> {
-    SQL_STATEMENT_CACHES.with(|caches| {
+    sql_statement_caches(|caches| {
         let mut caches = caches.borrow_mut();
         let cache = caches.entry(scope.to_string()).or_default();
         cache.clock = cache.clock.wrapping_add(1);
@@ -785,7 +1068,7 @@ fn register_cached_sql_statement(scope: &str, query: &str) -> Option<Arc<str>> {
 }
 
 fn discard_cached_sql_statement(scope: &str, query: &str) {
-    SQL_STATEMENT_CACHES.with(|caches| {
+    sql_statement_caches(|caches| {
         let mut caches = caches.borrow_mut();
         let Some(cache) = caches.get_mut(scope) else {
             return;
@@ -807,7 +1090,7 @@ fn recycle_sql_statement(scope: &str, query: &str, statement: *mut rusqlite::ffi
     };
     let mut retained = false;
     if reusable {
-        SQL_STATEMENT_CACHES.with(|caches| {
+        sql_statement_caches(|caches| {
             if let Some(entry) = caches
                 .borrow_mut()
                 .get_mut(scope)
@@ -832,7 +1115,7 @@ fn recycle_sql_statement(scope: &str, query: &str, statement: *mut rusqlite::ffi
 }
 
 fn close_sql_statement_cache(scope: &str) {
-    SQL_STATEMENT_CACHES.with(|caches| {
+    sql_statement_caches(|caches| {
         caches.borrow_mut().remove(scope);
     });
 }
@@ -877,148 +1160,153 @@ pub fn sql_cursor_start(
         };
     let sql = CString::new(query).map_err(|error| error.to_string())?;
     let result = with(scope, |connection| -> anyhow::Result<_> {
-        // SAFETY: the connection remains in DBS until close(), which drops all
-        // SQL cursors first. SQLite receives transient copies of every bind.
-        unsafe {
-            let database = connection.handle();
-            let started_in_transaction = rusqlite::ffi::sqlite3_get_autocommit(database) == 0;
-            let changes_before = total_changes_for_handle(database);
-            let start = sql.as_ptr();
-            let mut source = start;
-            let mut saw_prefix = false;
-            loop {
-                let using_cached = source == start && !cached_statement.is_null();
-                let mut cache_query =
-                    using_cached.then(|| cached_query.as_ref().expect("cached query key").clone());
-                let mut statement = if using_cached {
-                    cached_statement
-                } else {
-                    std::ptr::null_mut()
-                };
-                let mut tail = std::ptr::null();
-                if !using_cached {
-                    let prepare = rusqlite::ffi::sqlite3_prepare_v2(
-                        database,
-                        source,
-                        -1,
-                        &mut statement,
-                        &mut tail,
-                    );
-                    if prepare != rusqlite::ffi::SQLITE_OK {
-                        discard_in_use_sql_statement(scope, cache_query.as_deref(), statement);
-                        return Err(sqlite_operation_failure(
-                            scope,
+        // `storage.sql.exec` reaches SQLite here, so this is where the `_cf_`
+        // reservation has to hold -- the statement is prepared inside, and
+        // preparation is when SQLite consults the authorizer.
+        as_user_sql(|| {
+            // SAFETY: the connection remains in DBS until close(), which drops all
+            // SQL cursors first. SQLite receives transient copies of every bind.
+            unsafe {
+                let database = connection.handle();
+                let started_in_transaction = rusqlite::ffi::sqlite3_get_autocommit(database) == 0;
+                let changes_before = total_changes_for_handle(database);
+                let start = sql.as_ptr();
+                let mut source = start;
+                let mut saw_prefix = false;
+                loop {
+                    let using_cached = source == start && !cached_statement.is_null();
+                    let mut cache_query = using_cached
+                        .then(|| cached_query.as_ref().expect("cached query key").clone());
+                    let mut statement = if using_cached {
+                        cached_statement
+                    } else {
+                        std::ptr::null_mut()
+                    };
+                    let mut tail = std::ptr::null();
+                    if !using_cached {
+                        let prepare = rusqlite::ffi::sqlite3_prepare_v2(
                             database,
-                            started_in_transaction,
-                            prepare,
-                            "prepare SQL cursor",
-                        ));
+                            source,
+                            -1,
+                            &mut statement,
+                            &mut tail,
+                        );
+                        if prepare != rusqlite::ffi::SQLITE_OK {
+                            discard_in_use_sql_statement(scope, cache_query.as_deref(), statement);
+                            return Err(sqlite_operation_failure(
+                                scope,
+                                database,
+                                started_in_transaction,
+                                prepare,
+                                "prepare SQL cursor",
+                            ));
+                        }
                     }
-                }
-                if statement.is_null() {
-                    return Err(anyhow::anyhow!("SQL code did not contain a statement"));
-                }
+                    if statement.is_null() {
+                        return Err(anyhow::anyhow!("SQL code did not contain a statement"));
+                    }
 
-                let has_more = !using_cached
-                    && !tail.is_null()
-                    && CStr::from_ptr(tail)
-                        .to_bytes()
-                        .iter()
-                        .any(|byte| !byte.is_ascii_whitespace());
-                if has_more {
-                    if rusqlite::ffi::sqlite3_bind_parameter_count(statement) != 0 {
-                        discard_in_use_sql_statement(scope, None, statement);
+                    let has_more = !using_cached
+                        && !tail.is_null()
+                        && CStr::from_ptr(tail)
+                            .to_bytes()
+                            .iter()
+                            .any(|byte| !byte.is_ascii_whitespace());
+                    if has_more {
+                        if rusqlite::ffi::sqlite3_bind_parameter_count(statement) != 0 {
+                            discard_in_use_sql_statement(scope, None, statement);
+                            return Err(anyhow::anyhow!(
+                                "Wrong number of parameter bindings for SQL query."
+                            ));
+                        }
+                        loop {
+                            let step = rusqlite::ffi::sqlite3_step(statement);
+                            match step {
+                                rusqlite::ffi::SQLITE_ROW => {}
+                                rusqlite::ffi::SQLITE_DONE => break,
+                                _ => {
+                                    let error = sqlite_operation_failure(
+                                        scope,
+                                        database,
+                                        started_in_transaction,
+                                        step,
+                                        "step SQL prefix",
+                                    );
+                                    discard_in_use_sql_statement(scope, None, statement);
+                                    return Err(error);
+                                }
+                            }
+                        }
+                        rusqlite::ffi::sqlite3_finalize(statement);
+                        source = tail;
+                        saw_prefix = true;
+                        continue;
+                    }
+
+                    let expected = rusqlite::ffi::sqlite3_bind_parameter_count(statement) as usize;
+                    if expected != binds.len() {
+                        discard_in_use_sql_statement(scope, cache_query.as_deref(), statement);
                         return Err(anyhow::anyhow!(
                             "Wrong number of parameter bindings for SQL query."
                         ));
                     }
-                    loop {
-                        let step = rusqlite::ffi::sqlite3_step(statement);
-                        match step {
-                            rusqlite::ffi::SQLITE_ROW => {}
-                            rusqlite::ffi::SQLITE_DONE => break,
-                            _ => {
-                                let error = sqlite_operation_failure(
-                                    scope,
-                                    database,
-                                    started_in_transaction,
-                                    step,
-                                    "step SQL prefix",
-                                );
-                                discard_in_use_sql_statement(scope, None, statement);
-                                return Err(error);
-                            }
+                    for (offset, value) in binds.iter().map(json_to_sql).enumerate() {
+                        if let Err(error) =
+                            bind_cursor_value(database, statement, offset as i32 + 1, &value)
+                        {
+                            discard_in_use_sql_statement(scope, cache_query.as_deref(), statement);
+                            return Err(error);
                         }
                     }
-                    rusqlite::ffi::sqlite3_finalize(statement);
-                    source = tail;
-                    saw_prefix = true;
-                    continue;
-                }
-
-                let expected = rusqlite::ffi::sqlite3_bind_parameter_count(statement) as usize;
-                if expected != binds.len() {
-                    discard_in_use_sql_statement(scope, cache_query.as_deref(), statement);
-                    return Err(anyhow::anyhow!(
-                        "Wrong number of parameter bindings for SQL query."
-                    ));
-                }
-                for (offset, value) in binds.iter().map(json_to_sql).enumerate() {
-                    if let Err(error) =
-                        bind_cursor_value(database, statement, offset as i32 + 1, &value)
-                    {
-                        discard_in_use_sql_statement(scope, cache_query.as_deref(), statement);
-                        return Err(error);
+                    if cache_query.is_none() && !cache_busy && !saw_prefix {
+                        cache_query = register_cached_sql_statement(scope, query);
                     }
+                    let step = rusqlite::ffi::sqlite3_step(statement);
+                    return match step {
+                        rusqlite::ffi::SQLITE_ROW => {
+                            // Read metadata after the first step so SQLite has
+                            // automatically recompiled an expired cached statement.
+                            let columns = sql_cursor_columns(statement);
+                            let row = sql_cursor_row(statement);
+                            Ok((
+                                database,
+                                statement,
+                                changes_before,
+                                columns,
+                                Some(row),
+                                0,
+                                cache_query,
+                            ))
+                        }
+                        rusqlite::ffi::SQLITE_DONE => {
+                            let columns = sql_cursor_columns(statement);
+                            let rows_written =
+                                total_changes_for_handle(database).saturating_sub(changes_before);
+                            Ok((
+                                database,
+                                statement,
+                                changes_before,
+                                columns,
+                                None,
+                                rows_written,
+                                cache_query,
+                            ))
+                        }
+                        _ => {
+                            let error = sqlite_operation_failure(
+                                scope,
+                                database,
+                                started_in_transaction,
+                                step,
+                                "step SQL cursor",
+                            );
+                            discard_in_use_sql_statement(scope, cache_query.as_deref(), statement);
+                            Err(error)
+                        }
+                    };
                 }
-                if cache_query.is_none() && !cache_busy && !saw_prefix {
-                    cache_query = register_cached_sql_statement(scope, query);
-                }
-                let step = rusqlite::ffi::sqlite3_step(statement);
-                return match step {
-                    rusqlite::ffi::SQLITE_ROW => {
-                        // Read metadata after the first step so SQLite has
-                        // automatically recompiled an expired cached statement.
-                        let columns = sql_cursor_columns(statement);
-                        let row = sql_cursor_row(statement);
-                        Ok((
-                            database,
-                            statement,
-                            changes_before,
-                            columns,
-                            Some(row),
-                            0,
-                            cache_query,
-                        ))
-                    }
-                    rusqlite::ffi::SQLITE_DONE => {
-                        let columns = sql_cursor_columns(statement);
-                        let rows_written =
-                            total_changes_for_handle(database).saturating_sub(changes_before);
-                        Ok((
-                            database,
-                            statement,
-                            changes_before,
-                            columns,
-                            None,
-                            rows_written,
-                            cache_query,
-                        ))
-                    }
-                    _ => {
-                        let error = sqlite_operation_failure(
-                            scope,
-                            database,
-                            started_in_transaction,
-                            step,
-                            "step SQL cursor",
-                        );
-                        discard_in_use_sql_statement(scope, cache_query.as_deref(), statement);
-                        Err(error)
-                    }
-                };
             }
-        }
+        })
     })
     .unwrap_or_else(|| Err(anyhow::anyhow!("no db for {scope}")))
     .map_err(|error| error.to_string())?;
@@ -1033,7 +1321,7 @@ pub fn sql_cursor_start(
         return Ok((0, columns, row, rows_written, reused_cached_query));
     }
     let id = NEXT_SQL_CURSOR.fetch_add(1, Ordering::Relaxed);
-    SQL_CURSORS.with(|cursors| {
+    sql_cursors(|cursors| {
         cursors.borrow_mut().insert(
             id,
             SqlCursor {
@@ -1049,7 +1337,7 @@ pub fn sql_cursor_start(
 }
 
 pub fn sql_cursor_next(cursor_id: u64) -> Result<(Option<Vec<serde_json::Value>>, u64), String> {
-    SQL_CURSORS.with(|cursors| {
+    sql_cursors(|cursors| {
         let mut cursors = cursors.borrow_mut();
         let cursor = cursors
             .get_mut(&cursor_id)
@@ -1095,7 +1383,7 @@ pub fn sql_cursor_next(cursor_id: u64) -> Result<(Option<Vec<serde_json::Value>>
 }
 
 pub fn sql_cursor_close(cursor_id: u64) {
-    SQL_CURSORS.with(|cursors| {
+    sql_cursors(|cursors| {
         cursors.borrow_mut().remove(&cursor_id);
     });
 }
@@ -1142,9 +1430,9 @@ pub fn transaction_control(
         return result;
     }
     if nested
-        && !savepoint
+        && savepoint
             .strip_prefix("cells_tx_")
-            .is_some_and(|suffix| suffix.parse::<u64>().is_ok())
+            .is_none_or(|suffix| suffix.parse::<u64>().is_err())
     {
         return Err("invalid storage transaction savepoint".to_string());
     }
@@ -1320,7 +1608,7 @@ pub fn sql_limit_for_test(scope: &str, category: i32) -> anyhow::Result<i32> {
 
 #[cfg(all(test, celld_internal_tests))]
 pub fn sql_statement_cache_stats(scope: &str) -> (usize, usize, usize) {
-    SQL_STATEMENT_CACHES.with(|caches| {
+    sql_statement_caches(|caches| {
         caches.borrow().get(scope).map_or((0, 0, 0), |cache| {
             (
                 cache.entries.len(),
@@ -1340,7 +1628,7 @@ pub fn sql_statement_cache_stats(scope: &str) -> (usize, usize, usize) {
 pub fn get(scope: &str, key: &str) -> Option<String> {
     with(scope, |c| {
         c.query_row(
-            "SELECT v FROM kv WHERE scope=?1 AND k=?2",
+            "SELECT v FROM _cf_KV WHERE scope=?1 AND k=?2",
             [scope, key],
             |r| r.get::<_, String>(0),
         )
@@ -1351,7 +1639,7 @@ pub fn get(scope: &str, key: &str) -> Option<String> {
 pub fn get_stored(scope: &str, key: &str) -> anyhow::Result<Option<StoredValue>> {
     with(scope, |c| {
         c.query_row(
-            "SELECT v FROM kv WHERE scope=?1 AND k=?2",
+            "SELECT v FROM _cf_KV WHERE scope=?1 AND k=?2",
             [scope, key],
             |row| Ok(stored_value(row.get_ref(0)?)),
         )
@@ -1381,7 +1669,7 @@ pub fn get_many_stored(scope: &str, keys: &[String]) -> anyhow::Result<Vec<(Stri
     keys.sort();
     keys.dedup();
     with(scope, |c| {
-        let mut statement = c.prepare("SELECT v FROM kv WHERE scope=?1 AND k=?2")?;
+        let mut statement = c.prepare("SELECT v FROM _cf_KV WHERE scope=?1 AND k=?2")?;
         let mut values = Vec::new();
         for key in keys {
             if let Some(value) = statement
@@ -1402,7 +1690,7 @@ pub fn get_many_stored(scope: &str, keys: &[String]) -> anyhow::Result<Vec<(Stri
 pub fn put(scope: &str, key: &str, val: &str) {
     with(scope, |c| {
         c.execute(
-            "INSERT INTO kv(scope,k,v) VALUES(?1,?2,?3) \
+            "INSERT INTO _cf_KV(scope,k,v) VALUES(?1,?2,?3) \
          ON CONFLICT(scope,k) DO UPDATE SET v=excluded.v",
             [scope, key, val],
         )
@@ -1412,7 +1700,7 @@ pub fn put(scope: &str, key: &str, val: &str) {
 pub fn put_serialized(scope: &str, key: &str, value: &[u8]) -> anyhow::Result<()> {
     with(scope, |c| {
         c.execute(
-            "INSERT INTO kv(scope,k,v) VALUES(?1,?2,?3) \
+            "INSERT INTO _cf_KV(scope,k,v) VALUES(?1,?2,?3) \
              ON CONFLICT(scope,k) DO UPDATE SET v=excluded.v",
             rusqlite::params![scope, key, value],
         )
@@ -1433,7 +1721,7 @@ pub fn put_many(scope: &str, entries: &[(String, String)]) -> anyhow::Result<()>
             if !c.is_autocommit() {
                 return with_batch_savepoint(c, |c| {
                     let mut statement = c.prepare(
-                        "INSERT INTO kv(scope,k,v) VALUES(?1,?2,?3) \
+                        "INSERT INTO _cf_KV(scope,k,v) VALUES(?1,?2,?3) \
                      ON CONFLICT(scope,k) DO UPDATE SET v=excluded.v",
                     )?;
                     for (key, value) in entries {
@@ -1446,7 +1734,7 @@ pub fn put_many(scope: &str, entries: &[(String, String)]) -> anyhow::Result<()>
                 c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             {
                 let mut statement = transaction.prepare(
-                    "INSERT INTO kv(scope,k,v) VALUES(?1,?2,?3) \
+                    "INSERT INTO _cf_KV(scope,k,v) VALUES(?1,?2,?3) \
                  ON CONFLICT(scope,k) DO UPDATE SET v=excluded.v",
                 )?;
                 for (key, value) in entries {
@@ -1468,7 +1756,7 @@ pub fn put_many_serialized(scope: &str, entries: &[(String, Vec<u8>)]) -> anyhow
         without_sql_authorizer_mut(c, |c| {
             let write = |c: &Connection| -> anyhow::Result<()> {
                 let mut statement = c.prepare(
-                    "INSERT INTO kv(scope,k,v) VALUES(?1,?2,?3) \
+                    "INSERT INTO _cf_KV(scope,k,v) VALUES(?1,?2,?3) \
                  ON CONFLICT(scope,k) DO UPDATE SET v=excluded.v",
                 )?;
                 for (key, value) in entries {
@@ -1491,7 +1779,7 @@ pub fn put_many_serialized(scope: &str, entries: &[(String, Vec<u8>)]) -> anyhow
 
 pub fn delete(scope: &str, key: &str) -> anyhow::Result<bool> {
     with(scope, |c| {
-        c.execute("DELETE FROM kv WHERE scope=?1 AND k=?2", [scope, key])
+        c.execute("DELETE FROM _cf_KV WHERE scope=?1 AND k=?2", [scope, key])
             .map(|n| n > 0)
             .map_err(Into::into)
     })
@@ -1507,7 +1795,7 @@ pub fn delete_many(scope: &str, keys: &[String]) -> anyhow::Result<usize> {
         without_sql_authorizer_mut(c, |c| {
             if !c.is_autocommit() {
                 return with_batch_savepoint(c, |c| {
-                    let mut statement = c.prepare("DELETE FROM kv WHERE scope=?1 AND k=?2")?;
+                    let mut statement = c.prepare("DELETE FROM _cf_KV WHERE scope=?1 AND k=?2")?;
                     let mut deleted = 0;
                     for key in keys {
                         deleted += statement.execute(rusqlite::params![scope, key])?;
@@ -1520,7 +1808,7 @@ pub fn delete_many(scope: &str, keys: &[String]) -> anyhow::Result<usize> {
             let mut deleted = 0;
             {
                 let mut statement =
-                    transaction.prepare("DELETE FROM kv WHERE scope=?1 AND k=?2")?;
+                    transaction.prepare("DELETE FROM _cf_KV WHERE scope=?1 AND k=?2")?;
                 for key in keys {
                     deleted += statement.execute(rusqlite::params![scope, key])?;
                 }
@@ -1600,7 +1888,7 @@ fn list_query(
     use rusqlite::types::Value;
 
     let order = if reverse { "DESC" } else { "ASC" };
-    let mut query = String::from("SELECT k,v FROM kv WHERE scope=?");
+    let mut query = String::from("SELECT k,v FROM _cf_KV WHERE scope=?");
     let mut parameters = vec![Value::Text(scope.to_string())];
     if let Some(begin) = begin {
         query.push_str(" AND k>=?");
@@ -1640,7 +1928,7 @@ fn sqlite_failure(database: *mut rusqlite::ffi::sqlite3, operation: &str) -> any
 }
 
 pub fn sql_critical_error(scope: &str) -> Option<String> {
-    SQL_CRITICAL_ERRORS.with(|errors| errors.borrow().get(scope).cloned())
+    sql_critical_errors(|errors| errors.borrow().get(scope).cloned())
 }
 
 fn require_sql_healthy(scope: &str) -> Result<(), String> {
@@ -1668,11 +1956,8 @@ fn sqlite_operation_failure(
             && celld_logic::sqlite::SQLITE_INTERRUPT == rusqlite::ffi::SQLITE_INTERRUPT,
     );
     let now_autocommit = unsafe { rusqlite::ffi::sqlite3_get_autocommit(database) != 0 };
-    let poison =
-        celld_logic::sqlite::classify_failure(result_code, started_in_transaction, now_autocommit)
-            == celld_logic::sqlite::Disposition::Poison;
-    if poison {
-        SQL_CRITICAL_ERRORS.with(|errors| {
+    if celld_logic::sqlite::poisons_actor(result_code, started_in_transaction, now_autocommit) {
+        sql_critical_errors(|errors| {
             errors
                 .borrow_mut()
                 .entry(scope.to_string())
@@ -1716,7 +2001,7 @@ unsafe fn bind_cursor_value(
 }
 
 fn close_sync_list_cursors(scope: &str) {
-    SYNC_LIST_CURSORS.with(|cursors| {
+    sync_list_cursors(|cursors| {
         cursors
             .borrow_mut()
             .retain(|_, cursor| cursor.scope != scope);
@@ -1724,7 +2009,7 @@ fn close_sync_list_cursors(scope: &str) {
 }
 
 fn close_sql_cursors(scope: &str) {
-    SQL_CURSORS.with(|cursors| {
+    sql_cursors(|cursors| {
         cursors
             .borrow_mut()
             .retain(|_, cursor| cursor.scope != scope);
@@ -1775,12 +2060,12 @@ pub fn sync_list_start(
     })
     .unwrap_or_else(|| Err(anyhow::anyhow!("no db for {scope}")))?;
     let id = NEXT_SYNC_LIST_CURSOR.fetch_add(1, Ordering::Relaxed);
-    SYNC_LIST_CURSORS.with(|cursors| cursors.borrow_mut().insert(id, cursor));
+    sync_list_cursors(|cursors| cursors.borrow_mut().insert(id, cursor));
     Ok(id)
 }
 
 pub fn sync_list_next(cursor_id: u64) -> anyhow::Result<Option<(String, StoredValue)>> {
-    SYNC_LIST_CURSORS.with(|cursors| {
+    sync_list_cursors(|cursors| {
         let mut cursors = cursors.borrow_mut();
         let cursor = cursors
             .get_mut(&cursor_id)
@@ -1878,7 +2163,7 @@ pub struct KvTransaction<'connection> {
 impl KvTransaction<'_> {
     pub fn get(&self, key: &str) -> anyhow::Result<Option<String>> {
         match self.transaction.query_row(
-            "SELECT v FROM kv WHERE scope=?1 AND k=?2",
+            "SELECT v FROM _cf_KV WHERE scope=?1 AND k=?2",
             rusqlite::params![self.scope, key],
             |row| row.get(0),
         ) {
@@ -1894,7 +2179,7 @@ impl KvTransaction<'_> {
         keys.dedup();
         let mut statement = self
             .transaction
-            .prepare("SELECT v FROM kv WHERE scope=?1 AND k=?2")?;
+            .prepare("SELECT v FROM _cf_KV WHERE scope=?1 AND k=?2")?;
         let mut values = Vec::new();
         for key in keys {
             if let Some(value) = statement
@@ -1911,7 +2196,7 @@ impl KvTransaction<'_> {
 
     pub fn put(&self, key: &str, value: &str) -> anyhow::Result<()> {
         self.transaction.execute(
-            "INSERT INTO kv(scope,k,v) VALUES(?1,?2,?3) \
+            "INSERT INTO _cf_KV(scope,k,v) VALUES(?1,?2,?3) \
              ON CONFLICT(scope,k) DO UPDATE SET v=excluded.v",
             rusqlite::params![self.scope, key, value],
         )?;
@@ -1920,7 +2205,7 @@ impl KvTransaction<'_> {
 
     pub fn put_many(&self, entries: &[(String, String)]) -> anyhow::Result<()> {
         let mut statement = self.transaction.prepare(
-            "INSERT INTO kv(scope,k,v) VALUES(?1,?2,?3) \
+            "INSERT INTO _cf_KV(scope,k,v) VALUES(?1,?2,?3) \
              ON CONFLICT(scope,k) DO UPDATE SET v=excluded.v",
         )?;
         for (key, value) in entries {
@@ -1932,7 +2217,7 @@ impl KvTransaction<'_> {
     pub fn delete_many(&self, keys: &[String]) -> anyhow::Result<usize> {
         let mut statement = self
             .transaction
-            .prepare("DELETE FROM kv WHERE scope=?1 AND k=?2")?;
+            .prepare("DELETE FROM _cf_KV WHERE scope=?1 AND k=?2")?;
         let mut deleted = 0;
         for key in keys {
             deleted += statement.execute(rusqlite::params![self.scope, key])?;
@@ -1944,7 +2229,7 @@ impl KvTransaction<'_> {
         Ok(self
             .transaction
             .query_row(
-                "SELECT at_ms FROM alarms WHERE scope=?1",
+                "SELECT at_ms FROM _cf_ALARM WHERE scope=?1",
                 [self.scope.as_str()],
                 |row| row.get(0),
             )
@@ -1953,7 +2238,7 @@ impl KvTransaction<'_> {
 
     pub fn set_alarm(&self, at_ms: i64) -> anyhow::Result<()> {
         self.transaction.execute(
-            "INSERT INTO alarms(scope,at_ms,retry,counted_retry,generation) \
+            "INSERT INTO _cf_ALARM(scope,at_ms,retry,counted_retry,generation) \
              VALUES(?1,?2,0,0,random()) \
              ON CONFLICT(scope) DO UPDATE SET \
                at_ms=excluded.at_ms, retry=0, counted_retry=0, generation=random()",
@@ -1963,8 +2248,10 @@ impl KvTransaction<'_> {
     }
 
     pub fn delete_alarm(&self) -> anyhow::Result<()> {
-        self.transaction
-            .execute("DELETE FROM alarms WHERE scope=?1", [self.scope.as_str()])?;
+        self.transaction.execute(
+            "DELETE FROM _cf_ALARM WHERE scope=?1",
+            [self.scope.as_str()],
+        )?;
         Ok(())
     }
 
@@ -1977,7 +2264,7 @@ impl KvTransaction<'_> {
     ) -> anyhow::Result<Vec<(String, String)>> {
         let order = if reverse { "DESC" } else { "ASC" };
         let query = format!(
-            "SELECT k,v FROM kv \
+            "SELECT k,v FROM _cf_KV \
              WHERE scope=?1 AND (?2 IS NULL OR k>=?2) AND (?3 IS NULL OR k<?3) \
              ORDER BY k {order} LIMIT ?4",
         );
@@ -2023,13 +2310,13 @@ pub fn transaction<T>(
 pub fn set_actor_name(scope: &str, name: &str) -> anyhow::Result<()> {
     with(scope, |connection| -> anyhow::Result<()> {
         connection.execute(
-            "INSERT INTO cell_metadata(scope, actor_name) VALUES(?1, ?2) \
+            "INSERT INTO _cf_METADATA(scope, actor_name) VALUES(?1, ?2) \
              ON CONFLICT(scope) DO NOTHING",
             rusqlite::params![scope, name],
         )?;
         let stored: Option<String> = connection
             .query_row(
-                "SELECT actor_name FROM cell_metadata WHERE scope=?1",
+                "SELECT actor_name FROM _cf_METADATA WHERE scope=?1",
                 [scope],
                 |row| row.get(0),
             )
@@ -2046,7 +2333,7 @@ pub fn get_actor_name(scope: &str) -> anyhow::Result<Option<String>> {
     with(scope, |connection| {
         connection
             .query_row(
-                "SELECT actor_name FROM cell_metadata WHERE scope=?1",
+                "SELECT actor_name FROM _cf_METADATA WHERE scope=?1",
                 [scope],
                 |row| row.get(0),
             )
@@ -2072,7 +2359,7 @@ pub fn delete_all_with_alarm(scope: &str, delete_alarm: bool) -> anyhow::Result<
             c.execute_batch("PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;")?;
             let result = (|| -> anyhow::Result<()> {
                 for table in tables {
-                    if table == "cell_metadata" || (!delete_alarm && table == "alarms") {
+                    if table == "_cf_METADATA" || (!delete_alarm && table == "_cf_ALARM") {
                         continue;
                     }
                     let quoted = table.replace('"', "\"\"");
@@ -2107,7 +2394,7 @@ pub fn delete_all_with_alarm(scope: &str, delete_alarm: bool) -> anyhow::Result<
 pub fn set_alarm(scope: &str, at_ms: i64) -> anyhow::Result<Option<i64>> {
     with(scope, |c| {
         c.execute(
-            "INSERT INTO alarms(scope,at_ms,retry,counted_retry,generation) \
+            "INSERT INTO _cf_ALARM(scope,at_ms,retry,counted_retry,generation) \
              VALUES(?1,?2,0,0,random()) \
              ON CONFLICT(scope) DO UPDATE SET \
                at_ms=excluded.at_ms, retry=0, counted_retry=0, generation=random()",
@@ -2122,7 +2409,7 @@ pub fn set_alarm(scope: &str, at_ms: i64) -> anyhow::Result<Option<i64>> {
 
 pub fn get_alarm(scope: &str) -> Option<i64> {
     let alarm = alarm_state(scope);
-    let hidden_during_handler = ACTIVE_ALARMS.with(|alarms| {
+    let hidden_during_handler = active_alarms(|alarms| {
         alarms
             .borrow()
             .get(scope)
@@ -2137,7 +2424,7 @@ pub fn get_alarm(scope: &str) -> Option<i64> {
 
 pub fn delete_alarm(scope: &str) -> anyhow::Result<()> {
     with(scope, |c| {
-        c.execute("DELETE FROM alarms WHERE scope=?1", [scope])
+        c.execute("DELETE FROM _cf_ALARM WHERE scope=?1", [scope])
             .map(|_| ())
             .map_err(Into::into)
     })
@@ -2146,24 +2433,13 @@ pub fn delete_alarm(scope: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Publish alarm mutations to the owning cell thread's eviction state.
+/// Drain the alarm moves committed since the last take, in this isolate.
 ///
-/// The observer keeps the ordinary request path free of SQLite reads: alarm
-/// state changes only when an exceptional alarm operation mutates the table.
-pub fn watch_alarm(scope: &str, watcher: Arc<AtomicI64>) {
-    watcher.store(
-        alarm_state(scope).map_or(-1, |(at_ms, _)| at_ms),
-        Ordering::Release,
-    );
-    ALARM_WATCHERS.with(|watchers| {
-        watchers.borrow_mut().insert(scope.to_string(), watcher);
-    });
-}
-
-pub fn unwatch_alarm(scope: &str) {
-    ALARM_WATCHERS.with(|watchers| {
-        watchers.borrow_mut().remove(scope);
-    });
+/// Called at the end of every cell turn, under the isolate lock like all
+/// storage. Only an alarm mutation fills the map, so the ordinary request
+/// path pays one empty-map read and no SQLite.
+pub fn take_alarm_moves() -> Vec<(String, i64)> {
+    alarm_moves(|moves| moves.borrow_mut().drain().collect())
 }
 
 /// Publish committed alarm state to the watcher. Returns the committed value
@@ -2178,9 +2454,11 @@ fn publish_alarm(scope: &str) -> Option<i64> {
     let state = with(scope, |connection| {
         if connection.is_autocommit() {
             Ok(connection
-                .query_row("SELECT at_ms FROM alarms WHERE scope=?1", [scope], |row| {
-                    row.get::<_, i64>(0)
-                })
+                .query_row(
+                    "SELECT at_ms FROM _cf_ALARM WHERE scope=?1",
+                    [scope],
+                    |row| row.get::<_, i64>(0),
+                )
                 .ok()
                 .unwrap_or(-1))
         } else {
@@ -2190,26 +2468,24 @@ fn publish_alarm(scope: &str) -> Option<i64> {
     let at_ms = match state {
         Some(Ok(at_ms)) => at_ms,
         Some(Err(())) => {
-            ALARM_DIRTY_TRANSACTIONS.with(|dirty| {
+            alarm_dirty(|dirty| {
                 dirty.borrow_mut().insert(scope.to_string());
             });
             return None;
         }
         None => return None,
     };
-    ALARM_DIRTY_TRANSACTIONS.with(|dirty| {
+    alarm_dirty(|dirty| {
         dirty.borrow_mut().remove(scope);
     });
-    ALARM_WATCHERS.with(|watchers| {
-        if let Some(watcher) = watchers.borrow().get(scope) {
-            watcher.store(at_ms, Ordering::Release);
-        }
+    alarm_moves(|moves| {
+        moves.borrow_mut().insert(scope.to_string(), at_ms);
     });
     Some(at_ms)
 }
 
 fn publish_alarm_if_transaction_dirty(scope: &str) -> Option<i64> {
-    let dirty = ALARM_DIRTY_TRANSACTIONS.with(|scopes| scopes.borrow().contains(scope));
+    let dirty = alarm_dirty(|scopes| scopes.borrow().contains(scope));
     if dirty {
         publish_alarm(scope)
     } else {
@@ -2228,7 +2504,7 @@ pub fn due_alarm(scope: &str, now_ms: i64) -> Option<i64> {
 pub fn due_alarm_entry(scope: &str, now_ms: i64) -> Option<(i64, i64)> {
     with(scope, |c| {
         c.query_row(
-            "SELECT at_ms,retry FROM alarms WHERE scope=?1 AND at_ms<=?2",
+            "SELECT at_ms,retry FROM _cf_ALARM WHERE scope=?1 AND at_ms<=?2",
             rusqlite::params![scope, now_ms],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -2241,7 +2517,7 @@ fn alarm_state(scope: &str) -> Option<(i64, i64)> {
     with(scope, |connection| {
         connection
             .query_row(
-                "SELECT at_ms,generation FROM alarms WHERE scope=?1",
+                "SELECT at_ms,generation FROM _cf_ALARM WHERE scope=?1",
                 [scope],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -2260,7 +2536,7 @@ pub fn persisted_alarm(db_path: &str, scope: &str) -> Option<(i64, i64, u32, u32
             .ok()?;
     connection
         .query_row(
-            "SELECT at_ms,generation,retry,counted_retry FROM alarms WHERE scope=?1",
+            "SELECT at_ms,generation,retry,counted_retry FROM _cf_ALARM WHERE scope=?1",
             [scope],
             |row| {
                 Ok((
@@ -2278,7 +2554,7 @@ pub fn persisted_alarm(db_path: &str, scope: &str) -> Option<(i64, i64, u32, u32
 /// observes null as required by the Durable Object contract.
 pub fn begin_alarm_handler(scope: &str, fired_at_ms: i64) {
     let generation = alarm_state(scope).map(|(_, generation)| generation);
-    ACTIVE_ALARMS.with(|alarms| {
+    active_alarms(|alarms| {
         alarms.borrow_mut().insert(
             scope.to_string(),
             ActiveAlarm {
@@ -2290,7 +2566,7 @@ pub fn begin_alarm_handler(scope: &str, fired_at_ms: i64) {
 }
 
 pub fn active_alarm_scheduled_time(scope: &str) -> Option<i64> {
-    ACTIVE_ALARMS.with(|alarms| alarms.borrow().get(scope).map(|active| active.fired_at_ms))
+    active_alarms(|alarms| alarms.borrow().get(scope).map(|active| active.fired_at_ms))
 }
 
 /// Finish an alarm handler. A successful handler consumes its original alarm;
@@ -2306,7 +2582,7 @@ pub fn finish_alarm_handler_with_retry_policy(
     now_ms: i64,
     retry_counts_against_limit: bool,
 ) {
-    let active = ACTIVE_ALARMS.with(|alarms| alarms.borrow_mut().remove(scope));
+    let active = active_alarms(|alarms| alarms.borrow_mut().remove(scope));
     let Some(active) = active else {
         return;
     };
@@ -2317,7 +2593,7 @@ pub fn finish_alarm_handler_with_retry_policy(
     if succeeded {
         with(scope, |connection| {
             connection.execute(
-                "DELETE FROM alarms WHERE scope=?1 AND at_ms=?2",
+                "DELETE FROM _cf_ALARM WHERE scope=?1 AND at_ms=?2",
                 rusqlite::params![scope, active.fired_at_ms],
             )
         });
@@ -2332,7 +2608,7 @@ pub fn finish_alarm_handler_with_retry_policy(
 pub fn clear_alarm_if_due(scope: &str, fired_at_ms: i64) {
     with(scope, |c| {
         c.execute(
-            "DELETE FROM alarms WHERE scope=?1 AND at_ms<=?2",
+            "DELETE FROM _cf_ALARM WHERE scope=?1 AND at_ms<=?2",
             rusqlite::params![scope, fired_at_ms],
         )
     });
@@ -2343,7 +2619,7 @@ pub fn bump_alarm_with_policy(scope: &str, now_ms: i64, counts_against_limit: bo
     with(scope, |c| {
         let (retry, counted_retry): (i64, i64) = c
             .query_row(
-                "SELECT retry,counted_retry FROM alarms WHERE scope=?1",
+                "SELECT retry,counted_retry FROM _cf_ALARM WHERE scope=?1",
                 [scope],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -2351,12 +2627,12 @@ pub fn bump_alarm_with_policy(scope: &str, now_ms: i64, counts_against_limit: bo
         // The schedule is sans-IO (`celld_logic::alarm::alarm_retry`); this fn
         // is its executor, reading the counters and writing the new row.
         match celld_logic::alarm::alarm_retry(now_ms, retry, counted_retry, counts_against_limit) {
-            celld_logic::alarm::AlarmRetry::GiveUp => {
-                let _ = c.execute("DELETE FROM alarms WHERE scope=?1", [scope]);
+            None => {
+                let _ = c.execute("DELETE FROM _cf_ALARM WHERE scope=?1", [scope]);
             }
-            celld_logic::alarm::AlarmRetry::Retry { at_ms } => {
+            Some(at_ms) => {
                 let _ = c.execute(
-                    "UPDATE alarms SET at_ms=?2, retry=retry+1, \
+                    "UPDATE _cf_ALARM SET at_ms=?2, retry=retry+1, \
                        counted_retry=counted_retry+?3 WHERE scope=?1",
                     rusqlite::params![scope, at_ms, i64::from(counts_against_limit)],
                 );
@@ -2383,4 +2659,59 @@ mod conformance_actor_sqlite_tests {
 #[cfg(all(test, celld_internal_tests))]
 mod conformance_sqlite_kv_tests {
     include!(env!("CELLD_CONFORMANCE_SQLITE_KV_TESTS"));
+}
+
+#[cfg(test)]
+mod internal_table_names {
+    use super::*;
+
+    /// denoland/celld#122: celld's tables were `kv`, `alarms` and
+    /// `cell_metadata`, which an application can collide with and which a
+    /// library that keeps only `_cf_*` will drop. Opening an existing cell
+    /// must carry it to the Cloudflare names without losing a row.
+    #[test]
+    fn legacy_tables_are_renamed_in_place() {
+        let file = std::env::temp_dir().join(format!("celld-rename-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let connection = Connection::open(&file).expect("open");
+
+        // The pre-2026-08-06 schema, with a row worth keeping.
+        connection
+            .execute_batch(
+                "CREATE TABLE kv (scope TEXT, k TEXT, v TEXT, PRIMARY KEY(scope,k));
+                 CREATE TABLE alarms (scope TEXT PRIMARY KEY, at_ms INTEGER);
+                 CREATE TABLE cell_metadata (scope TEXT PRIMARY KEY, actor_name TEXT);
+                 INSERT INTO kv VALUES('s','k','v');",
+            )
+            .expect("legacy schema");
+
+        schema(&connection).expect("migrate");
+
+        let names: Vec<String> = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT name FROM sqlite_schema WHERE type='table' \
+                     AND name NOT LIKE 'sqlite_%' ORDER BY name",
+                )
+                .expect("prepare");
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .expect("query");
+            rows.collect::<rusqlite::Result<Vec<_>>>().expect("collect")
+        };
+        assert_eq!(names, ["_cf_ALARM", "_cf_KV", "_cf_METADATA"]);
+
+        let kept: String = connection
+            .query_row("SELECT v FROM _cf_KV WHERE k='k'", [], |row| row.get(0))
+            .expect("the row survives the rename");
+        assert_eq!(kept, "v");
+
+        // Idempotent: opening an already-migrated cell is a no-op.
+        schema(&connection).expect("second open");
+        let kept_again: String = connection
+            .query_row("SELECT v FROM _cf_KV WHERE k='k'", [], |row| row.get(0))
+            .expect("still there");
+        assert_eq!(kept_again, "v");
+        let _ = std::fs::remove_file(&file);
+    }
 }

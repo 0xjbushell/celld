@@ -332,7 +332,7 @@ async fn checkpoint_truncate_continuity_break_still_restores() {
     assert!(dpos.txid.0 >= 5, "at least 5 transactions captured");
 
     // Every captured TXID is on the replica.
-    let files = replica.client.ltx_files(0, TXID(0), false).await.unwrap();
+    let files = replica.client.ltx_files(0, TXID(0)).await.unwrap();
     assert!(
         files.len() as u64 >= dpos.txid.0,
         "every captured TXID is on the replica (got {} files, txid={})",

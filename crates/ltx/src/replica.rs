@@ -43,8 +43,18 @@ use crate::db::Db;
 use crate::error::{new_ltx_error, Error, Result};
 use crate::ltx::{self, FileInfo};
 use crate::{Pos, TXID};
+use futures_util::stream;
+use futures_util::StreamExt;
+use futures_util::TryStreamExt;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::sync::Semaphore;
+
+/// Keep enough reads in flight to hide an object store's round-trip latency,
+/// while the caller's semaphore bounds aggregate restore traffic.
+const RESTORE_DOWNLOAD_CONCURRENCY: usize = 64;
 
 /// The compaction level which full snapshots are held at.
 ///
@@ -52,7 +62,7 @@ use std::path::{Path, PathBuf};
 /// scope no files land here (snapshots are written at L0), but
 /// [`calc_restore_plan`] still probes it first so the algorithm stays a faithful
 /// port that works the moment compaction is added.
-pub const SNAPSHOT_LEVEL: i32 = 9;
+pub use crate::compaction_level::SNAPSHOT_LEVEL;
 
 /// Whether a sync error means the cached replica position can no longer be
 /// trusted and must be re-derived from the store on the next sync.
@@ -77,9 +87,7 @@ fn pos_untrustworthy(err: &Error) -> bool {
 /// Ported from `Replica` (replica.go:30-59). The Go type also owns the
 /// background-monitor machinery (`wg`/`cancel`/`f`) and tunables
 /// (`SyncInterval`/`MonitorEnabled`); those drive the deferred monitor loop and
-/// are intentionally omitted here (see module docs). `auto_recover_enabled`
-/// mirrors `AutoRecoverEnabled` (replica.go:58) for the monitor's
-/// reset-on-corruption path.
+/// are intentionally omitted here (see module docs).
 pub struct Replica<C: ReplicaClient> {
     /// The database being replicated. `None` for a restore-only replica (the Go
     /// `NewReplicaWithClient(nil, client)` shape used by the restore tests).
@@ -97,11 +105,6 @@ pub struct Replica<C: ReplicaClient> {
     /// has no equivalent -- it lists whenever `pos` is zero -- which is the
     /// listing celld's fencing lets it skip.
     pos_known: bool,
-
-    /// If true, automatically reset local state when LTX errors are detected
-    /// (`replica.go:54-58` `AutoRecoverEnabled`). Consulted by the deferred
-    /// monitor loop; the field is kept so the public surface matches upstream.
-    pub auto_recover_enabled: bool,
 }
 
 impl<C: ReplicaClient> Replica<C> {
@@ -114,7 +117,6 @@ impl<C: ReplicaClient> Replica<C> {
             client,
             pos: Pos::ZERO,
             pos_known: false,
-            auto_recover_enabled: false,
         }
     }
 
@@ -126,7 +128,6 @@ impl<C: ReplicaClient> Replica<C> {
             client,
             pos: Pos::ZERO,
             pos_known: false,
-            auto_recover_enabled: false,
         }
     }
 
@@ -297,7 +298,7 @@ impl<C: ReplicaClient> Replica<C> {
     /// or a zero `FileInfo` if none exist. Ported from `Replica.MaxLTXFileInfo`
     /// (replica.go:218-233).
     async fn max_ltx_file_info(&self, level: i32) -> Result<FileInfo> {
-        let files = self.client.ltx_files(level, TXID(0), false).await?;
+        let files = self.client.ltx_files(level, TXID(0)).await?;
         let mut info = FileInfo::default();
         for item in files {
             if item.max_txid > info.max_txid {
@@ -313,7 +314,7 @@ impl<C: ReplicaClient> Replica<C> {
     /// most-recent state (no target TXID). Mirrors the common
     /// `Replica.Restore(ctx, opt)` call with `OutputPath` set and no TXID
     /// (replica.go:533).
-    pub async fn restore(&self, output_path: impl AsRef<Path>) -> Result<()> {
+    pub async fn restore(&self, output_path: impl AsRef<Path>) -> Result<RestorePlanStats> {
         restore(&self.client, output_path, TXID(0)).await
     }
 
@@ -365,7 +366,7 @@ impl<C: ReplicaClient> Replica<C> {
         let max_txid = replica_info.max_txid;
         let data = self
             .client
-            .open_ltx_file(0, min_txid, max_txid, 0, 0)
+            .open_ltx_file(0, min_txid, max_txid)
             .await
             .map_err(|e| Error::Other(format!("open remote L0 file: {e}").into()))?;
 
@@ -394,7 +395,28 @@ pub async fn restore<C: ReplicaClient>(
     client: &C,
     output_path: impl AsRef<Path>,
     txid: TXID,
-) -> Result<()> {
+) -> Result<RestorePlanStats> {
+    restore_with_download_slots(client, output_path, txid, Arc::new(Semaphore::new(1))).await
+}
+
+/// What a restore read: the plan's shape, for the caller's telemetry.
+#[derive(Debug, Clone)]
+pub struct RestorePlanStats {
+    pub objects: usize,
+    pub bytes: u64,
+    /// Object count per compaction level, ordered by level.
+    pub by_level: BTreeMap<i32, usize>,
+}
+
+/// Restores a database like [`restore`], but downloads independent LTX files
+/// concurrently. All restores that share `download_slots` share one hard I/O
+/// ceiling, so a cold cohort cannot multiply the limit per cell.
+pub async fn restore_with_download_slots<C: ReplicaClient>(
+    client: &C,
+    output_path: impl AsRef<Path>,
+    txid: TXID,
+    download_slots: Arc<Semaphore>,
+) -> Result<RestorePlanStats> {
     let output_path = output_path.as_ref();
 
     // Ensure output path does not already exist (replica.go:591-595).
@@ -415,9 +437,8 @@ pub async fn restore<C: ReplicaClient>(
     // Build the restore plan (replica.go:611).
     let infos = calc_restore_plan(client, txid).await?;
 
-    // Download every planned file's bytes, in plan order (replica.go:627-642).
-    // Validate each is at least header-sized first (replica.go:628-632).
-    let mut files: Vec<Vec<u8>> = Vec::with_capacity(infos.len());
+    // Validate the whole plan before starting I/O. An invalid later entry must
+    // not cause a partial download burst before the restore fails.
     for info in &infos {
         if info.size < ltx::HEADER_SIZE as i64 {
             return Err(Error::Other(
@@ -432,12 +453,37 @@ pub async fn restore<C: ReplicaClient>(
                 .into(),
             ));
         }
-        let data = client
-            .open_ltx_file(info.level, info.min_txid, info.max_txid, 0, 0)
-            .await
-            .map_err(|e| Error::Other(format!("open ltx file: {e}").into()))?;
-        files.push(data);
     }
+
+    let mut stats = RestorePlanStats {
+        objects: infos.len(),
+        bytes: infos.iter().map(|info| info.size.max(0) as u64).sum(),
+        by_level: BTreeMap::new(),
+    };
+    for info in &infos {
+        *stats.by_level.entry(info.level).or_insert(0) += 1;
+    }
+
+    // Files are independent reads. `buffered` overlaps them but yields them in
+    // plan order, which preserves the compactor input contract. The shared
+    // semaphore is the node-level ceiling across every concurrent restore.
+    let files: Vec<Vec<u8>> = stream::iter(infos)
+        .map(|info| {
+            let download_slots = download_slots.clone();
+            async move {
+                let _permit = download_slots
+                    .acquire_owned()
+                    .await
+                    .expect("restore download semaphore closed");
+                client
+                    .open_ltx_file(info.level, info.min_txid, info.max_txid)
+                    .await
+                    .map_err(|e| Error::Other(format!("open ltx file: {e}").into()))
+            }
+        })
+        .buffered(RESTORE_DOWNLOAD_CONCURRENCY)
+        .try_collect()
+        .await?;
 
     if files.is_empty() {
         return Err(Error::Other("no matching backup files available".into()));
@@ -457,7 +503,7 @@ pub async fn restore<C: ReplicaClient>(
     let tmp_output_path = append_ext(output_path, "tmp");
     write_file_atomic(&tmp_output_path, output_path, &image)?;
 
-    Ok(())
+    Ok(stats)
 }
 
 /// Returns the ordered list of LTX files needed to restore the database at
@@ -473,7 +519,7 @@ pub async fn calc_restore_plan<C: ReplicaClient>(client: &C, txid: TXID) -> Resu
     let mut infos: Vec<FileInfo> = Vec::new();
 
     // Start with the latest snapshot before the target TXID (replica.go:1430-1452).
-    let snapshot_files = client.ltx_files(SNAPSHOT_LEVEL, TXID(0), false).await?;
+    let snapshot_files = client.ltx_files(SNAPSHOT_LEVEL, TXID(0)).await?;
     let mut snapshot: Option<FileInfo> = None;
     for info in snapshot_files {
         if txid != TXID(0) && info.max_txid > txid {
@@ -498,7 +544,7 @@ pub async fn calc_restore_plan<C: ReplicaClient>(client: &C, txid: TXID) -> Resu
     // Build a cursor per level, highest level first (replica.go:1463-1473).
     let mut cursors: Vec<RestoreLevelCursor> = Vec::with_capacity((max_level + 1) as usize);
     for level in (0..=max_level).rev() {
-        let files = client.ltx_files(level, TXID(0), false).await?;
+        let files = client.ltx_files(level, TXID(0)).await?;
         cursors.push(RestoreLevelCursor::new(files));
     }
 
@@ -699,51 +745,47 @@ fn slice_max_txid(infos: &[FileInfo]) -> TXID {
 ///   * pages numbered beyond the final `Commit` are dropped (truncation).
 ///
 /// `DecodeDatabaseTo` then writes pages `1..=Commit`, zero-filling the lock page
-/// (decoder.go:236-254). Every input is fully decoded + checksum-verified first
-/// (`decode_file`), so a corrupt download is caught here.
+/// (decoder.go:236-254). Every input is fully decoded and checksum-verified, so
+/// a corrupt download is caught here.
 fn build_database_image(files: &[Vec<u8>]) -> Result<Vec<u8>> {
-    // Decode + verify each input, gathering its header and pages.
-    let mut headers: Vec<ltx::Header> = Vec::with_capacity(files.len());
-    let mut page_sets: Vec<Vec<(u32, Vec<u8>)>> = Vec::with_capacity(files.len());
-    for data in files {
-        let decoded = ltx::decode_file(data)?;
-        let pages = ltx::decode_file_pages(data)?;
-        headers.push(decoded.header);
-        page_sets.push(pages);
-    }
+    let mut page_size = None;
+    let mut commit = None;
+    let mut merged: HashMap<u32, Vec<u8>> = HashMap::new();
 
-    // Validate page sizes match across inputs (compactor.go:95-97).
-    let page_size = headers[0].page_size;
-    for h in &headers {
-        if h.page_size != page_size {
-            return Err(Error::Other(
-                format!(
-                    "input files have mismatched page sizes: {} != {}",
-                    page_size, h.page_size
-                )
-                .into(),
-            ));
+    for data in files {
+        let (decoded, pages) = ltx::decode_file_with_pages(data)?;
+        let header = decoded.header;
+        if let Some(expected) = page_size {
+            if header.page_size != expected {
+                return Err(Error::Other(
+                    format!(
+                        "input files have mismatched page sizes: {} != {}",
+                        expected, header.page_size
+                    )
+                    .into(),
+                ));
+            }
+        } else {
+            page_size = Some(header.page_size);
+        }
+        commit = Some(header.commit);
+
+        // Inputs arrive oldest to newest, so moving each page into the map makes
+        // the latest input win without a second staging collection or clone.
+        for (pgno, data) in pages {
+            merged.insert(pgno, data);
         }
     }
 
-    // The final database size is the last input's Commit (compactor.go:108-118).
-    let commit = headers[headers.len() - 1].commit;
+    let (Some(page_size), Some(commit)) = (page_size, commit) else {
+        return Err(Error::Other(
+            "cannot build a database from no LTX files".into(),
+        ));
+    };
+    merged.retain(|pgno, _| *pgno <= commit);
+
     let page_size_usize = page_size as usize;
     let lock = ltx::lock_pgno(page_size);
-
-    // Merge: for each page number, the latest input that carries it wins. Iterate
-    // inputs in order, overwriting — the last write for a pgno is the newest
-    // input's, matching the compactor's newest-first selection (compactor.go:203-224).
-    // Pages beyond the final Commit are skipped (compactor.go:217).
-    let mut merged: HashMap<u32, Vec<u8>> = HashMap::new();
-    for pages in &page_sets {
-        for (pgno, data) in pages {
-            if *pgno > commit {
-                continue; // out of range of the final database size
-            }
-            merged.insert(*pgno, data.clone());
-        }
-    }
 
     // Reconstruct the database image: pages 1..=commit, lock page zero-filled
     // (decoder.go:236-254). A non-lock page missing from the merge means the
@@ -1145,7 +1187,7 @@ mod tests {
         for info in &plan {
             datas.push(
                 client
-                    .open_ltx_file(info.level, info.min_txid, info.max_txid, 0, 0)
+                    .open_ltx_file(info.level, info.min_txid, info.max_txid)
                     .await
                     .unwrap(),
             );
@@ -1187,24 +1229,14 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ReplicaClient for FaultyClient {
-        fn type_name(&self) -> &str {
-            "faulty"
-        }
-        async fn ltx_files(&self, l: i32, s: TXID, m: bool) -> Result<Vec<FileInfo>> {
+        async fn ltx_files(&self, l: i32, s: TXID) -> Result<Vec<FileInfo>> {
             if self.poison_list {
                 return Err(Error::Other("list poisoned".into()));
             }
-            self.inner.ltx_files(l, s, m).await
+            self.inner.ltx_files(l, s).await
         }
-        async fn open_ltx_file(
-            &self,
-            l: i32,
-            mn: TXID,
-            mx: TXID,
-            o: i64,
-            s: i64,
-        ) -> Result<Vec<u8>> {
-            self.inner.open_ltx_file(l, mn, mx, o, s).await
+        async fn open_ltx_file(&self, l: i32, mn: TXID, mx: TXID) -> Result<Vec<u8>> {
+            self.inner.open_ltx_file(l, mn, mx).await
         }
         async fn write_ltx_file(&self, l: i32, mn: TXID, mx: TXID, d: &[u8]) -> Result<FileInfo> {
             if let Some(e) = self.fail_first_write.lock().unwrap().take() {

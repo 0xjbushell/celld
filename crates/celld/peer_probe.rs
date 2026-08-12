@@ -106,7 +106,7 @@ pub fn respond(node: &str, advertise: &str, challenge: &str) -> anyhow::Result<P
 
 pub(crate) async fn probe(
     client: &reqwest::Client,
-    node: &crate::fleet::DiagnosticNode,
+    node: &crate::ownership_store::NodeLeaseWire,
     auth: &crate::peer_auth::PeerAuth,
 ) -> anyhow::Result<()> {
     if node.probe_public_key.is_empty() {
@@ -164,7 +164,7 @@ pub(crate) async fn probe(
 }
 
 fn verify(
-    expected: &crate::fleet::DiagnosticNode,
+    expected: &crate::ownership_store::NodeLeaseWire,
     challenge: &str,
     response: &PeerProbeResponse,
 ) -> anyhow::Result<()> {

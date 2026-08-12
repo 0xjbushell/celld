@@ -1,21 +1,33 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
-//! The engine's single S3 client: the `object_store` crate `celld-ltx`
-//! already links, bound to one bucket (wiki/designs/s3-client-dedup.md).
-//! Replaces aws-sdk-s3. No call site streamed a body, so everything is
-//! in-memory `Bytes`.
+//! The engine's single object-store client: the `object_store` crate
+//! `celld-ltx` already links, bound to one bucket. Replaces aws-sdk-s3.
+//! No call site streamed a body, so everything is in-memory `Bytes`.
+//!
+//! Two conditional-write dialects share the surface. An `s3://` (or
+//! bare) spec speaks the S3 dialect: the CAS token is the etag, sent as
+//! If-Match / If-None-Match with SigV4 credentials. A `gs://` spec
+//! speaks the Cloud Storage XML API dialect: the CAS token is the
+//! object generation, sent as x-goog-if-generation-match with OAuth
+//! credentials. The distinction is the dialect, not the endpoint — GCS
+//! accepts S3-style requests on the same host but does not apply
+//! If-Match to a PUT, so only the generation dialect can fence there.
+//! Callers never see the difference: the token is an opaque `String` a
+//! read answers and a conditional write consumes.
 //!
 //! Error contract, relied on by the self-fence: `put_cas` answers
 //! `Ok(None)` only for a clean 412/409 rejection; every other failure is
 //! ambiguous — the write may have committed — and surfaces as `Err`.
+//! In the same spirit a response that carries no CAS token is an error,
+//! never an empty token a later conditional write would trust.
 
 use anyhow::anyhow;
 use anyhow::Context;
 use bytes::Bytes;
 use futures_util::StreamExt;
-use object_store::aws::AmazonS3;
 use object_store::aws::AmazonS3Builder;
 use object_store::aws::S3ConditionalPut;
+use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::path::Path;
 use object_store::Attribute;
 use object_store::Attributes;
@@ -41,21 +53,105 @@ pub struct StaticCredentials {
     pub session_token: Option<String>,
 }
 
-/// One S3-compatible bucket. Cheap to clone; each `open` builds its own
-/// HTTP transport, so a dedicated instance also isolates its traffic.
+/// Which conditional-write dialect the bucket speaks, and therefore
+/// what the opaque CAS token holds: the etag on S3, the object
+/// generation on GCS. GCS ignores etags on writes, so its tokens must
+/// come from the generation everywhere — reads, heads, and put results.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StorageBackend {
+    S3,
+    Gcs,
+}
+
+impl StorageBackend {
+    fn scheme(self) -> &'static str {
+        match self {
+            StorageBackend::S3 => "s3",
+            StorageBackend::Gcs => "gs",
+        }
+    }
+
+    /// The CAS token a read or applied write answers: etag or generation,
+    /// per dialect. A response without one cannot be fenced against, so a
+    /// missing or empty token is an error — never an empty string a later
+    /// conditional write would send as a real precondition.
+    fn token(self, e_tag: Option<String>, version: Option<String>) -> anyhow::Result<String> {
+        let (token, header) = match self {
+            StorageBackend::S3 => (e_tag, "ETag"),
+            StorageBackend::Gcs => (version, "x-goog-generation"),
+        };
+        match token {
+            Some(token) if !token.is_empty() => Ok(token),
+            _ => Err(anyhow!(
+                "response carries no {header}, so there is no CAS token"
+            )),
+        }
+    }
+
+    /// The precondition a conditional update sends for a held token.
+    fn update(self, token: &str) -> UpdateVersion {
+        match self {
+            StorageBackend::S3 => UpdateVersion {
+                e_tag: Some(token.to_string()),
+                version: None,
+            },
+            StorageBackend::Gcs => UpdateVersion {
+                e_tag: None,
+                version: Some(token.to_string()),
+            },
+        }
+    }
+}
+
+/// One object-store bucket, optionally scoped to a key prefix. Cheap to
+/// clone; each `open` builds its own HTTP transport, so a dedicated
+/// instance also isolates its traffic.
 #[derive(Clone)]
 pub struct Bucket {
-    store: Arc<AmazonS3>,
+    store: Arc<dyn ObjectStore>,
     /// Conditional writes only, built with retries OFF: a retried CAS put
-    /// can land on the first attempt's own etag change and report a clean
+    /// can land on the first attempt's own token change and report a clean
     /// 412 — converting "may have committed" into a false rejection. The
     /// ambiguity must surface as `Err` so the caller reconciles.
-    cas_store: Arc<AmazonS3>,
+    cas_store: Arc<dyn ObjectStore>,
+    backend: StorageBackend,
     /// Bucket name, for messages — the store is already bound to it.
     pub name: String,
+    /// Empty, or a slash-terminated key prefix every operation is scoped
+    /// to. Call sites keep forming unprefixed keys; this type is the one
+    /// place that knows where in the bucket a fleet lives.
+    pub prefix: String,
+}
+
+/// Split a `[s3://|gs://]NAME[/PREFIX]` bucket spec into the backend, the
+/// bucket name and a normalized key prefix: empty, or slash-terminated. A
+/// spec without a scheme stays S3-compatible, and a spec without a PREFIX
+/// keeps every key at the bucket root, so a fleet provisioned before
+/// either existed never moves its objects.
+fn split_spec(spec: &str) -> (StorageBackend, &str, String) {
+    let (backend, spec) = match spec.strip_prefix("gs://") {
+        Some(rest) => (StorageBackend::Gcs, rest),
+        None => (StorageBackend::S3, spec.trim_start_matches("s3://")),
+    };
+    let (name, prefix) = spec.split_once('/').unwrap_or((spec, ""));
+    let parts = prefix.split('/').filter(|part| !part.is_empty());
+    (
+        backend,
+        name,
+        parts.map(|part| format!("{part}/")).collect(),
+    )
 }
 
 impl Bucket {
+    /// `bucket` is `[s3://|gs://]NAME[/PREFIX]`. With a PREFIX every key
+    /// this client reads or writes lives under `PREFIX/`, so several
+    /// fleets can share one bucket without colliding.
+    ///
+    /// A `gs://` bucket authenticates through Google Application Default
+    /// Credentials (or the `GOOGLE_*` service-account environment) and
+    /// takes no S3 endpoint, static credentials, or region — the bucket
+    /// carries its own location.
+    ///
     /// `app` labels this client's traffic in the User-Agent (the aws
     /// AppName format, `app/<name>`), keeping e.g. the lease safety lane
     /// observable in black-box storage traces.
@@ -66,6 +162,36 @@ impl Bucket {
         credentials: Option<StaticCredentials>,
         app: Option<&str>,
     ) -> anyhow::Result<Bucket> {
+        Self::open_with_gcs_builder(
+            bucket,
+            endpoint,
+            region,
+            credentials,
+            app,
+            GoogleCloudStorageBuilder::from_env(),
+        )
+    }
+
+    /// The body of [`Self::open`], taking the base GCS builder instead of
+    /// deriving it from the `GOOGLE_*` environment. A caller that passes
+    /// an explicit builder is independent of that environment.
+    fn open_with_gcs_builder(
+        bucket: &str,
+        endpoint: Option<&str>,
+        region: &str,
+        credentials: Option<StaticCredentials>,
+        app: Option<&str>,
+        gcs_builder: GoogleCloudStorageBuilder,
+    ) -> anyhow::Result<Bucket> {
+        let (backend, bucket, prefix) = split_spec(bucket);
+        // The prefix is spliced into keys as plain text and stripped off
+        // listed keys the same way. A character `object_store` would
+        // percent-encode would make the two disagree, so refuse it here
+        // rather than mis-parse every listing later.
+        let illegal = |c: char| !c.is_ascii_alphanumeric() && !"-_./".contains(c);
+        if prefix.contains(illegal) {
+            anyhow::bail!("bucket prefix accepts only letters, digits and -_./: {prefix:?}");
+        }
         // These bounds mirror the aws-sdk TimeoutConfig they replace
         // (connect 3 s / attempt 15 s / operation 30 s) — a correctness
         // condition for the node self-fence, not tuning. The read-timeout
@@ -80,90 +206,174 @@ impl Bucket {
                     .context("app user agent")?,
             );
         }
-        let mut builder = AmazonS3Builder::from_env()
-            .with_bucket_name(bucket)
-            .with_region(region)
-            .with_conditional_put(S3ConditionalPut::ETagMatch)
-            .with_retry(RetryConfig {
-                max_retries: 2,
-                retry_timeout: Duration::from_secs(30),
-                ..RetryConfig::default()
-            })
-            .with_client_options(options);
-        if let Some(endpoint) = endpoint {
-            // Path-style against explicit S3-compatible endpoints, exactly
-            // as the aws client's force_path_style(endpoint.is_some()).
-            builder = builder
-                .with_endpoint(endpoint)
-                .with_virtual_hosted_style_request(false);
-        } else {
-            builder = builder.with_virtual_hosted_style_request(true);
-        }
-        if let Some(credentials) = credentials {
-            builder = builder
-                .with_access_key_id(credentials.access_key_id)
-                .with_secret_access_key(credentials.secret_access_key);
-            if let Some(token) = credentials.session_token {
-                builder = builder.with_token(token);
-            }
-        }
-        let cas_builder = builder.clone().with_retry(RetryConfig {
+        let retry = RetryConfig {
+            max_retries: 2,
+            retry_timeout: Duration::from_secs(30),
+            ..RetryConfig::default()
+        };
+        let cas_retry = RetryConfig {
             max_retries: 0,
             retry_timeout: Duration::from_secs(30),
             ..RetryConfig::default()
-        });
+        };
+        let (store, cas_store): (Arc<dyn ObjectStore>, Arc<dyn ObjectStore>) = match backend {
+            StorageBackend::S3 => {
+                let mut builder = AmazonS3Builder::from_env()
+                    .with_bucket_name(bucket)
+                    .with_region(region)
+                    .with_conditional_put(S3ConditionalPut::ETagMatch)
+                    .with_retry(retry)
+                    .with_client_options(options);
+                if let Some(endpoint) = endpoint {
+                    // Path-style against explicit S3-compatible endpoints, exactly
+                    // as the aws client's force_path_style(endpoint.is_some()).
+                    builder = builder
+                        .with_endpoint(endpoint)
+                        .with_virtual_hosted_style_request(false);
+                } else {
+                    builder = builder.with_virtual_hosted_style_request(true);
+                }
+                if let Some(credentials) = credentials {
+                    builder = builder
+                        .with_access_key_id(credentials.access_key_id)
+                        .with_secret_access_key(credentials.secret_access_key);
+                    if let Some(token) = credentials.session_token {
+                        builder = builder.with_token(token);
+                    }
+                }
+                let cas_builder = builder.clone().with_retry(cas_retry);
+                (
+                    Arc::new(builder.build().context("build s3 client")?),
+                    Arc::new(cas_builder.build().context("build s3 cas client")?),
+                )
+            }
+            StorageBackend::Gcs => {
+                // The generation dialect only. celld's S3 client fences
+                // with If-Match, which GCS does not apply to a PUT; and
+                // this GCS client authenticates with OAuth, not HMAC keys.
+                // So an S3 endpoint or S3 static credentials with gs:// is
+                // a configuration error, not something to quietly
+                // reinterpret.
+                if endpoint.is_some() {
+                    anyhow::bail!(
+                        "a gs:// bucket takes no S3 endpoint; unset --endpoint / S3_ENDPOINT"
+                    );
+                }
+                if credentials.is_some() {
+                    anyhow::bail!(
+                        "a gs:// bucket cannot use S3 static credentials; it authenticates \
+                         with Google Application Default Credentials"
+                    );
+                }
+                let builder = gcs_builder
+                    .with_bucket_name(bucket)
+                    .with_retry(retry)
+                    .with_client_options(options);
+                let cas_builder = builder.clone().with_retry(cas_retry);
+                (
+                    Arc::new(builder.build().context("build gcs client")?),
+                    Arc::new(cas_builder.build().context("build gcs cas client")?),
+                )
+            }
+        };
         Ok(Bucket {
-            store: Arc::new(builder.build().context("build s3 client")?),
-            cas_store: Arc::new(cas_builder.build().context("build s3 cas client")?),
+            store,
+            cas_store,
+            backend,
             name: bucket.to_string(),
+            prefix,
         })
     }
 
-    /// Body and etag, or `None` when the key does not exist.
+    /// The bucket's URL scheme, `s3` or `gs`, for operator-facing
+    /// messages.
+    pub fn scheme(&self) -> &'static str {
+        self.backend.scheme()
+    }
+
+    /// The dialect this bucket speaks, for choosing the matching
+    /// replication store.
+    pub(crate) fn backend(&self) -> StorageBackend {
+        self.backend
+    }
+
+    /// Scope a caller's key to this client's prefix.
+    fn key(&self, key: &str) -> String {
+        format!("{}{key}", self.prefix)
+    }
+
+    /// The inverse of [`Self::key`]: a listing answers with full keys, and
+    /// every caller parses back the key it asked for, not the prefix.
+    fn unkey<'a>(&self, key: &'a str) -> &'a str {
+        key.strip_prefix(self.prefix.as_str()).unwrap_or(key)
+    }
+
+    /// Body and CAS token, or `None` when the key does not exist.
     pub async fn get(&self, key: &str) -> anyhow::Result<Option<(Bytes, String)>> {
-        match self.store.get(&Path::from(key)).await {
+        let key = self.key(key);
+        match self.store.get(&Path::from(key.as_str())).await {
             Ok(result) => {
-                let etag = result.meta.e_tag.clone().unwrap_or_default();
-                let bytes = result
-                    .bytes()
-                    .await
-                    .with_context(|| format!("read body s3://{}/{key}", self.name))?;
-                Ok(Some((bytes, etag)))
+                let token = self
+                    .backend
+                    .token(result.meta.e_tag.clone(), result.meta.version.clone())
+                    .with_context(|| format!("read {}://{}/{key}", self.scheme(), self.name))?;
+                let bytes = result.bytes().await.with_context(|| {
+                    format!("read body {}://{}/{key}", self.scheme(), self.name)
+                })?;
+                Ok(Some((bytes, token)))
             }
             Err(Error::NotFound { .. }) => Ok(None),
-            Err(error) => Err(anyhow!(error).context(format!("read s3://{}/{key}", self.name))),
+            Err(error) => {
+                Err(anyhow!(error).context(format!("read {}://{}/{key}", self.scheme(), self.name)))
+            }
         }
     }
 
-    /// Size and etag, or `None` when the key does not exist.
+    /// Size and CAS token, or `None` when the key does not exist.
     pub async fn head(&self, key: &str) -> anyhow::Result<Option<(u64, String)>> {
-        match self.store.head(&Path::from(key)).await {
-            Ok(meta) => Ok(Some((meta.size as u64, meta.e_tag.unwrap_or_default()))),
+        let key = self.key(key);
+        match self.store.head(&Path::from(key.as_str())).await {
+            Ok(meta) => {
+                let token = self
+                    .backend
+                    .token(meta.e_tag, meta.version)
+                    .with_context(|| format!("head {}://{}/{key}", self.scheme(), self.name))?;
+                Ok(Some((meta.size as u64, token)))
+            }
             Err(Error::NotFound { .. }) => Ok(None),
-            Err(error) => Err(anyhow!(error).context(format!("head s3://{}/{key}", self.name))),
+            Err(error) => {
+                Err(anyhow!(error).context(format!("head {}://{}/{key}", self.scheme(), self.name)))
+            }
         }
     }
 
     pub async fn put(&self, key: &str, body: impl Into<PutPayload>) -> anyhow::Result<()> {
+        let key = self.key(key);
         self.store
-            .put(&Path::from(key), body.into())
+            .put(&Path::from(key.as_str()), body.into())
             .await
-            .with_context(|| format!("write s3://{}/{key}", self.name))?;
+            .with_context(|| format!("write {}://{}/{key}", self.scheme(), self.name))?;
         Ok(())
     }
 
-    /// Size plus one `x-amz-meta-*` value, or `None` when the key does not
-    /// exist. A plain `head` cannot see user metadata; this one can.
+    /// Size plus one user-metadata value (`x-amz-meta-*` / `x-goog-meta-*`),
+    /// or `None` when the key does not exist. A plain `head` cannot see
+    /// user metadata; this one can.
     pub async fn head_with_meta(
         &self,
         key: &str,
         name: &str,
     ) -> anyhow::Result<Option<(u64, Option<String>)>> {
+        let key = self.key(key);
         let options = GetOptions {
             head: true,
             ..GetOptions::default()
         };
-        match self.store.get_opts(&Path::from(key), options).await {
+        match self
+            .store
+            .get_opts(&Path::from(key.as_str()), options)
+            .await
+        {
             Ok(result) => {
                 let value = result
                     .attributes
@@ -172,17 +382,20 @@ impl Bucket {
                 Ok(Some((result.meta.size as u64, value)))
             }
             Err(Error::NotFound { .. }) => Ok(None),
-            Err(error) => Err(anyhow!(error).context(format!("head s3://{}/{key}", self.name))),
+            Err(error) => {
+                Err(anyhow!(error).context(format!("head {}://{}/{key}", self.scheme(), self.name)))
+            }
         }
     }
 
-    /// Plain write carrying `x-amz-meta-*` user metadata.
+    /// Plain write carrying user metadata (`x-amz-meta-*` / `x-goog-meta-*`).
     pub async fn put_with_meta(
         &self,
         key: &str,
         body: impl Into<PutPayload>,
         meta: &[(&'static str, &str)],
     ) -> anyhow::Result<()> {
+        let key = self.key(key);
         let mut attributes = Attributes::new();
         for (name, value) in meta {
             attributes.insert(
@@ -195,38 +408,57 @@ impl Bucket {
             ..PutOptions::default()
         };
         self.store
-            .put_opts(&Path::from(key), body.into(), options)
+            .put_opts(&Path::from(key.as_str()), body.into(), options)
             .await
-            .with_context(|| format!("write s3://{}/{key}", self.name))?;
+            .with_context(|| format!("write {}://{}/{key}", self.scheme(), self.name))?;
         Ok(())
     }
 
-    /// Conditional write. `etag: None` requires the key to be absent
-    /// (If-None-Match: *); `Some` requires the current etag (If-Match).
-    /// `Ok(Some(new_etag))` applied, `Ok(None)` cleanly rejected; any other
-    /// failure is ambiguous and stays an error.
+    /// Conditional write. `token: None` requires the key to be absent;
+    /// `Some` requires the current CAS token — the etag on S3 (If-Match),
+    /// the generation on GCS (x-goog-if-generation-match).
+    /// `Ok(Some(new_token))` applied, `Ok(None)` cleanly rejected; any
+    /// other failure is ambiguous and stays an error.
     pub async fn put_cas(
         &self,
         key: &str,
         body: impl Into<PutPayload>,
-        etag: Option<&str>,
+        token: Option<&str>,
     ) -> anyhow::Result<Option<String>> {
-        let mode = match etag {
+        let key = self.key(key);
+        let mode = match token {
             None => PutMode::Create,
-            Some(etag) => PutMode::Update(UpdateVersion {
-                e_tag: Some(etag.to_string()),
-                version: None,
-            }),
+            Some(token) => PutMode::Update(self.backend.update(token)),
         };
         match self
             .cas_store
-            .put_opts(&Path::from(key), body.into(), PutOptions::from(mode))
+            .put_opts(
+                &Path::from(key.as_str()),
+                body.into(),
+                PutOptions::from(mode),
+            )
             .await
         {
-            Ok(result) => Ok(Some(result.e_tag.unwrap_or_default())),
+            Ok(result) => {
+                // The write applied; a result without a usable token still
+                // surfaces as `Err`, which callers already treat as "may
+                // have committed" and reconcile.
+                let token = self
+                    .backend
+                    .token(result.e_tag, result.version)
+                    .with_context(|| {
+                        format!(
+                            "conditional write {}://{}/{key} applied without a CAS token",
+                            self.scheme(),
+                            self.name
+                        )
+                    })?;
+                Ok(Some(token))
+            }
             Err(Error::Precondition { .. } | Error::AlreadyExists { .. }) => Ok(None),
             Err(error) => Err(anyhow!(error).context(format!(
-                "conditional write s3://{}/{key} may have committed",
+                "conditional write {}://{}/{key} may have committed",
+                self.scheme(),
                 self.name
             ))),
         }
@@ -234,59 +466,103 @@ impl Bucket {
 
     /// Idempotent: deleting an absent key succeeds, as S3's DELETE does.
     pub async fn delete(&self, key: &str) -> anyhow::Result<()> {
-        match self.store.delete(&Path::from(key)).await {
+        let key = self.key(key);
+        match self.store.delete(&Path::from(key.as_str())).await {
             Ok(()) | Err(Error::NotFound { .. }) => Ok(()),
-            Err(error) => Err(anyhow!(error).context(format!("delete s3://{}/{key}", self.name))),
+            Err(error) => Err(anyhow!(error).context(format!(
+                "delete {}://{}/{key}",
+                self.scheme(),
+                self.name
+            ))),
         }
     }
 
     /// Every object under `prefix/`; the client paginates internally.
+    /// Listed keys come back the way the caller wrote them, because the
+    /// caller parses them and knows nothing of the fleet's prefix.
     pub async fn list(&self, prefix: &str) -> anyhow::Result<Vec<ObjectMeta>> {
-        let path = Path::from(prefix.trim_end_matches('/'));
+        let path = Path::from(self.key(prefix.trim_end_matches('/')));
         let mut stream = self.store.list(Some(&path));
         let mut objects = Vec::new();
         while let Some(meta) = stream.next().await {
-            objects.push(meta.with_context(|| format!("list s3://{}/{prefix}", self.name))?);
+            let mut meta =
+                meta.with_context(|| format!("list {}://{}/{path}", self.scheme(), self.name))?;
+            if !self.prefix.is_empty() {
+                // The listing gave object_store a valid key, so re-parsing
+                // the tail of it cannot fail.
+                meta.location = Path::parse(self.unkey(meta.location.as_ref())).unwrap();
+            }
+            objects.push(meta);
         }
         Ok(objects)
     }
 
     /// Does anything exist under `prefix/`? One page at most.
     pub async fn list_any(&self, prefix: &str) -> anyhow::Result<bool> {
-        let path = Path::from(prefix.trim_end_matches('/'));
+        let path = Path::from(self.key(prefix.trim_end_matches('/')));
         match self.store.list(Some(&path)).next().await {
             None => Ok(false),
             Some(Ok(_)) => Ok(true),
-            Some(Err(error)) => {
-                Err(anyhow!(error).context(format!("list s3://{}/{prefix}", self.name)))
-            }
+            Some(Err(error)) => Err(anyhow!(error).context(format!(
+                "list {}://{}/{path}",
+                self.scheme(),
+                self.name
+            ))),
         }
     }
 
     /// Immediate child "directories" under `prefix/` (delimiter listing),
     /// as full prefixes with the trailing slash stripped.
     pub async fn common_prefixes(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
-        let path = Path::from(prefix.trim_end_matches('/'));
+        let path = Path::from(self.key(prefix.trim_end_matches('/')));
         let result = self
             .store
             .list_with_delimiter(Some(&path))
             .await
-            .with_context(|| format!("list s3://{}/{prefix}", self.name))?;
+            .with_context(|| format!("list {}://{}/{path}", self.scheme(), self.name))?;
         Ok(result
             .common_prefixes
             .into_iter()
-            .map(|p| p.as_ref().to_string())
+            .map(|p| self.unkey(p.as_ref()).to_string())
             .collect())
     }
 
     /// The head_bucket replacement: prove the bucket is reachable and the
-    /// credential is accepted with one list page.
+    /// credential is accepted with one list page. Scoped to the prefix, so
+    /// a credential scoped to it validates too.
     pub async fn validate(&self) -> anyhow::Result<()> {
-        match self.store.list(None).next().await {
+        let scope = (!self.prefix.is_empty()).then(|| Path::from(self.prefix.as_str()));
+        match self.store.list(scope.as_ref()).next().await {
             None | Some(Ok(_)) => Ok(()),
-            Some(Err(error)) => Err(anyhow!(error).context(format!("validate s3://{}", self.name))),
+            Some(Err(error)) => {
+                Err(anyhow!(error).context(format!("validate {}://{}", self.scheme(), self.name)))
+            }
         }
     }
+}
+
+/// The replica-lane store for a `gs://` fleet bucket: its own transport
+/// and connection pool, authenticated like [`Bucket::open`]'s gs:// path
+/// (OAuth via Application Default Credentials or the `GOOGLE_*` env),
+/// with the same default retry policy the S3 replica lane gets from its
+/// litestream-ported config in `ltx_repl`. Replica writes are plain puts,
+/// so retries stay on.
+pub(crate) fn gcs_replica_store(bucket: &str) -> anyhow::Result<Arc<dyn ObjectStore>> {
+    gcs_replica_store_with_builder(GoogleCloudStorageBuilder::from_env(), bucket)
+}
+
+/// The body of [`gcs_replica_store`], taking the base builder for the same
+/// reason [`Bucket::open_with_gcs_builder`] does.
+fn gcs_replica_store_with_builder(
+    builder: GoogleCloudStorageBuilder,
+    bucket: &str,
+) -> anyhow::Result<Arc<dyn ObjectStore>> {
+    Ok(Arc::new(
+        builder
+            .with_bucket_name(bucket)
+            .build()
+            .context("build gcs replica store")?,
+    ))
 }
 
 /// Was this a 401/403 — the credential itself rejected? Used by the managed
@@ -310,11 +586,14 @@ pub fn is_unauthorized(error: &anyhow::Error) -> bool {
 mod live_cas {
     use super::{Bucket, StaticCredentials};
 
-    // Live CAS contract against a real S3-compatible bucket (R2). Gated on
+    // Live CAS contract against a real bucket (R2 or GCS). Gated on
     // CELLD_CAS_LIVE=1 so it never runs in CI; a mock cannot answer whether
-    // object_store maps R2's precondition failures to Ok(None) (the fencing
-    // contract) rather than Err. Run:
+    // object_store maps the provider's precondition failures to Ok(None)
+    // (the fencing contract) rather than Err. Run:
     //   CELLD_CAS_LIVE=1 CELLD_CAS_BUCKET=<b> CELLD_CAS_ENDPOINT=<ep> AWS_*=... \
+    //     cargo test -p celld put_cas_contract -- --nocapture
+    // or against GCS (Application Default Credentials, no endpoint):
+    //   CELLD_CAS_LIVE=1 CELLD_CAS_BUCKET=gs://<b> \
     //     cargo test -p celld put_cas_contract -- --nocapture
     #[tokio::test]
     async fn put_cas_contract_against_real_bucket() {
@@ -324,19 +603,16 @@ mod live_cas {
         let name = std::env::var("CELLD_CAS_BUCKET").expect("CELLD_CAS_BUCKET");
         let endpoint = std::env::var("CELLD_CAS_ENDPOINT").ok();
         let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "auto".into());
-        let creds = StaticCredentials {
-            access_key_id: std::env::var("AWS_ACCESS_KEY_ID").unwrap(),
-            secret_access_key: std::env::var("AWS_SECRET_ACCESS_KEY").unwrap(),
-            session_token: std::env::var("AWS_SESSION_TOKEN").ok(),
-        };
-        let bucket = Bucket::open(
-            &name,
-            endpoint.as_deref(),
-            &region,
-            Some(creds),
-            Some("cas-test"),
-        )
-        .expect("open bucket");
+        let creds = std::env::var("AWS_ACCESS_KEY_ID")
+            .ok()
+            .map(|access_key_id| StaticCredentials {
+                access_key_id,
+                secret_access_key: std::env::var("AWS_SECRET_ACCESS_KEY")
+                    .expect("AWS_SECRET_ACCESS_KEY"),
+                session_token: std::env::var("AWS_SESSION_TOKEN").ok(),
+            });
+        let bucket = Bucket::open(&name, endpoint.as_deref(), &region, creds, Some("cas-test"))
+            .expect("open bucket");
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -376,4 +652,9 @@ mod live_cas {
         bucket.delete(&key).await.expect("cleanup delete");
         eprintln!("CAS verified on {name}: create / reject-create / update / reject-stale");
     }
+}
+
+#[cfg(all(test, celld_internal_tests))]
+mod conformance_bucket_tests {
+    include!(env!("CELLD_CONFORMANCE_BUCKET_TESTS"));
 }

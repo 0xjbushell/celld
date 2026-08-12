@@ -11,6 +11,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 pub mod alarm;
 pub mod cache;
 pub mod dead_node_reconciliation;
+pub mod gate;
+pub mod isolate;
 pub mod peer;
 pub mod pressure;
 pub mod restore;
@@ -19,699 +21,8 @@ pub mod schedule;
 pub mod sqlite;
 pub mod wake;
 
-pub type Ms = i64;
-
-pub type CellId = String;
-pub type NodeId = String;
-pub type RequestId = u64;
-pub type WebSocketId = u64;
-pub type OpId = u64;
-pub type Epoch = u64;
-
-/// One runtime that this node can currently serve locally.
-///
-/// Presence is a read-only projection of the decision core, not a second
-/// inventory maintained by an adapter. Keeping the epoch beside the cell ID
-/// lets management and inspection traffic identify the exact fenced runtime.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PresenceCell {
-    pub id: CellId,
-    pub epoch: Epoch,
-}
-
-/// Cumulative lifecycle decisions exposed to management from the same state
-/// machine that made them. These are advisory counters, but they are not a
-/// second shell-owned model and replay to the same values for the same events.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ActivitySnapshot {
-    pub acquired: u64,
-    pub proxied: u64,
-    pub expired_owner_leases: u64,
-    pub restored: u64,
-    pub advanced_epochs: u64,
-}
-
-/// Management-facing lifecycle state derived atomically from [`State`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PresenceSnapshot {
-    pub serving: bool,
-    pub cells: Vec<PresenceCell>,
-    pub activity: ActivitySnapshot,
-    pub lazy_lease_shadow: LeaseLifecycleShadowBatch,
-}
-
-impl PresenceSnapshot {
-    pub fn owned_cells(&self) -> usize {
-        self.cells.len()
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Config {
-    /// Resident cells plus activation reservations may never exceed this.
-    pub max_resident: usize,
-    /// Complete nonresident routes which may be in flight at once.
-    ///
-    /// This is deliberately independent of the stateless Worker pool. A warm
-    /// request consumes no activation slot, while a cold request holds one
-    /// across ownership resolution, capacity waiting, restore, and publish.
-    pub max_activations: usize,
-    /// Evictions that may hold a durability proof in flight at once.
-    ///
-    /// A proof is a round trip to the bucket, so draining a node one cell at a
-    /// time takes the number of cells times that latency -- a node shedding
-    /// five hundred cells against a two hundred millisecond proof refuses
-    /// admission for a minute and a half while it walks down. Bounded
-    /// concurrency is what makes the walk down finish in a time anyone can
-    /// reason about.
-    pub max_hibernations: usize,
-    /// Concurrent outbound WebSockets one cell may hold.
-    ///
-    /// Distinct from the node-wide pin budget, which counts *cells* held
-    /// resident: one socket is enough to pin a cell, so that budget says
-    /// nothing about how many a single cell may open. This bounds what one
-    /// application can consume on its own behalf.
-    pub max_outbound_websockets: usize,
-    /// What an evicted cell's ownership record should say.
-    ///
-    /// Releasing it lets any node take the cell next, which is what makes a
-    /// loaded node shed load rather than merely stop hosting it: keeping the
-    /// record means every later request for that cell still routes here, to a
-    /// node that already decided it has no room. Keeping it is right when the
-    /// local hibernation snapshot is the point, because a same-node wake is a
-    /// rename instead of a restore.
-    pub ownership_on_evict: OwnershipOnEvict,
-    /// Production executors require a live self-node lease before serving.
-    /// Deterministic unit slices which do not exercise node authority can
-    /// disable this explicitly.
-    pub require_node_lease: bool,
-    /// Exact cross-node request protocol this process can authenticate and
-    /// understand. A live owner speaking another version is unavailable, not
-    /// stale: incompatibility never authorizes takeover.
-    pub peer_protocol: u16,
-    /// How long an activation effect may remain outstanding before the core
-    /// stops waiting for it.
-    ///
-    /// Without this a swallowed effect is invisible: no event ever arrives, no
-    /// timer is watching, and the request waits forever while every piece of
-    /// state remains perfectly consistent. celld shipped that and parked
-    /// requests past ninety seconds. `None` restores the old behaviour, which
-    /// only a test that wants to observe an indefinite wait should ask for.
-    pub operation_deadline_ms: Option<u64>,
-    /// How close an armed alarm may be before the cell stops being worth
-    /// hibernating. Inside this window the wake would cost more than the
-    /// residency it saves, so the cell is held.
-    pub alarm_resident_ms: u64,
-    /// How long a cell may sit unused before the node gives it back, with no
-    /// pressure involved. `None` keeps every cell resident until something
-    /// needs the room.
-    pub idle_evict_ms: Option<u64>,
-    /// Ceilings and low watermarks for load shedding.
-    ///
-    /// `max_resident` is a hard cap on reservations; this is the softer,
-    /// resource-aware question of whether the node is overloaded at all.
-    /// Without it a node has only a cell count to reason about, so it meets
-    /// memory or CPU exhaustion by running into it rather than shedding.
-    pub pressure: pressure::PressureConfig,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OwnerRecord {
-    /// `None` is a deliberately released, fenced record. Epochs never reset.
-    pub node: Option<NodeId>,
-    pub epoch: Epoch,
-    pub etag: String,
-}
-
-/// The routing and authority fields read from `nodes/<node>.json`.
-///
-/// The executor samples wall time and returns the verbatim record. The core,
-/// not the storage adapter, decides whether it is live and routable.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NodeLeaseRecord {
-    pub node: NodeId,
-    pub addr: String,
-    pub expires_ms: u64,
-    pub peer_protocol: u16,
-    /// Per-process generation; production stores this in
-    /// `ownership_index_generation`.
-    pub generation: String,
-    /// Object version observed by the read. Empty only in synthetic events.
-    pub etag: String,
-}
-
-/// One advisory fleet-capacity observation returned by the storage shell.
-///
-/// Membership and expiry remain authoritative node-lease facts. Load is only
-/// used to choose where an unowned cell should try to land; the chosen peer
-/// must still atomically admit the handoff before it acquires ownership.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CapacityPeer {
-    pub node: NodeId,
-    pub addr: String,
-    pub expires_ms: u64,
-    pub peer_protocol: u16,
-    pub sampled_ms: u64,
-    pub resident_cells: usize,
-    pub host_websockets: usize,
-    pub rss_bytes: u64,
-    pub pressured: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NodeLeaseSpec {
-    pub addr: String,
-    pub peer_protocol: u16,
-    pub generation: String,
-    pub ttl_ms: u64,
-    pub mode: NodeLeaseMode,
-    pub linger_ms: u64,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum NodeLeaseMode {
-    #[default]
-    Continuous,
-    Shadow,
-    Lazy,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NodeLeaseAuthorityAction {
-    Hold,
-    Renew,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LeaseLifecycleShadowSnapshot {
-    pub mode: NodeLeaseMode,
-    pub active_cells: usize,
-    pub serving_cells: usize,
-    pub idle_ms: u64,
-    pub linger_ms: u64,
-    pub lease_active: bool,
-    pub elapsed_since_ok_ms: u64,
-    pub elapsed_since_renew_ms: u64,
-    pub ttl_ms: u64,
-    pub shadow_release_reported: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LeaseLifecycleShadowExpected {
-    pub shadow_release: bool,
-    pub authority_action: NodeLeaseAuthorityAction,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LeaseLifecycleShadowDecision {
-    pub sequence: u64,
-    pub observed_at_ms: u64,
-    pub snapshot: LeaseLifecycleShadowSnapshot,
-    pub expected: LeaseLifecycleShadowExpected,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct LeaseLifecycleShadowBatch {
-    pub dropped: u64,
-    pub decisions: Vec<LeaseLifecycleShadowDecision>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CasGuard {
-    Absent,
-    Match(String),
-}
-
-/// See [`Config::ownership_on_evict`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum OwnershipOnEvict {
-    /// Publish the cell as unowned so any node may take it next.
-    #[default]
-    Release,
-    /// Keep the record, so a same-node wake can reuse the local snapshot.
-    Sticky,
-}
-
-/// Why the node is halting. The shell writes this down: a process that
-/// self-fences and exits without saying why leaves an operator with an exit
-/// code and nothing else.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HaltReason {
-    /// The node lease was not renewed inside its TTL, so this node can no
-    /// longer prove it owns anything it is serving.
-    NodeLeaseExpired,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CasOutcome {
-    Applied,
-    Rejected,
-}
-
-/// Observable result of a successful restore effect. A non-fresh activation
-/// may still discover that no local or replicated database exists; the
-/// adapter reports what happened instead of making the core infer I/O truth.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RestoreOutcome {
-    pub restored: bool,
-    /// The alarm the restored database already had armed.
-    ///
-    /// A cell carries its alarm in its own SQLite, so a cell that arrives
-    /// here from another node — or wakes cold — has one the isolate has not
-    /// re-armed yet. Nothing else tells this node about it: the observer
-    /// fires when a *running* isolate calls `setAlarm`, which is exactly the
-    /// case this is not. Without it the mirror reads "no alarm" and every
-    /// residency decision that consults it is wrong in the direction of
-    /// shedding a cell that is about to fire.
-    pub alarm: Option<RestoredAlarm>,
-}
-
-/// See [`RestoreOutcome::alarm`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RestoredAlarm {
-    pub at_ms: i64,
-    /// Whether a durable wake entry already covers it. Read from the same
-    /// flusher the observer consults, not assumed: claiming coverage this
-    /// node cannot prove is how an alarm gets hibernated away.
-    pub covered: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum LeaseCasOutcome {
-    Applied { etag: String },
-    Rejected,
-}
-
-/// Deterministic timers are versioned effects, not implicit clock reads. A
-/// stale firing from a replaced lease generation is harmless.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Timer {
-    NodeLeaseRenew {
-        generation: u64,
-    },
-    NodeLeaseFence {
-        generation: u64,
-    },
-    CellAlarm {
-        cell: CellId,
-        generation: u64,
-    },
-    /// Fires if `op` is still outstanding. Identified by operation rather than
-    /// by cell, so a completion that lands first simply leaves a stale timer
-    /// that finds nothing to expire.
-    OperationDeadline {
-        op: OpId,
-    },
-}
-
-/// Whether a failed operation definitely did not commit or may have committed
-/// before its caller lost the response.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Failure {
-    Definite,
-    Ambiguous,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WebSocketKind {
-    Hibernatable,
-    Regular,
-    /// A transport the cell opened itself with `new WebSocket(url)`. It pins
-    /// its cell exactly as a regular one does -- a live transport cannot move
-    /// with ownership -- but unlike an inbound client socket it is created by
-    /// application code at a rate the application chooses, so how much of the
-    /// node it may hold is budgeted.
-    Outbound,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Event {
-    StartNodeLease {
-        now_ms: u64,
-        spec: NodeLeaseSpec,
-    },
-    SelfNodeLeaseRead {
-        op: OpId,
-        now_ms: u64,
-        now_mono_ms: u64,
-        result: Result<Option<NodeLeaseRecord>, Failure>,
-    },
-    NodeLeaseCasCompleted {
-        op: OpId,
-        now_mono_ms: u64,
-        result: Result<LeaseCasOutcome, Failure>,
-    },
-    TimerFired {
-        timer: Timer,
-        now_ms: u64,
-        now_mono_ms: u64,
-    },
-    Request {
-        request: RequestId,
-        cell: CellId,
-    },
-    /// Production form of [`Event::Request`] with the sampled clocks needed
-    /// to acquire an idle lazy node lease. Untimed model slices retain the
-    /// compact variant above and use the state's last observed clocks.
-    RequestAt {
-        request: RequestId,
-        cell: CellId,
-        now_ms: u64,
-        now_mono_ms: u64,
-    },
-    /// A peer selected this node as a possible landing place for an unowned
-    /// cell. Unlike ordinary ingress, this request must refuse immediately if
-    /// its advertised capacity has gone stale; waiting here would strand the
-    /// forwarding node instead of letting it traverse another candidate.
-    CapacityRequestAt {
-        request: RequestId,
-        cell: CellId,
-        now_ms: u64,
-        now_mono_ms: u64,
-    },
-    /// Reserve an idle resident isolate for a top-level Worker request. The
-    /// shell falls back to the stateless pool when no resident is available;
-    /// choosing and pinning a resident is lifecycle policy and therefore
-    /// belongs in the replayable core.
-    WorkerRequest {
-        request: RequestId,
-    },
-    Cancel {
-        request: RequestId,
-    },
-    ActivityFinished {
-        request: RequestId,
-    },
-    /// A request that ran locally advanced its cell's committed WAL to
-    /// `position`. Its response is withheld — the output gate — until that
-    /// position is replicated, so celld never acknowledges a write it could
-    /// still lose. Read-only requests emit [`Event::ActivityFinished`] instead
-    /// and pay no durability latency. The epoch is not carried: the core reads
-    /// it from the pinned cell's resident phase, which cannot change while the
-    /// request holds it.
-    Wrote {
-        request: RequestId,
-        position: u64,
-    },
-    /// The shell finished proving a gated write durable. `Ok(position)` reports
-    /// the committed-write position the replica has *actually* proved durable;
-    /// the core acknowledges only when it covers the gated write's position, so
-    /// a replicator that proves less than it was asked to cannot force an early
-    /// ack. `Err` failed the proof outright.
-    DurableReached {
-        op: OpId,
-        result: Result<u64, Failure>,
-    },
-    WebSocketOpened {
-        cell: CellId,
-        websocket: WebSocketId,
-        kind: WebSocketKind,
-    },
-    WebSocketClosed {
-        cell: CellId,
-        websocket: WebSocketId,
-    },
-    AlarmObserved {
-        cell: CellId,
-        at_ms: Option<i64>,
-        covered: bool,
-        now_ms: u64,
-        now_mono_ms: u64,
-    },
-    AlarmFinished {
-        op: OpId,
-        now_ms: u64,
-        now_mono_ms: u64,
-        result: Result<(Option<i64>, bool), Failure>,
-    },
-    WakeHint {
-        cell: CellId,
-    },
-    WakeHintAt {
-        cell: CellId,
-        now_ms: u64,
-        now_mono_ms: u64,
-    },
-    OwnerRead {
-        op: OpId,
-        /// Wall-clock observation made when the ownership read completed. It
-        /// bounds reuse of a shared owner-node lease without letting the core
-        /// read a clock itself.
-        now_ms: u64,
-        result: Result<Option<OwnerRecord>, Failure>,
-    },
-    NodeLeaseRead {
-        op: OpId,
-        now_ms: u64,
-        result: Result<Option<NodeLeaseRecord>, Failure>,
-    },
-    CapacityPeersRead {
-        op: OpId,
-        now_ms: u64,
-        result: Result<Vec<CapacityPeer>, Failure>,
-    },
-    OwnerCasCompleted {
-        op: OpId,
-        result: Result<CasOutcome, Failure>,
-    },
-    OwnerReleased {
-        op: OpId,
-        result: Result<CasOutcome, Failure>,
-    },
-    RestoreCompleted {
-        op: OpId,
-        result: Result<RestoreOutcome, Failure>,
-    },
-    RuntimeStarted {
-        op: OpId,
-        result: Result<(), Failure>,
-    },
-    Published {
-        op: OpId,
-        result: Result<(), Failure>,
-    },
-    DurabilityChecked {
-        op: OpId,
-        result: Result<(), Failure>,
-    },
-    RuntimeStopped {
-        op: OpId,
-    },
-    /// Policy input for this first slice. Later eviction selection emits this
-    /// from the same core rather than an external caller choosing a victim.
-    Evict {
-        cell: CellId,
-    },
-    /// A periodic resource sample from the edge.
-    ///
-    /// The core never reads a clock or a proc file; the shell measures and
-    /// hands the numbers over, and every decision that follows -- whether the
-    /// node is overloaded, whether the latch stays hot, how far to shed --
-    /// happens here where a schedule can replay it.
-    LoadSampled {
-        load: pressure::Load,
-        now_mono_ms: u64,
-    },
-    /// Retire an exact cached remote route after a dispatch failure which is
-    /// known not to have executed the request. Newer route generations are
-    /// unaffected by delayed failure reports.
-    InvalidateRemote {
-        cell: CellId,
-        node: NodeId,
-        epoch: Epoch,
-    },
-    NodeFenced,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Route {
-    Local,
-    Remote {
-        node: NodeId,
-        addr: String,
-        epoch: Epoch,
-        peer_protocol: u16,
-    },
-}
-
-/// Exact resident isolate reserved for a top-level Worker request.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WorkerRoute {
-    pub cell: CellId,
-    pub epoch: Epoch,
-    /// A pending durability proof made stale by selecting this still-routable
-    /// resident. The executor uses the ID only to release its effect waiter;
-    /// a late completion is ignored by the core's phase check.
-    pub retired_durability: Option<OpId>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RequestError {
-    NodeUnavailable,
-    ResolveFailed,
-    AcquireFailed,
-    RestoreFailed,
-    RuntimeFailed,
-    PublishFailed,
-    NodeFenced,
-    PeerIncompatible,
-    CapacityExhausted,
-    /// A local write ran but its durability could not be proven, so the
-    /// response must fail rather than falsely acknowledge the write.
-    DurabilityUnproven,
-}
-
-/// Work performed outside the core. Every asynchronous effect is versioned;
-/// completion events with an obsolete `op` are ignored.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Effect {
-    ScheduleTimer {
-        timer: Timer,
-        at_mono_ms: u64,
-    },
-    ReadSelfNodeLease {
-        op: OpId,
-    },
-    CasNodeLease {
-        op: OpId,
-        guard: CasGuard,
-        record: NodeLeaseRecord,
-    },
-    /// Shadow mode proposed the lazy release but deliberately retained
-    /// authority. The shell only records this decision; it performs no I/O.
-    ObserveNodeLeaseShadowRelease {
-        sequence: u64,
-    },
-    /// Lazy mode stopped renewing its idle node lease. The bucket object is
-    /// intentionally left to expire; this effect is observability only.
-    ObserveNodeLeaseReleased,
-    ReadOwner {
-        op: OpId,
-        cell: CellId,
-    },
-    ReadNodeLease {
-        op: OpId,
-        cell: CellId,
-        owner: NodeId,
-    },
-    /// Enumerate recent node leases and return their advisory load records.
-    /// Listing and bounded parallel reads are adapter mechanics; selection,
-    /// reservations, and exclusions are deterministic core policy.
-    ReadCapacityPeers {
-        op: OpId,
-        cell: CellId,
-    },
-    CasOwner {
-        op: OpId,
-        cell: CellId,
-        guard: CasGuard,
-        epoch: Epoch,
-        takeover: bool,
-    },
-    /// Bring the bucket's wake entry for this cell into line with its alarm.
-    ///
-    /// Emitted wherever the alarm settles, which is the only place that
-    /// knows. An arm needs an entry; a consumed alarm needs its entry gone,
-    /// or every later due scan finds a hint for an alarm that already fired
-    /// and wakes a cell with nothing to do. `next_alarm_ms` is -1 when no
-    /// alarm remains.
-    ReconcileWakeEntry {
-        cell: CellId,
-        next_alarm_ms: i64,
-    },
-    /// Publish an evicted cell as unowned, keeping its epoch, so the next
-    /// node to want it can take it without waiting for this one to notice.
-    ReleaseOwner {
-        op: OpId,
-        cell: CellId,
-        epoch: Epoch,
-    },
-    Restore {
-        op: OpId,
-        cell: CellId,
-        spec: RestoreSpec,
-    },
-    StartRuntime {
-        op: OpId,
-        cell: CellId,
-        epoch: Epoch,
-    },
-    Publish {
-        op: OpId,
-        cell: CellId,
-        epoch: Epoch,
-    },
-    /// Prove that every commit made before this effect is recoverable from
-    /// replica authority. Voluntary eviction cannot begin until this succeeds.
-    EnsureDurable {
-        op: OpId,
-        cell: CellId,
-        epoch: Epoch,
-    },
-    /// The output gate: prove the cell's committed `position` is replicated so
-    /// a withheld local write response can be released. Unlike
-    /// [`Effect::EnsureDurable`] this is per-request and changes no cell phase,
-    /// so the cell keeps serving co-resident requests while one response waits.
-    AwaitDurable {
-        op: OpId,
-        cell: CellId,
-        epoch: Epoch,
-        position: u64,
-    },
-    StopRuntime {
-        op: OpId,
-        cell: CellId,
-        epoch: Epoch,
-        cause: StopCause,
-    },
-    FireAlarm {
-        op: OpId,
-        cell: CellId,
-        epoch: Epoch,
-        scheduled_ms: i64,
-    },
-    Complete {
-        request: RequestId,
-        result: Result<Route, RequestError>,
-    },
-    /// Release a withheld local write response now that its durability is
-    /// decided: `Ok` acknowledges the write, `Err` fails it. Emitted only for a
-    /// request the shell held open via [`Event::Wrote`].
-    ReleaseResponse {
-        request: RequestId,
-        result: Result<(), RequestError>,
-    },
-    /// Complete the synchronous resident-selection decision. `None` means
-    /// the executor must use the ordinary stateless Worker pool.
-    CompleteWorker {
-        request: RequestId,
-        route: Option<WorkerRoute>,
-    },
-    /// Refuse a transport the node cannot afford to hold. The shell closes it;
-    /// the cell carries on without it.
-    CloseWebSocket {
-        cell: CellId,
-        websocket: WebSocketId,
-    },
-    Halt {
-        code: i32,
-        reason: HaltReason,
-    },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StopCause {
-    Cleanup,
-    /// `rebalance` means this eviction hands the cell to the fleet: its
-    /// ownership record is released and the local replica is not worth
-    /// keeping. An idle hibernation is the opposite on both counts -- it
-    /// keeps the record so the next activation here renames the file into
-    /// place instead of paying a full remote restore.
-    Evict {
-        rebalance: bool,
-    },
-    Fence,
-}
+mod types;
+pub use types::*;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Activation {
@@ -734,8 +45,11 @@ pub struct RestoreSpec {
     /// precede it.
     pub fresh: bool,
     /// Ownership was seized from a different node (or a released record), so
-    /// a previous local hibernation cache is not authoritative.
+    /// a previous local eviction cache is not authoritative.
     pub took_over: bool,
+    /// The node-level lease handoff proved that this exact local epoch remains
+    /// authoritative. The adapter must not consult the remote replica.
+    pub resume_local: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -760,9 +74,23 @@ pub struct Claim {
 /// not about to start answering.
 pub const MAX_ACQUIRE_RECONCILES: u32 = 3;
 
+/// Phases map onto the Durable Objects lifecycle states where Cloudflare has
+/// a name for them:
+///
+/// - `Resident` is active or idle in memory (states 1-3).
+/// - `Dormant` is out of memory but still owned by this node, so the cell has
+///   not been moved off its host. A dormant cell with surviving hibernatable
+///   sockets is *hibernated* (state 4); see [`Core::is_hibernated`].
+/// - `Inactive` is out of memory and owned by nobody: removed from the host,
+///   needing a cold start (state 5, and the initial state of every cell).
+///
+/// Note that celld and Cloudflare use "evict" differently. Cloudflare evicts a
+/// cell *off its host*, which produces `Inactive`. celld evicts a cell *out of
+/// memory*, which produces `Dormant`, and shedding is what then publishes it
+/// unowned.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Phase {
-    Dormant,
+    Inactive,
     /// Cold demand queued behind `max_activations`, before any I/O begins.
     WaitingActivation,
     ReadingOwner {
@@ -808,7 +136,8 @@ pub enum Phase {
         epoch: Epoch,
         cause: StopCause,
     },
-    OwnedDormant {
+    /// Out of memory, still owned here. Hibernated when sockets survived.
+    Dormant {
         epoch: Epoch,
     },
     Resident {
@@ -848,7 +177,9 @@ struct Cell {
     evict_rebalance: bool,
     alarm: Option<AlarmState>,
     alarm_wake: bool,
-    /// When this cell's hibernation was last refused, if it has been.
+    /// Startup, rather than a request or alarm, demands this activation.
+    resume_demand: bool,
+    /// When this cell's eviction was last refused, if it has been.
     ///
     /// A cell that cannot prove its replica durable goes back to residency,
     /// and being cold is exactly why nobody registered it -- so it settles at
@@ -857,7 +188,7 @@ struct Cell {
     /// it will ever succeed with. Recording the refusal lets the order prefer
     /// cells that have not just failed, while still coming back to them when
     /// they are all that is left.
-    hibernation_refused_mono_ms: Option<u64>,
+    eviction_refused_mono_ms: Option<u64>,
     /// When this cell last did something, on the remembered monotonic clock.
     ///
     /// Eviction order is the whole reason this exists. Without it the shed
@@ -890,7 +221,7 @@ struct HeldNodeLease {
     last_ok_mono_ms: u64,
     last_attempt_mono_ms: u64,
     timer_generation: u64,
-    inactive_since_mono_ms: Option<u64>,
+    idle_since_mono_ms: Option<u64>,
     shadow_release_reported: bool,
 }
 
@@ -903,14 +234,28 @@ struct PendingNodeLease {
     /// desired record landed, but must not turn a failed create into an
     /// unbounded read/write loop.
     readback_only: bool,
+    /// The monotonic instant `desired.expires_ms` was computed from.
+    ///
+    /// Authority is bounded by what the *bucket* says, and the bucket says
+    /// `expires_ms`, which is sampled here rather than when the write lands.
+    /// Anchoring the local fence deadline to the write's completion instead
+    /// would let this node serve for the whole duration of the round trip
+    /// after every peer is entitled to declare it dead -- the store is under
+    /// no obligation to answer quickly, so that window is unbounded.
+    anchor_mono_ms: u64,
+    /// This initial CAS replaces the exact live generation certified by the
+    /// clean local shutdown. Renewals never set this bit.
+    resume_local: bool,
 }
 
 #[derive(Clone, Debug)]
 enum NodeAuthority {
     Unstarted,
     /// Lazy lifecycle with no live lease. The spec is retained so the next
-    /// local dependency can acquire before touching cell ownership.
-    Inactive(NodeLeaseSpec),
+    /// local dependency can acquire before touching cell ownership. Named
+    /// `Lapsed`, not `Inactive`: `inactive` is a cell state (state 5, gone
+    /// from this host) and must mean only that.
+    Lapsed(NodeLeaseSpec),
     Reading {
         op: OpId,
         pending: PendingNodeLease,
@@ -920,6 +265,19 @@ enum NodeAuthority {
         pending: PendingNodeLease,
     },
     Held(HeldNodeLease),
+    /// A continuous node whose initial acquisition did not succeed, waiting to
+    /// try again.
+    ///
+    /// `StartNodeLease` is emitted exactly once, at process start, so without
+    /// this the first failed acquisition is permanent: the process stays up,
+    /// holds no authority, and answers every request `NodeUnavailable` for as
+    /// long as it runs. One slow or rate-limited bucket response at startup
+    /// should not cost a node its whole lifetime. A lazy node already
+    /// recovers, because its next request re-acquires from `Lapsed`.
+    Retrying {
+        spec: NodeLeaseSpec,
+        generation: u64,
+    },
     Failed,
     Fenced,
 }
@@ -927,7 +285,7 @@ enum NodeAuthority {
 impl Default for Cell {
     fn default() -> Self {
         Self {
-            phase: Phase::Dormant,
+            phase: Phase::Inactive,
             requests: BTreeSet::new(),
             websockets: BTreeMap::new(),
             waiting_for: None,
@@ -936,7 +294,8 @@ impl Default for Cell {
             evict_rebalance: false,
             alarm: None,
             alarm_wake: false,
-            hibernation_refused_mono_ms: None,
+            resume_demand: false,
+            eviction_refused_mono_ms: None,
             last_used_mono_ms: 0,
         }
     }
@@ -947,6 +306,15 @@ pub struct State {
     node: NodeId,
     config: Config,
     fenced: bool,
+    /// A shutdown handoff is under way: every resident cell is to be
+    /// released, pumped at most `max_releases` at a time. Sticky -- a
+    /// draining node never goes back to serving.
+    draining: bool,
+    /// An exact clean predecessor was replaced and its local inventory is
+    /// being scanned or materialized. Readiness remains false until every
+    /// discovered cell either publishes or fails closed.
+    resuming: bool,
+    resuming_cells: BTreeSet<CellId>,
     next_op: OpId,
     next_timer_generation: u64,
     cells: BTreeMap<CellId, Cell>,
@@ -954,6 +322,12 @@ pub struct State {
     /// Local routes handed to the executor but not yet reported complete.
     /// These are eviction pins: the adapter may still be running user code.
     active_requests: BTreeMap<RequestId, CellId>,
+    /// Reverse index of `active_requests`: how many active requests target
+    /// each cell. `is_active` reads it in O(1) where scanning the values was
+    /// O(active_requests), and `worker_request` calls `is_active` once per
+    /// resident cell — the product wedged cold-cell activation, the rate
+    /// falling with the cell count (engine/pathological-load.md).
+    active_cells: BTreeMap<CellId, usize>,
     /// Local write responses withheld by the output gate until their cell is
     /// proven durable to the written position, keyed by the durability op. An
     /// open gate makes its cell active, so the cell cannot be evicted
@@ -979,7 +353,7 @@ pub struct State {
     /// the runtime stop. Explicit for the same reason as the activation
     /// permits: the bound belongs in the replayable state machine rather than
     /// being implied by how many executor tasks happen to exist.
-    hibernation_permits: BTreeSet<CellId>,
+    eviction_permits: BTreeSet<CellId>,
     /// Cells waiting for a residency slot, in arrival order. FIFO is the
     /// whole admission policy: waking every waiter on a release and letting
     /// them race is unfair by construction — under sustained eviction a
@@ -1007,6 +381,15 @@ pub struct State {
     /// Start/publish effects invalidated by fencing may still commit. Their
     /// late completion must trigger compensating cleanup, not be ignored.
     retired_runtime_ops: BTreeMap<OpId, (CellId, Epoch)>,
+    /// The cell each in-flight cell-scoped operation belongs to. Completion
+    /// events name only the op; this index is what makes resolving one a
+    /// lookup instead of a walk of every cell.
+    cell_ops: BTreeMap<OpId, CellId>,
+    /// How many cells currently occupy capacity, maintained at every phase
+    /// transition. `has_capacity` asks on every admission and `validate` on
+    /// every debug event; counting by walking the map priced both by the
+    /// total cell count rather than the answer.
+    occupied: usize,
     node_authority: NodeAuthority,
     /// Requests admitted while a lazy node is inactive. They are not entered
     /// into per-cell routing state until the node lease is authoritative, so
@@ -1051,10 +434,8 @@ pub struct State {
 
 impl State {
     pub fn new(node: impl Into<NodeId>, config: Config) -> Self {
-        assert!(
-            config.max_hibernations > 0,
-            "max_hibernations must be positive"
-        );
+        assert!(config.max_evictions > 0, "max_evictions must be positive");
+        assert!(config.max_releases > 0, "max_releases must be positive");
         assert!(
             config.max_activations > 0,
             "max_activations must be positive"
@@ -1063,18 +444,22 @@ impl State {
             node: node.into(),
             config,
             fenced: false,
+            draining: false,
+            resuming: false,
+            resuming_cells: BTreeSet::new(),
             next_op: 1,
             next_timer_generation: 1,
             cells: BTreeMap::new(),
             request_cells: BTreeMap::new(),
             active_requests: BTreeMap::new(),
+            active_cells: BTreeMap::new(),
             gated_writes: BTreeMap::new(),
             gate_pinned: BTreeSet::new(),
             worker_cursor: None,
             activity: ActivitySnapshot::default(),
             activation_waiters: VecDeque::new(),
             activation_permits: BTreeSet::new(),
-            hibernation_permits: BTreeSet::new(),
+            eviction_permits: BTreeSet::new(),
             capacity_waiters: VecDeque::new(),
             capacity_requests: BTreeSet::new(),
             capacity_reservations: BTreeMap::new(),
@@ -1082,6 +467,8 @@ impl State {
             capacity_rejections: BTreeMap::new(),
             node_lease_cache: BTreeMap::new(),
             retired_runtime_ops: BTreeMap::new(),
+            cell_ops: BTreeMap::new(),
+            occupied: 0,
             node_authority: NodeAuthority::Unstarted,
             node_lease_waiters: BTreeMap::new(),
             node_wake_waiters: BTreeSet::new(),
@@ -1104,14 +491,26 @@ impl State {
         self.fenced
     }
 
+    /// Authority is the lease's published validity evaluated at ask time on
+    /// the monotonic clock — not the `Held` variant. A peer treats the record
+    /// as dead the instant `now_ms` reaches `expires_ms`, so a holder whose
+    /// lease lapsed must answer `false` here even if `Timer::NodeLeaseFence`
+    /// has not fired yet: the timer is the liveness backstop that halts the
+    /// process, never the safety mechanism. A suspended VM's timer fires
+    /// late, but a request evaluated after resume still refuses. The `<` /
+    /// `>=` polarity matches the fence timer at `handle_timer`, so the
+    /// predicate and the timer cannot disagree.
     pub fn node_authoritative(&self) -> bool {
         if !self.config.require_node_lease {
             return !self.fenced;
         }
+        let fresh = |held: &HeldNodeLease| {
+            self.now_mono_ms.saturating_sub(held.last_ok_mono_ms) < held.spec.ttl_ms
+        };
         match &self.node_authority {
-            NodeAuthority::Held(_) => true,
+            NodeAuthority::Held(held) => fresh(held),
             NodeAuthority::Reading { pending, .. } | NodeAuthority::Writing { pending, .. } => {
-                pending.prior.is_some()
+                pending.prior.as_ref().is_some_and(fresh)
             }
             _ => false,
         }
@@ -1121,13 +520,13 @@ impl State {
     /// even though it intentionally holds no authority: a DO request first
     /// acquires the lease, while stateless Worker traffic needs none.
     pub fn ready_to_serve(&self) -> bool {
-        if self.fenced {
+        if self.fenced || self.resuming {
             return false;
         }
         self.node_authoritative()
             || matches!(
                 &self.node_authority,
-                NodeAuthority::Inactive(NodeLeaseSpec {
+                NodeAuthority::Lapsed(NodeLeaseSpec {
                     mode: NodeLeaseMode::Lazy,
                     ..
                 }) | NodeAuthority::Reading {
@@ -1174,7 +573,7 @@ impl State {
     }
 
     /// Host-side sockets open across every cell. Each one pins its cell
-    /// against hibernation, so a node holding many is a poor landing place
+    /// against eviction, so a node holding many is a poor landing place
     /// even when its residency looks unremarkable.
     pub fn host_websockets(&self) -> usize {
         self.cells.values().map(|cell| cell.websockets.len()).sum()
@@ -1189,10 +588,12 @@ impl State {
     }
 
     pub fn occupied(&self) -> usize {
-        self.cells
-            .values()
-            .filter(|cell| phase_occupies_capacity(&cell.phase))
-            .count()
+        self.occupied
+    }
+
+    /// Are fewer than `ceiling` cells occupying capacity?
+    fn occupied_below(&self, ceiling: usize) -> bool {
+        self.occupied < ceiling
     }
 
     pub fn residents(&self) -> Vec<CellId> {
@@ -1245,20 +646,53 @@ impl State {
         self.activation_permits.len()
     }
 
+    /// Evictions in flight, from the durability proof through the runtime
+    /// stop. During a drain this saturates at `max_releases`.
+    pub fn evicting(&self) -> usize {
+        self.eviction_permits.len()
+    }
+
+    /// Cold routes that have not finished: cells that hold an activation
+    /// permit plus cells queued behind the activation ceiling. A capacity
+    /// waiter already holds a permit, so this counts every cell once. A
+    /// rollout waits for zero before it removes more warm capacity.
+    pub fn activation_backlog(&self) -> usize {
+        self.activation_permits.len() + self.activation_waiters.len()
+    }
+
+    /// Ownership releases still in flight. The shutdown drain waits for
+    /// zero: a released cell stops occupying capacity before its record
+    /// write commits, so an exit gated on occupancy alone can outrun its
+    /// own releases and leave records a successor must wait out the node
+    /// lease for -- the takeover-at-once promise broken on every real
+    /// store, where the write loses a race against a 50ms drain poll that
+    /// a local fixture always wins.
+    pub fn releasing(&self) -> usize {
+        self.cells
+            .values()
+            .filter(|cell| cell.releasing.is_some())
+            .count()
+    }
+
     /// Cheap internal consistency gate run by both executors after every event.
     pub fn validate(&self) -> Result<(), String> {
-        if self.occupied() > self.config.max_resident {
+        if !self.occupied_below(self.config.max_resident.saturating_add(1)) {
             return Err(format!(
                 "occupied {} exceeds ceiling {}",
                 self.occupied(),
                 self.config.max_resident
             ));
         }
-        if self.hibernation_permits.len() > self.config.max_hibernations {
+        let eviction_ceiling = if self.draining {
+            self.config.max_releases.max(self.config.max_evictions)
+        } else {
+            self.config.max_evictions
+        };
+        if self.eviction_permits.len() > eviction_ceiling {
             return Err(format!(
-                "hibernating {} exceeds ceiling {}",
-                self.hibernation_permits.len(),
-                self.config.max_hibernations
+                "evicting {} exceeds ceiling {}",
+                self.eviction_permits.len(),
+                eviction_ceiling
             ));
         }
         if self.activation_permits.len() > self.config.max_activations {
@@ -1324,6 +758,35 @@ impl State {
                     ));
                 }
             }
+            // Every in-flight cell op must be resolvable through the index,
+            // or its completion event will never find this cell.
+            let indexed = |op: OpId| self.cell_ops.get(&op) == Some(id);
+            if let Some(op) = phase_op(&cell.phase) {
+                if !indexed(op) {
+                    return Err(format!("cell {id:?} phase op {op} is not indexed"));
+                }
+            }
+            if let Some(AlarmState::Firing { op, .. }) = cell.alarm {
+                if !indexed(op) {
+                    return Err(format!("cell {id:?} firing alarm op {op} is not indexed"));
+                }
+            }
+            if let Some(op) = cell.releasing {
+                if !indexed(op) {
+                    return Err(format!("cell {id:?} release op {op} is not indexed"));
+                }
+            }
+        }
+        let walked = self
+            .cells
+            .values()
+            .filter(|cell| phase_occupies_capacity(&cell.phase))
+            .count();
+        if walked != self.occupied {
+            return Err(format!(
+                "occupied counter {} disagrees with the walk {walked}",
+                self.occupied
+            ));
         }
         for (request, id) in &self.request_cells {
             if !self
@@ -1345,6 +808,17 @@ impl State {
             if id.is_empty() {
                 return Err(format!("request {request} has an empty node-lease target"));
             }
+        }
+        // The reverse index must agree with the map it summarizes, exactly.
+        let mut recount: BTreeMap<CellId, usize> = BTreeMap::new();
+        for id in self.active_requests.values() {
+            *recount.entry(id.clone()).or_insert(0) += 1;
+        }
+        if recount != self.active_cells {
+            return Err(format!(
+                "active_cells index {:?} disagrees with active_requests {:?}",
+                self.active_cells, recount
+            ));
         }
         for (request, id) in &self.active_requests {
             if self.request_cells.contains_key(request) {
@@ -1401,18 +875,40 @@ impl State {
         op
     }
 
+    /// Allocate an op that will live in `cell`'s phase, alarm, or release
+    /// slot, and index it.
+    fn cell_op(&mut self, cell: &str) -> OpId {
+        let op = self.op();
+        self.cell_ops.insert(op, cell.to_string());
+        op
+    }
+
+    /// Resolve a completion's op to its cell, consuming the index entry —
+    /// but only when `predicate` confirms the cell still holds the op. On a
+    /// mismatch the entry stays: the op's real completion has not arrived
+    /// yet (an expiry can probe the wrong handler), and it must still find
+    /// its way here later.
+    fn take_cell_op(&mut self, op: OpId, predicate: impl Fn(&Cell) -> bool) -> Option<CellId> {
+        let id = self.cell_ops.get(&op)?.clone();
+        if !self.cells.get(&id).is_some_and(predicate) {
+            return None;
+        }
+        self.cell_ops.remove(&op);
+        Some(id)
+    }
+
     fn has_capacity(&self) -> bool {
         // Residency is a hard cap, known exactly and counted -- never sampled.
         // A node at its cell cap is at capacity, not overloaded: it refuses
         // more and holds what it has, rather than shedding a live cell it must
         // then place again elsewhere. The only sampled fact that refuses
-        // admission is genuine resource pressure (RSS/CPU), which a cell count
+        // admission is genuine memory pressure, which a cell count
         // cannot see.
-        self.occupied() < self.config.max_resident && !self.shedding
+        self.occupied_below(self.config.max_resident) && !self.shedding
     }
 
     pub fn is_active(&self, id: &str) -> bool {
-        self.active_requests.values().any(|cell| cell == id)
+        self.active_cells.contains_key(id)
             || self.cells.get(id).is_some_and(|cell| {
                 cell.websockets
                     .values()
@@ -1420,13 +916,90 @@ impl State {
             })
     }
 
+    /// Record `request` as active on `cell`, keeping the `active_cells`
+    /// reverse index in step with `active_requests`. Every insert into
+    /// `active_requests` goes through here so the two never disagree.
+    fn activate_request(&mut self, request: RequestId, cell: CellId) {
+        *self.active_cells.entry(cell.clone()).or_insert(0) += 1;
+        self.active_requests.insert(request, cell);
+    }
+
+    /// Drop `request` from the active set, decrementing its cell's index and
+    /// forgetting the cell once no request targets it. Returns the cell the
+    /// request held, as `active_requests.remove` did.
+    fn deactivate_request(&mut self, request: RequestId) -> Option<CellId> {
+        let cell = self.active_requests.remove(&request)?;
+        if let Some(count) = self.active_cells.get_mut(&cell) {
+            *count -= 1;
+            if *count == 0 {
+                self.active_cells.remove(&cell);
+            }
+        }
+        Some(cell)
+    }
+
+    /// Hibernated (Durable Objects state 4): out of memory, still on this
+    /// host, with WebSocket clients parked at the network layer. Nothing in
+    /// memory survives -- the next event runs the constructor again, exactly
+    /// as a cold start does -- so the surviving sockets are the whole of the
+    /// difference from `Inactive`.
+    pub fn is_hibernated(&self, id: &str) -> bool {
+        self.cells.get(id).is_some_and(|cell| {
+            matches!(cell.phase, Phase::Dormant { .. })
+                && cell
+                    .websockets
+                    .values()
+                    .any(|kind| matches!(kind, WebSocketKind::Hibernatable))
+        })
+    }
+
+    /// Hibernatable (Durable Objects state 2): resident, doing no work, and
+    /// holding nothing that must survive in memory. State 3 is the negation --
+    /// resident and idle, but pinned by a `Regular` or `Outbound` socket that
+    /// cannot outlive the isolate.
+    ///
+    /// This is the cell's own criteria, not a decision to evict. celld also
+    /// refuses eviction for an imminent or uncovered alarm and for state the
+    /// bucket cannot restore; those are policy and are checked separately.
+    pub fn is_hibernatable(&self, id: &str) -> bool {
+        self.cells
+            .get(id)
+            .is_some_and(|cell| matches!(cell.phase, Phase::Resident { .. }))
+            && !self.is_active(id)
+    }
+
     pub fn websocket_count(&self, id: &str) -> usize {
         self.cells.get(id).map_or(0, |cell| cell.websockets.len())
     }
 
-    /// Distinct local cell lifecycles which require this process's node
+    /// Does anything local still need this process's node authority?
+    ///
+    /// The question every caller but the shadow snapshot actually asks, and
+    /// asking it directly is what makes it cheap: no set, no cloned ids, and
+    /// a stop at the first dependent cell.
+    ///
+    /// Counting instead put an `O(n log n)` walk of every resident cell on
+    /// the path taken after *every* state transition, which is to say on
+    /// every request. A profile of `/c/hello` with 800 resident cells spent
+    /// more time in `BTreeSet<String>` than in the request: throughput fell
+    /// from 57k to 3.5k rps, linearly in the number of resident cells.
+    fn node_lease_is_depended_on(&self) -> bool {
+        !self.node_lease_waiters.is_empty()
+            || !self.node_wake_waiters.is_empty()
+            || self
+                .cells
+                .values()
+                .any(|cell| phase_depends_on_node_lease(&cell.phase) || !cell.websockets.is_empty())
+    }
+
+    /// How many distinct local cell lifecycles require this process's node
     /// authority. Hibernated cells do not pin a lazy lease by themselves, but
-    /// a host-held WebSocket does even after its isolate has hibernated.
+    /// a hibernated cell does, because its host-held WebSocket outlives the
+    /// isolate.
+    ///
+    /// The exact figure, for the shadow snapshot that reports it. Everything
+    /// else wants [`node_lease_is_depended_on`](Self::node_lease_is_depended_on),
+    /// which answers the same question without building the set.
     fn node_lease_dependency_count(&self) -> usize {
         let mut cells = BTreeSet::new();
         cells.extend(self.node_lease_waiters.values().cloned());
@@ -1443,7 +1016,7 @@ impl State {
     /// deliberately derived from core state rather than an executor-owned
     /// active-cell counter, which used to let the model and production drift.
     fn update_node_lease_dependencies(&mut self, now_mono_ms: u64) {
-        let active = self.node_lease_dependency_count();
+        let depended_on = self.node_lease_is_depended_on();
         let held = match &mut self.node_authority {
             NodeAuthority::Held(held) => Some(held),
             NodeAuthority::Reading { pending, .. } | NodeAuthority::Writing { pending, .. } => {
@@ -1454,10 +1027,10 @@ impl State {
         let Some(held) = held else {
             return;
         };
-        if active == 0 {
-            held.inactive_since_mono_ms.get_or_insert(now_mono_ms);
+        if !depended_on {
+            held.idle_since_mono_ms.get_or_insert(now_mono_ms);
         } else {
-            held.inactive_since_mono_ms = None;
+            held.idle_since_mono_ms = None;
             held.shadow_release_reported = false;
         }
     }
@@ -1477,7 +1050,7 @@ impl State {
             self.lazy_lease_shadow.dropped = self.lazy_lease_shadow.dropped.saturating_add(1);
         }
         let idle_ms = held
-            .inactive_since_mono_ms
+            .idle_since_mono_ms
             .map_or(0, |inactive| now_mono_ms.saturating_sub(inactive));
         self.lazy_lease_shadow
             .decisions
@@ -1514,7 +1087,7 @@ impl State {
         self.capacity_requests.remove(&request);
         match &result {
             Ok(Route::Local) => {
-                self.active_requests.insert(request, id.to_string());
+                self.activate_request(request, id.to_string());
                 let now = self.now_mono_ms;
                 if let Some(cell) = self.cells.get_mut(id) {
                     cell.last_used_mono_ms = now;
@@ -1574,13 +1147,20 @@ impl State {
 
         if let Some(route) = &route {
             self.worker_cursor = Some(route.cell.clone());
-            self.active_requests.insert(request, route.cell.clone());
+            self.activate_request(request, route.cell.clone());
             if let Some(cell) = self.cells.get_mut(&route.cell) {
                 if matches!(cell.phase, Phase::EnsuringDurability { .. }) {
                     // Same rescue as `request_authorized`: the permit taken
                     // at nomination comes back with the cell.
-                    cell.phase = Phase::Resident { epoch: route.epoch };
-                    self.hibernation_permits.remove(&route.cell);
+                    if let Some(stale) = phase_op(&cell.phase) {
+                        self.cell_ops.remove(&stale);
+                    }
+                    set_phase(
+                        &mut self.occupied,
+                        cell,
+                        Phase::Resident { epoch: route.epoch },
+                    );
+                    self.eviction_permits.remove(&route.cell);
                 }
                 cell.last_used_mono_ms = self.now_mono_ms;
             }
@@ -1612,8 +1192,8 @@ impl State {
         cell.waiting_activation = None;
         match start {
             ColdStart::ReadOwner => {
-                let op = self.op();
-                cell.phase = Phase::ReadingOwner { op };
+                let op = self.cell_op(id);
+                set_phase(&mut self.occupied, cell, Phase::ReadingOwner { op });
                 effects.push(Effect::ReadOwner {
                     op,
                     cell: id.to_string(),
@@ -1638,7 +1218,7 @@ impl State {
             self.activation_permits.insert(id.to_string());
             self.begin_cold_route(id, cell, start, effects);
         } else {
-            cell.phase = Phase::WaitingActivation;
+            set_phase(&mut self.occupied, cell, Phase::WaitingActivation);
             cell.waiting_activation = Some(start);
             self.activation_waiters.push_back(id.to_string());
         }
@@ -1666,16 +1246,74 @@ impl State {
                 self.cells.insert(id, cell);
                 continue;
             };
-            if cell.requests.is_empty() && !cell.alarm_wake {
-                cell.phase = match start {
-                    ColdStart::ReadOwner => Phase::Dormant,
-                    ColdStart::Restore(spec) => Phase::OwnedDormant { epoch: spec.epoch },
-                };
+            if cell.requests.is_empty() && !cell.alarm_wake && !cell.resume_demand {
+                set_phase(
+                    &mut self.occupied,
+                    &mut cell,
+                    match start {
+                        ColdStart::ReadOwner => Phase::Inactive,
+                        ColdStart::Restore(spec) => Phase::Dormant { epoch: spec.epoch },
+                    },
+                );
             } else {
                 self.activation_permits.insert(id.clone());
                 self.begin_cold_route(&id, &mut cell, start, effects);
             }
             self.cells.insert(id, cell);
+        }
+    }
+
+    /// Adopt the exact epochs encoded by a clean predecessor's local paths.
+    /// The node lease CAS that caused this event is the ownership proof, so
+    /// this path deliberately emits no per-cell ownership effects.
+    fn local_cells_read(
+        &mut self,
+        result: Result<Vec<LocalCell>, Failure>,
+        effects: &mut Vec<Effect>,
+    ) {
+        if !self.resuming {
+            return;
+        }
+        let Ok(mut cells) = result else {
+            self.resuming = false;
+            return;
+        };
+        cells.sort();
+        cells.dedup();
+        if cells.len() > self.config.max_resident || !self.cells.is_empty() {
+            self.resuming = false;
+            return;
+        }
+        for local in cells {
+            let mut cell = Cell {
+                resume_demand: true,
+                ..Cell::default()
+            };
+            self.resuming_cells.insert(local.id.clone());
+            self.admit_or_queue_activation(
+                &local.id,
+                &mut cell,
+                ColdStart::Restore(RestoreSpec {
+                    epoch: local.epoch,
+                    fresh: false,
+                    took_over: false,
+                    resume_local: true,
+                }),
+                effects,
+            );
+            self.cells.insert(local.id, cell);
+        }
+        if self.resuming_cells.is_empty() {
+            self.resuming = false;
+        }
+    }
+
+    fn settle_local_resume(&mut self, id: &str) {
+        if self.resuming_cells.remove(id) && self.resuming_cells.is_empty() {
+            self.resuming = false;
+        }
+        if let Some(cell) = self.cells.get_mut(id) {
+            cell.resume_demand = false;
         }
     }
 
@@ -1688,13 +1326,17 @@ impl State {
     ) {
         debug_assert!(self.has_capacity());
         cell.waiting_for = None;
-        let op = self.op();
+        let op = self.cell_op(id);
         match activation {
             Activation::Claim(claim) => {
-                cell.phase = Phase::Acquiring {
-                    op,
-                    claim: claim.clone(),
-                };
+                set_phase(
+                    &mut self.occupied,
+                    cell,
+                    Phase::Acquiring {
+                        op,
+                        claim: claim.clone(),
+                    },
+                );
                 effects.push(Effect::CasOwner {
                     op,
                     cell: id.to_string(),
@@ -1704,10 +1346,14 @@ impl State {
                 });
             }
             Activation::Restore(spec) => {
-                cell.phase = Phase::Restoring {
-                    op,
-                    spec: spec.clone(),
-                };
+                set_phase(
+                    &mut self.occupied,
+                    cell,
+                    Phase::Restoring {
+                        op,
+                        spec: spec.clone(),
+                    },
+                );
                 effects.push(Effect::Restore {
                     op,
                     cell: id.to_string(),
@@ -1724,15 +1370,19 @@ impl State {
         activation: Activation,
         effects: &mut Vec<Effect>,
     ) {
-        if cell.requests.is_empty() && !cell.alarm_wake {
-            cell.phase = match activation {
-                Activation::Claim(_) => Phase::Dormant,
-                Activation::Restore(spec) => Phase::OwnedDormant { epoch: spec.epoch },
-            };
+        if cell.requests.is_empty() && !cell.alarm_wake && !cell.resume_demand {
+            set_phase(
+                &mut self.occupied,
+                cell,
+                match activation {
+                    Activation::Claim(_) => Phase::Inactive,
+                    Activation::Restore(spec) => Phase::Dormant { epoch: spec.epoch },
+                },
+            );
         } else if self.has_capacity() {
             self.begin_activation(id, cell, activation, effects);
         } else {
-            cell.phase = Phase::WaitingCapacity;
+            set_phase(&mut self.occupied, cell, Phase::WaitingCapacity);
             cell.waiting_for = Some(activation);
             self.capacity_waiters.push_back(id.to_string());
             self.shed_one(effects);
@@ -1755,11 +1405,15 @@ impl State {
                 self.cells.insert(id, cell);
                 continue;
             };
-            if cell.requests.is_empty() && !cell.alarm_wake {
-                cell.phase = match activation {
-                    Activation::Claim(_) => Phase::Dormant,
-                    Activation::Restore(spec) => Phase::OwnedDormant { epoch: spec.epoch },
-                };
+            if cell.requests.is_empty() && !cell.alarm_wake && !cell.resume_demand {
+                set_phase(
+                    &mut self.occupied,
+                    &mut cell,
+                    match activation {
+                        Activation::Claim(_) => Phase::Inactive,
+                        Activation::Restore(spec) => Phase::Dormant { epoch: spec.epoch },
+                    },
+                );
             } else {
                 self.begin_activation(&id, &mut cell, activation, effects);
             }
@@ -1771,12 +1425,12 @@ impl State {
     fn start_node_lease(&mut self, now_ms: u64, spec: NodeLeaseSpec, effects: &mut Vec<Effect>) {
         if !matches!(
             self.node_authority,
-            NodeAuthority::Unstarted | NodeAuthority::Failed | NodeAuthority::Inactive(_)
+            NodeAuthority::Unstarted | NodeAuthority::Failed | NodeAuthority::Lapsed(_)
         ) {
             return;
         }
         if spec.mode == NodeLeaseMode::Lazy {
-            self.node_authority = NodeAuthority::Inactive(spec);
+            self.node_authority = NodeAuthority::Lapsed(spec);
             return;
         }
         self.begin_node_lease_acquisition(now_ms, spec, effects);
@@ -1801,6 +1455,8 @@ impl State {
             desired,
             prior: None,
             readback_only: false,
+            anchor_mono_ms: self.now_mono_ms,
+            resume_local: false,
         };
         let op = self.op();
         self.node_authority = NodeAuthority::Reading { op, pending };
@@ -1809,9 +1465,24 @@ impl State {
 
     fn fail_initial_node_lease(&mut self, spec: NodeLeaseSpec, effects: &mut Vec<Effect>) {
         self.node_authority = if spec.mode == NodeLeaseMode::Lazy {
-            NodeAuthority::Inactive(spec)
+            // The next request re-acquires from here.
+            NodeAuthority::Lapsed(spec)
         } else {
-            NodeAuthority::Failed
+            // Nothing else will ever ask: `StartNodeLease` is a one-shot at
+            // process start. Arm the retry here or this node is done serving.
+            // The renewal cadence is the right interval -- it is already the
+            // rate this fleet has decided its bucket can carry.
+            let generation = self.next_timer_generation;
+            self.next_timer_generation = self
+                .next_timer_generation
+                .checked_add(1)
+                .expect("timer generation exhausted");
+            let retry_after = (spec.ttl_ms / 3).max(1);
+            effects.push(Effect::ScheduleTimer {
+                timer: Timer::NodeLeaseRenew { generation },
+                at_mono_ms: self.now_mono_ms.saturating_add(retry_after),
+            });
+            NodeAuthority::Retrying { spec, generation }
         };
         for (request, _) in std::mem::take(&mut self.node_lease_waiters) {
             effects.push(Effect::Complete {
@@ -1822,12 +1493,76 @@ impl State {
         self.node_wake_waiters.clear();
     }
 
+    /// A lease write landed. Decide whether it actually preserved authority,
+    /// and if so install it anchored to the instant its `expires_ms` was
+    /// sampled.
+    ///
+    /// A renewal that lands at or after the PRIOR lease's expiry has not
+    /// extended anything: every peer was already entitled to read that record,
+    /// find it dead, and seize this node's cells, and one of them may have
+    /// begun doing exactly that. Rewriting `nodes/<node>.json` does not
+    /// retract a takeover already in flight -- the ownership compare-and-swap
+    /// a peer is about to issue is guarded on the ownership record's ETag,
+    /// which a resident owner never touches -- so resurrecting the lease here
+    /// is precisely how two nodes end up serving one cell. The gap is a fence,
+    /// not a hiccup.
+    fn complete_node_lease_write(
+        &mut self,
+        pending: PendingNodeLease,
+        record: NodeLeaseRecord,
+        now_mono_ms: u64,
+        effects: &mut Vec<Effect>,
+    ) {
+        // The record just published expires at `anchor + ttl`. A round trip
+        // that outlived that window landed a lease which is already dead to
+        // every peer reading the bucket, so this process must not act on it --
+        // and acting on it is exactly what installing it does, because
+        // `hold_node_lease` drains the waiting requests inline, before the
+        // past-due fence timer it arms can possibly be delivered.
+        let expired = now_mono_ms.saturating_sub(pending.anchor_mono_ms) >= pending.spec.ttl_ms;
+        match &pending.prior {
+            // A renewal only preserves authority if it lands while the PRIOR
+            // lease is still valid. Losing that continuity means peers were
+            // already entitled to seize this node's cells.
+            Some(prior) => {
+                if expired || now_mono_ms.saturating_sub(prior.last_ok_mono_ms) >= prior.spec.ttl_ms
+                {
+                    self.fence_node(effects);
+                    return;
+                }
+            }
+            // An initial acquisition that lands expired never became
+            // authoritative: this node owns nothing and is serving nothing, so
+            // there is no runtime to fence and no reason to halt. Fail the
+            // waiters and let a later request retry from a fresh sample.
+            None => {
+                if expired {
+                    self.fail_initial_node_lease(pending.spec, effects);
+                    return;
+                }
+            }
+        }
+        let resume_local = pending.resume_local;
+        self.hold_node_lease(
+            pending.spec,
+            record,
+            pending.prior,
+            pending.anchor_mono_ms,
+            resume_local,
+            effects,
+        );
+    }
+
+    /// Install a held lease. `anchor_mono_ms` is the monotonic instant the
+    /// record's `expires_ms` was computed from -- NOT the instant the write
+    /// completed. See [`PendingNodeLease::anchor_mono_ms`].
     fn hold_node_lease(
         &mut self,
         spec: NodeLeaseSpec,
         record: NodeLeaseRecord,
         prior: Option<HeldNodeLease>,
-        now_mono_ms: u64,
+        anchor_mono_ms: u64,
+        resume_local: bool,
         effects: &mut Vec<Effect>,
     ) {
         let generation = self.next_timer_generation;
@@ -1838,28 +1573,36 @@ impl State {
         let renew_after = (spec.ttl_ms / 3).max(1);
         effects.push(Effect::ScheduleTimer {
             timer: Timer::NodeLeaseRenew { generation },
-            at_mono_ms: now_mono_ms.saturating_add(renew_after),
+            at_mono_ms: anchor_mono_ms.saturating_add(renew_after),
         });
+        // Exactly the published deadline. A peer treats the record as live
+        // while `expires_ms > now_ms`, so this node must have stopped serving
+        // by the time `now_ms` reaches `expires_ms` -- not one millisecond
+        // after it.
         effects.push(Effect::ScheduleTimer {
             timer: Timer::NodeLeaseFence { generation },
-            at_mono_ms: now_mono_ms.saturating_add(spec.ttl_ms).saturating_add(1),
+            at_mono_ms: anchor_mono_ms.saturating_add(spec.ttl_ms),
         });
-        let inactive_since_mono_ms = prior
+        let idle_since_mono_ms = prior
             .as_ref()
-            .and_then(|held| held.inactive_since_mono_ms)
-            .or_else(|| (self.node_lease_dependency_count() == 0).then_some(now_mono_ms));
+            .and_then(|held| held.idle_since_mono_ms)
+            .or_else(|| (!self.node_lease_is_depended_on()).then_some(anchor_mono_ms));
         let shadow_release_reported = prior
             .as_ref()
             .is_some_and(|held| held.shadow_release_reported);
         self.node_authority = NodeAuthority::Held(HeldNodeLease {
             spec,
             record,
-            last_ok_mono_ms: now_mono_ms,
-            last_attempt_mono_ms: now_mono_ms,
+            last_ok_mono_ms: anchor_mono_ms,
+            last_attempt_mono_ms: anchor_mono_ms,
             timer_generation: generation,
-            inactive_since_mono_ms,
+            idle_since_mono_ms,
             shadow_release_reported,
         });
+        if resume_local {
+            self.resuming = true;
+            effects.push(Effect::ReadLocalCells);
+        }
         self.drain_node_lease_waiters(effects);
     }
 
@@ -1880,8 +1623,8 @@ impl State {
     }
 
     fn release_or_fence_node_lease(&mut self, held: HeldNodeLease, effects: &mut Vec<Effect>) {
-        if held.spec.mode == NodeLeaseMode::Lazy && self.node_lease_dependency_count() == 0 {
-            self.node_authority = NodeAuthority::Inactive(held.spec);
+        if held.spec.mode == NodeLeaseMode::Lazy && !self.node_lease_is_depended_on() {
+            self.node_authority = NodeAuthority::Lapsed(held.spec);
             effects.push(Effect::ObserveNodeLeaseReleased);
         } else {
             self.fence_node(effects);
@@ -1896,14 +1639,20 @@ impl State {
     ) {
         let op = self.op();
         let record = pending.desired.clone();
+        let authority_expires_ms = pending.prior.as_ref().map(|prior| prior.record.expires_ms);
         self.node_authority = NodeAuthority::Writing { op, pending };
-        effects.push(Effect::CasNodeLease { op, guard, record });
+        effects.push(Effect::CasNodeLease {
+            op,
+            guard,
+            record,
+            authority_expires_ms,
+        });
     }
 
     fn read_self_node_lease(
         &mut self,
         op: OpId,
-        _now_ms: u64,
+        now_ms: u64,
         now_mono_ms: u64,
         result: Result<Option<NodeLeaseRecord>, Failure>,
         effects: &mut Vec<Effect>,
@@ -1933,7 +1682,7 @@ impl State {
                 }
             }
             Ok(Some(record)) if same_node_lease(&record, &pending.desired) => {
-                self.hold_node_lease(pending.spec, record, pending.prior, now_mono_ms, effects);
+                self.complete_node_lease_write(pending, record, now_mono_ms, effects);
             }
             Ok(Some(record))
                 if pending
@@ -1962,6 +1711,12 @@ impl State {
                 // node replaces its prior process generation immediately. The
                 // ETag still serializes competing replacements, and a process
                 // which loses that CAS never becomes authoritative.
+                let mut pending = pending;
+                pending.resume_local = pending.prior.is_none()
+                    && !pending.readback_only
+                    && record.expires_ms > now_ms
+                    && pending.spec.resume_generation.as_deref()
+                        == Some(record.generation.as_str());
                 self.begin_node_lease_write(pending, CasGuard::Match(record.etag), effects);
             }
             Ok(None) => self.begin_node_lease_write(pending, CasGuard::Absent, effects),
@@ -1993,9 +1748,9 @@ impl State {
         }
         match result {
             Ok(LeaseCasOutcome::Applied { etag }) => {
-                let mut record = pending.desired;
+                let mut record = pending.desired.clone();
                 record.etag = etag;
-                self.hold_node_lease(pending.spec, record, pending.prior, now_mono_ms, effects);
+                self.complete_node_lease_write(pending, record, now_mono_ms, effects);
             }
             Ok(LeaseCasOutcome::Rejected) if pending.prior.is_some() => {
                 self.release_or_fence_node_lease(pending.prior.expect("checked above"), effects);
@@ -2046,11 +1801,15 @@ impl State {
                 // finish -- so abandoning one would mean declaring a runtime
                 // gone while it may still be running. That needs a decision,
                 // not a timer.
+                // A restore is a sequence of individually bounded object-store
+                // requests. Its total duration scales with the replica. The
+                // shell cannot cancel the task, so retiring the core op would
+                // discard late success and let another request duplicate it.
+                Effect::Restore { .. } => None,
                 Effect::ReadOwner { op, .. }
                 | Effect::ReadNodeLease { op, .. }
                 | Effect::ReadCapacityPeers { op, .. }
                 | Effect::CasOwner { op, .. }
-                | Effect::Restore { op, .. }
                 | Effect::StartRuntime { op, .. }
                 | Effect::Publish { op, .. }
                 | Effect::EnsureDurable { op, .. }
@@ -2070,7 +1829,6 @@ impl State {
         }
     }
 
-
     /// An activation effect outlived its deadline.
     ///
     /// Expiry deliberately reuses each stage's own failure handling rather
@@ -2085,42 +1843,36 @@ impl State {
     /// timed-out compare-and-swap definite would let a second attempt
     /// overwrite an epoch that had in fact been applied.
     fn expire_operation(&mut self, op: OpId, now_ms: u64, effects: &mut Vec<Effect>) {
-        // A firing alarm is tracked on the cell rather than in its phase, so
-        // it is looked for first. Expiry re-arms it exactly as a failed
-        // handler would, which keeps alarms at-least-once instead of turning
-        // a stuck handler into a lost one.
-        if self.cells.values().any(|cell| {
-            matches!(cell.alarm, Some(AlarmState::Firing { op: current, .. }) if current == op)
-        }) {
-            let now_mono_ms = self.now_mono_ms;
-            self.alarm_finished(op, now_ms, now_mono_ms, Err(Failure::Ambiguous), effects);
-            return;
-        }
-        // A gated write is tracked in `gated_writes`, not a cell phase, so it
-        // is resolved here before the phase scan. Ambiguous is the only safe
-        // class: the write may or may not be durable, so the client must not be
-        // told it succeeded.
+        // A gated write is tracked in `gated_writes`, not the op index.
+        // Ambiguous is the only safe class: the write may or may not be
+        // durable, so the client must not be told it succeeded.
         if self.gated_writes.contains_key(&op) {
             self.durable_reached(op, Err(Failure::Ambiguous), effects);
             return;
         }
-        let Some(id) = self.find_cell(|phase| match phase {
-            Phase::ReadingOwner { op: current }
-            | Phase::ReadingNodeLease { op: current, .. }
-            | Phase::ReadingCapacity { op: current, .. }
-            | Phase::Acquiring { op: current, .. }
-            | Phase::ReconcilingAcquire { op: current, .. }
-            | Phase::Restoring { op: current, .. }
-            | Phase::Starting { op: current, .. }
-            | Phase::Publishing { op: current, .. }
-            | Phase::EnsuringDurability { op: current, .. } => *current == op,
-            _ => false,
-        }) else {
+        // A peek, not a take: each arm below re-enters the op's own
+        // completion handler, and that handler consumes the index entry.
+        let Some(id) = self.cell_ops.get(&op).cloned() else {
             // Already answered, superseded, or fenced. A stale deadline has
             // nothing to expire, which is the ordinary case.
             return;
         };
-        let phase = self.cells.get(&id).map(|cell| cell.phase.clone());
+        let Some(cell) = self.cells.get(&id) else {
+            return;
+        };
+        // A firing alarm is tracked on the cell rather than in its phase, so
+        // it is looked for first. Expiry re-arms it exactly as a failed
+        // handler would, which keeps alarms at-least-once instead of turning
+        // a stuck handler into a lost one.
+        if matches!(cell.alarm, Some(AlarmState::Firing { op: current, .. }) if current == op) {
+            let now_mono_ms = self.now_mono_ms;
+            self.alarm_finished(op, now_ms, now_mono_ms, Err(Failure::Ambiguous), effects);
+            return;
+        }
+        if phase_op(&cell.phase) != Some(op) {
+            return;
+        }
+        let phase = Some(cell.phase.clone());
         match phase {
             Some(Phase::ReadingOwner { .. }) => {
                 self.owner_read(op, 0, Err(Failure::Definite), effects)
@@ -2134,9 +1886,10 @@ impl State {
             Some(Phase::Acquiring { .. }) | Some(Phase::ReconcilingAcquire { .. }) => {
                 self.owner_cas_completed(op, Err(Failure::Ambiguous), effects)
             }
-            Some(Phase::Restoring { .. }) => {
-                self.restore_completed(op, Err(Failure::Ambiguous), effects)
-            }
+            // A restore has no aggregate deadline. Each object-store request
+            // is bounded in the shell, and the complete task must retain its
+            // op so a late success cannot be discarded and duplicated.
+            Some(Phase::Restoring { .. }) => {}
             Some(Phase::Starting { .. }) => {
                 self.runtime_started(op, Err(Failure::Ambiguous), effects)
             }
@@ -2172,6 +1925,16 @@ impl State {
             }
             timer => timer,
         };
+        // A retry has no held lease to validate against, so it is resolved
+        // before the authority lookup below discards it.
+        if let NodeAuthority::Retrying { spec, generation } = &self.node_authority {
+            if matches!(timer, Timer::NodeLeaseRenew { generation: fired } if fired == *generation)
+            {
+                let spec = spec.clone();
+                self.begin_node_lease_acquisition(now_ms, spec, effects);
+            }
+            return;
+        }
         let active = match &self.node_authority {
             NodeAuthority::Held(held) => Some(held.clone()),
             NodeAuthority::Reading { pending, .. } | NodeAuthority::Writing { pending, .. } => {
@@ -2183,9 +1946,23 @@ impl State {
             return;
         };
         match timer {
+            // `>=`, not `>`: a peer stops treating the record as live the
+            // instant `now_ms` reaches `expires_ms`, so authority must end
+            // there too. Serving through that one millisecond overlaps a
+            // takeover that is already entitled to proceed.
             Timer::NodeLeaseFence { generation }
                 if generation == held.timer_generation
-                    && now_mono_ms.saturating_sub(held.last_ok_mono_ms) > held.spec.ttl_ms =>
+                    && now_mono_ms.saturating_sub(held.last_ok_mono_ms) >= held.spec.ttl_ms =>
+            {
+                self.release_or_fence_node_lease(held, effects);
+            }
+            // A renew timer that arrives after the lease it belongs to has
+            // already expired is not a renewal opportunity; authority is
+            // already gone. Fence rather than issue a write that could
+            // resurrect it behind a peer's in-flight takeover.
+            Timer::NodeLeaseRenew { generation }
+                if generation == held.timer_generation
+                    && now_mono_ms.saturating_sub(held.last_ok_mono_ms) >= held.spec.ttl_ms =>
             {
                 self.release_or_fence_node_lease(held, effects);
             }
@@ -2199,10 +1976,10 @@ impl State {
                     unreachable!("held checked above")
                 };
                 let idle_ms = prior
-                    .inactive_since_mono_ms
+                    .idle_since_mono_ms
                     .map_or(0, |inactive| now_mono_ms.saturating_sub(inactive));
                 let idle_long_enough =
-                    prior.inactive_since_mono_ms.is_some() && idle_ms >= prior.spec.linger_ms;
+                    prior.idle_since_mono_ms.is_some() && idle_ms >= prior.spec.linger_ms;
                 if prior.spec.mode == NodeLeaseMode::Shadow
                     && idle_long_enough
                     && !prior.shadow_release_reported
@@ -2211,7 +1988,7 @@ impl State {
                     prior.shadow_release_reported = true;
                 }
                 if prior.spec.mode == NodeLeaseMode::Lazy && idle_long_enough {
-                    self.node_authority = NodeAuthority::Inactive(prior.spec);
+                    self.node_authority = NodeAuthority::Lapsed(prior.spec);
                     effects.push(Effect::ObserveNodeLeaseReleased);
                     return;
                 }
@@ -2232,6 +2009,8 @@ impl State {
                         desired,
                         prior: Some(prior),
                         readback_only: false,
+                        anchor_mono_ms: now_mono_ms,
+                        resume_local: false,
                     },
                     guard,
                     effects,
@@ -2277,13 +2056,21 @@ impl State {
             self.cells.insert(id.to_string(), cell);
             return;
         }
-        if let Phase::EnsuringDurability { epoch, .. } = cell.phase {
-            cell.phase = Phase::Resident { epoch };
+        if let Phase::EnsuringDurability { op, epoch } = cell.phase {
+            self.cell_ops.remove(&op);
+            set_phase(&mut self.occupied, &mut cell, Phase::Resident { epoch });
         }
         let observed_before = match cell.alarm {
             Some(AlarmState::Armed { at_ms, .. }) | Some(AlarmState::Firing { at_ms, .. }) => at_ms,
             None => -1,
         };
+        // The assignment below replaces a firing alarm unconditionally. Its
+        // op entry is usually consumed already (`alarm_finished` routes
+        // through here), but a direct observation can land mid-fire, and the
+        // replaced op will then never match a lookup again.
+        if let Some(AlarmState::Firing { op, .. }) = cell.alarm {
+            self.cell_ops.remove(&op);
+        }
         cell.alarm = at_ms.filter(|at_ms| *at_ms >= 0).map(|at_ms| {
             let generation = self.next_timer_generation;
             self.next_timer_generation = self
@@ -2328,7 +2115,7 @@ impl State {
         if !self.node_authoritative() {
             if let Some(spec) = self.lazy_node_lease_spec() {
                 self.node_wake_waiters.insert(id.to_string());
-                if matches!(self.node_authority, NodeAuthority::Inactive(_)) {
+                if matches!(self.node_authority, NodeAuthority::Lapsed(_)) {
                     self.begin_node_lease_acquisition(now_ms, spec, effects);
                 }
                 effects.push(Effect::ScheduleTimer {
@@ -2364,8 +2151,9 @@ impl State {
         }
         let epoch = match cell.phase {
             Phase::Resident { epoch } => epoch,
-            Phase::EnsuringDurability { epoch, .. } => {
-                cell.phase = Phase::Resident { epoch };
+            Phase::EnsuringDurability { op, epoch } => {
+                self.cell_ops.remove(&op);
+                set_phase(&mut self.occupied, &mut cell, Phase::Resident { epoch });
                 epoch
             }
             Phase::Fenced => {
@@ -2373,7 +2161,7 @@ impl State {
                 self.cells.insert(id.to_string(), cell);
                 return;
             }
-            Phase::OwnedDormant { epoch } => {
+            Phase::Dormant { epoch } => {
                 cell.alarm_wake = true;
                 self.admit_or_queue_activation(
                     id,
@@ -2382,6 +2170,7 @@ impl State {
                         epoch,
                         fresh: false,
                         took_over: false,
+                        resume_local: false,
                     }),
                     effects,
                 );
@@ -2395,7 +2184,7 @@ impl State {
                 self.cells.insert(id.to_string(), cell);
                 return;
             }
-            Phase::Dormant => {
+            Phase::Inactive => {
                 cell.alarm_wake = true;
                 self.admit_or_queue_activation(id, &mut cell, ColdStart::ReadOwner, effects);
                 effects.push(Effect::ScheduleTimer {
@@ -2420,7 +2209,7 @@ impl State {
                 return;
             }
         };
-        let op = self.op();
+        let op = self.cell_op(id);
         cell.alarm = Some(AlarmState::Firing {
             op,
             at_ms,
@@ -2445,9 +2234,8 @@ impl State {
         result: Result<(Option<i64>, bool), Failure>,
         effects: &mut Vec<Effect>,
     ) {
-        let Some(id) = self.cells.iter().find_map(|(id, cell)| {
+        let Some(id) = self.take_cell_op(op, |cell| {
             matches!(cell.alarm, Some(AlarmState::Firing { op: current, .. }) if current == op)
-                .then(|| id.clone())
         }) else {
             return;
         };
@@ -2503,7 +2291,7 @@ impl State {
 
     fn lazy_node_lease_spec(&self) -> Option<NodeLeaseSpec> {
         match &self.node_authority {
-            NodeAuthority::Inactive(spec) if spec.mode == NodeLeaseMode::Lazy => Some(spec.clone()),
+            NodeAuthority::Lapsed(spec) if spec.mode == NodeLeaseMode::Lazy => Some(spec.clone()),
             NodeAuthority::Reading { pending, .. } | NodeAuthority::Writing { pending, .. }
                 if pending.prior.is_none() && pending.spec.mode == NodeLeaseMode::Lazy =>
             {
@@ -2542,7 +2330,7 @@ impl State {
         }
         if let Some(spec) = self.lazy_node_lease_spec() {
             self.node_lease_waiters.insert(request, id);
-            if matches!(self.node_authority, NodeAuthority::Inactive(_)) {
+            if matches!(self.node_authority, NodeAuthority::Lapsed(_)) {
                 self.begin_node_lease_acquisition(now_ms, spec, effects);
             }
         } else {
@@ -2570,16 +2358,17 @@ impl State {
             Phase::Resident { .. } => {
                 self.complete_request(&id, request, Ok(Route::Local), effects)
             }
-            Phase::EnsuringDurability { epoch, .. } => {
+            Phase::EnsuringDurability { op, epoch } => {
                 // The runtime is still published, so a new request wins the
                 // race with voluntary eviction. Retiring the operation makes
                 // its eventual durability completion harmless. The permit
                 // taken at nomination comes back with the rescue: leaked, it
-                // counts against `max_hibernations` forever and eventually
+                // counts against `max_evictions` forever and eventually
                 // stands every future eviction down.
                 let epoch = *epoch;
-                cell.phase = Phase::Resident { epoch };
-                self.hibernation_permits.remove(&id);
+                self.cell_ops.remove(op);
+                set_phase(&mut self.occupied, &mut cell, Phase::Resident { epoch });
+                self.eviction_permits.remove(&id);
                 self.complete_request(&id, request, Ok(Route::Local), effects);
             }
             Phase::Remote {
@@ -2605,7 +2394,7 @@ impl State {
                 cell.requests.insert(request);
                 self.request_cells.insert(request, id.clone());
                 match phase {
-                    Phase::Dormant => {
+                    Phase::Inactive => {
                         self.admit_or_queue_activation(
                             &id,
                             &mut cell,
@@ -2613,7 +2402,7 @@ impl State {
                             effects,
                         );
                     }
-                    Phase::OwnedDormant { epoch } => {
+                    Phase::Dormant { epoch } => {
                         let epoch = *epoch;
                         self.admit_or_queue_activation(
                             &id,
@@ -2622,6 +2411,7 @@ impl State {
                                 epoch,
                                 fresh: false,
                                 took_over: false,
+                                resume_local: false,
                             }),
                             effects,
                         );
@@ -2643,7 +2433,7 @@ impl State {
         }
         if let Some(spec) = self.lazy_node_lease_spec() {
             self.node_wake_waiters.insert(id);
-            if matches!(self.node_authority, NodeAuthority::Inactive(_)) {
+            if matches!(self.node_authority, NodeAuthority::Lapsed(_)) {
                 self.begin_node_lease_acquisition(now_ms, spec, effects);
             }
         }
@@ -2653,16 +2443,17 @@ impl State {
         let mut cell = self.cells.remove(&id).unwrap_or_default();
         cell.alarm_wake = true;
         match cell.phase {
-            Phase::Dormant | Phase::Remote { .. } => {
+            Phase::Inactive | Phase::Remote { .. } => {
                 self.admit_or_queue_activation(&id, &mut cell, ColdStart::ReadOwner, effects);
             }
-            Phase::OwnedDormant { epoch } => self.admit_or_queue_activation(
+            Phase::Dormant { epoch } => self.admit_or_queue_activation(
                 &id,
                 &mut cell,
                 ColdStart::Restore(RestoreSpec {
                     epoch,
                     fresh: false,
                     took_over: false,
+                    resume_local: false,
                 }),
                 effects,
             ),
@@ -2685,22 +2476,95 @@ impl State {
         cell.requests.remove(&request);
         if cell.requests.is_empty() && !cell.alarm_wake && cell.phase == Phase::WaitingActivation {
             let start = cell.waiting_activation.take();
-            cell.phase = match start {
-                Some(ColdStart::Restore(spec)) => Phase::OwnedDormant { epoch: spec.epoch },
-                _ => Phase::Dormant,
-            };
+            set_phase(
+                &mut self.occupied,
+                cell,
+                match start {
+                    Some(ColdStart::Restore(spec)) => Phase::Dormant { epoch: spec.epoch },
+                    _ => Phase::Inactive,
+                },
+            );
             self.activation_waiters.retain(|queued| queued != &id);
         } else if cell.requests.is_empty()
             && !cell.alarm_wake
             && cell.phase == Phase::WaitingCapacity
         {
             let activation = cell.waiting_for.take();
-            cell.phase = match activation {
-                Some(Activation::Restore(spec)) => Phase::OwnedDormant { epoch: spec.epoch },
-                _ => Phase::Dormant,
-            };
+            set_phase(
+                &mut self.occupied,
+                cell,
+                match activation {
+                    Some(Activation::Restore(spec)) => Phase::Dormant { epoch: spec.epoch },
+                    _ => Phase::Inactive,
+                },
+            );
             self.capacity_waiters.retain(|queued| queued != &id);
         }
+    }
+
+    /// Retire cold work that cannot contribute to a clean local reload.
+    ///
+    /// Published runtimes remain untouched. The shell drains their active
+    /// turns before it snapshots the resident inventory. A restore has no
+    /// runtime to preserve, and it can legitimately outlive every caller, so
+    /// waiting for it would make one cold cell disable local reuse for the
+    /// complete node. Retire those phases and fail their callers. A later
+    /// completion is ignored because its operation is no longer current.
+    fn begin_preserve(&mut self, effects: &mut Vec<Effect>) {
+        self.activation_waiters.clear();
+        self.capacity_waiters.clear();
+        for (request, _) in std::mem::take(&mut self.node_lease_waiters) {
+            effects.push(Effect::Complete {
+                request,
+                result: Err(RequestError::NodeFenced),
+            });
+        }
+        self.node_wake_waiters.clear();
+
+        let ids: Vec<CellId> = self.cells.keys().cloned().collect();
+        for id in ids {
+            let mut cell = self.cells.remove(&id).expect("id came from map");
+            let fallback = match &cell.phase {
+                Phase::WaitingActivation => match cell.waiting_activation.as_ref() {
+                    Some(ColdStart::Restore(spec)) => Some(Phase::Dormant { epoch: spec.epoch }),
+                    _ => Some(Phase::Inactive),
+                },
+                Phase::ReadingOwner { .. }
+                | Phase::ReadingNodeLease { .. }
+                | Phase::ReadingCapacity { .. }
+                | Phase::Acquiring { .. }
+                | Phase::ReconcilingAcquire { .. } => Some(Phase::Inactive),
+                Phase::WaitingCapacity => match cell.waiting_for.as_ref() {
+                    Some(Activation::Restore(spec)) => Some(Phase::Dormant { epoch: spec.epoch }),
+                    _ => Some(Phase::Inactive),
+                },
+                Phase::Restoring { spec, .. } => Some(Phase::Dormant { epoch: spec.epoch }),
+                _ => None,
+            };
+            if let Some(fallback) = fallback {
+                if let Some(stale) = phase_op(&cell.phase) {
+                    self.cell_ops.remove(&stale);
+                }
+                self.finish_requests(&id, &mut cell, Err(RequestError::NodeFenced), effects);
+                set_phase(&mut self.occupied, &mut cell, fallback);
+                cell.waiting_for = None;
+                cell.waiting_activation = None;
+                cell.alarm_wake = false;
+                cell.resume_demand = false;
+                self.resuming_cells.remove(&id);
+            }
+            self.cells.insert(id, cell);
+        }
+        if self.resuming_cells.is_empty() {
+            self.resuming = false;
+        }
+        self.activation_permits.retain(|id| {
+            self.cells
+                .get(id)
+                .is_some_and(|cell| phase_holds_activation(&cell.phase))
+        });
+        self.capacity_requests
+            .retain(|request| self.request_cells.contains_key(request));
     }
 
     fn begin_capacity_lookup(
@@ -2710,11 +2574,15 @@ impl State {
         claim: Claim,
         effects: &mut Vec<Effect>,
     ) {
-        let op = self.op();
-        cell.phase = Phase::ReadingCapacity {
-            op,
-            claim: claim.clone(),
-        };
+        let op = self.cell_op(id);
+        set_phase(
+            &mut self.occupied,
+            cell,
+            Phase::ReadingCapacity {
+                op,
+                claim: claim.clone(),
+            },
+        );
         effects.push(Effect::ReadCapacityPeers {
             op,
             cell: id.to_string(),
@@ -2766,14 +2634,13 @@ impl State {
         result: Result<Option<OwnerRecord>, Failure>,
         effects: &mut Vec<Effect>,
     ) {
-        let Some(id) = self.cells.iter().find_map(|(id, cell)| {
+        let Some(id) = self.take_cell_op(op, |cell| {
             matches!(
                 cell.phase,
                 Phase::ReadingOwner { op: current }
                     | Phase::ReconcilingAcquire { op: current, .. }
                     if current == op
             )
-            .then(|| id.clone())
         }) else {
             return;
         };
@@ -2804,6 +2671,7 @@ impl State {
                     took_over: reconciling_claim
                         .as_ref()
                         .is_some_and(|claim| claim.takeover),
+                    resume_local: false,
                 };
                 self.record_acquisition(&spec);
                 self.activate_or_wait(&id, &mut cell, Activation::Restore(spec), effects);
@@ -2854,11 +2722,15 @@ impl State {
                     );
                 } else {
                     self.node_lease_cache.remove(&owner);
-                    let next = self.op();
-                    cell.phase = Phase::ReadingNodeLease {
-                        op: next,
-                        owner: record,
-                    };
+                    let next = self.cell_op(&id);
+                    set_phase(
+                        &mut self.occupied,
+                        &mut cell,
+                        Phase::ReadingNodeLease {
+                            op: next,
+                            owner: record,
+                        },
+                    );
                     effects.push(Effect::ReadNodeLease {
                         op: next,
                         cell: id.clone(),
@@ -2880,7 +2752,7 @@ impl State {
                 );
             }
             Err(_) => {
-                cell.phase = Phase::Dormant;
+                set_phase(&mut self.occupied, &mut cell, Phase::Inactive);
                 self.finish_requests(&id, &mut cell, Err(RequestError::ResolveFailed), effects);
             }
         }
@@ -2897,9 +2769,9 @@ impl State {
         result: Result<Option<NodeLeaseRecord>, Failure>,
         effects: &mut Vec<Effect>,
     ) {
-        let Some(id) = self.find_cell(
-            |phase| matches!(phase, Phase::ReadingNodeLease { op: current, .. } if *current == op),
-        ) else {
+        let Some(id) = self.take_cell_op(op, |cell| {
+            matches!(cell.phase, Phase::ReadingNodeLease { op: current, .. } if current == op)
+        }) else {
             return;
         };
         let mut cell = self.cells.remove(&id).expect("cell found above");
@@ -2927,9 +2799,9 @@ impl State {
         result: Result<Vec<CapacityPeer>, Failure>,
         effects: &mut Vec<Effect>,
     ) {
-        let Some(id) = self.find_cell(
-            |phase| matches!(phase, Phase::ReadingCapacity { op: current, .. } if *current == op),
-        ) else {
+        let Some(id) = self.take_cell_op(op, |cell| {
+            matches!(cell.phase, Phase::ReadingCapacity { op: current, .. } if current == op)
+        }) else {
             return;
         };
         let mut cell = self.cells.remove(&id).expect("cell found above");
@@ -2996,13 +2868,17 @@ impl State {
                 .capacity_reservations
                 .entry(peer.node.clone())
                 .or_default() += 1;
-            cell.phase = Phase::Remote {
-                node: peer.node.clone(),
-                addr: peer.addr.clone(),
-                epoch: 0,
-                peer_protocol: peer.peer_protocol,
-                capacity_sampled_ms: Some(peer.sampled_ms),
-            };
+            set_phase(
+                &mut self.occupied,
+                &mut cell,
+                Phase::Remote {
+                    node: peer.node.clone(),
+                    addr: peer.addr.clone(),
+                    epoch: 0,
+                    peer_protocol: peer.peer_protocol,
+                    capacity_sampled_ms: Some(peer.sampled_ms),
+                },
+            );
             self.finish_requests(
                 &id,
                 &mut cell,
@@ -3036,7 +2912,7 @@ impl State {
                     && record.node.as_deref() == Some(lease.node.as_str())
                     && lease.peer_protocol != self.config.peer_protocol =>
             {
-                cell.phase = Phase::Dormant;
+                set_phase(&mut self.occupied, cell, Phase::Inactive);
                 self.finish_requests(id, cell, Err(RequestError::PeerIncompatible), effects);
             }
             Ok(Some(lease))
@@ -3048,13 +2924,17 @@ impl State {
                 let node = lease.node;
                 let addr = lease.addr;
                 let epoch = record.epoch;
-                cell.phase = Phase::Remote {
-                    node: node.clone(),
-                    addr: addr.clone(),
-                    epoch,
-                    peer_protocol: lease.peer_protocol,
-                    capacity_sampled_ms: None,
-                };
+                set_phase(
+                    &mut self.occupied,
+                    cell,
+                    Phase::Remote {
+                        node: node.clone(),
+                        addr: addr.clone(),
+                        epoch,
+                        peer_protocol: lease.peer_protocol,
+                        capacity_sampled_ms: None,
+                    },
+                );
                 self.finish_requests(
                     id,
                     cell,
@@ -3082,7 +2962,7 @@ impl State {
                 );
             }
             Err(_) => {
-                cell.phase = Phase::Dormant;
+                set_phase(&mut self.occupied, cell, Phase::Inactive);
                 self.finish_requests(id, cell, Err(RequestError::ResolveFailed), effects);
             }
         }
@@ -3094,8 +2974,9 @@ impl State {
         result: Result<CasOutcome, Failure>,
         effects: &mut Vec<Effect>,
     ) {
-        let Some(id) = self.find_cell(
-            |phase| matches!(phase, Phase::Acquiring { op: current, .. } if *current == op),
+        let Some(id) = self.take_cell_op(
+            op,
+            |cell| matches!(cell.phase, Phase::Acquiring { op: current, .. } if current == op),
         ) else {
             return;
         };
@@ -3106,17 +2987,22 @@ impl State {
         let claim = claim.clone();
         match result {
             Ok(CasOutcome::Applied) => {
-                let next = self.op();
+                let next = self.cell_op(&id);
                 let spec = RestoreSpec {
                     epoch: claim.epoch,
                     fresh: matches!(claim.guard, CasGuard::Absent),
                     took_over: claim.takeover,
+                    resume_local: false,
                 };
                 self.record_acquisition(&spec);
-                cell.phase = Phase::Restoring {
-                    op: next,
-                    spec: spec.clone(),
-                };
+                set_phase(
+                    &mut self.occupied,
+                    &mut cell,
+                    Phase::Restoring {
+                        op: next,
+                        spec: spec.clone(),
+                    },
+                );
                 effects.push(Effect::Restore {
                     op: next,
                     cell: id.clone(),
@@ -3124,20 +3010,28 @@ impl State {
                 });
             }
             Ok(CasOutcome::Rejected) => {
-                let next = self.op();
-                cell.phase = Phase::ReadingOwner { op: next };
+                let next = self.cell_op(&id);
+                set_phase(
+                    &mut self.occupied,
+                    &mut cell,
+                    Phase::ReadingOwner { op: next },
+                );
                 effects.push(Effect::ReadOwner {
                     op: next,
                     cell: id.clone(),
                 });
             }
             Err(Failure::Ambiguous) if claim.reconciles < MAX_ACQUIRE_RECONCILES => {
-                let next = self.op();
+                let next = self.cell_op(&id);
                 let claim = Claim {
                     reconciles: claim.reconciles + 1,
                     ..claim
                 };
-                cell.phase = Phase::ReconcilingAcquire { op: next, claim };
+                set_phase(
+                    &mut self.occupied,
+                    &mut cell,
+                    Phase::ReconcilingAcquire { op: next, claim },
+                );
                 effects.push(Effect::ReadOwner {
                     op: next,
                     cell: id.clone(),
@@ -3147,11 +3041,11 @@ impl State {
                 // Out of reconciles. The claim may or may not have applied, so
                 // this cell is left dormant for a later request to resolve
                 // from the record rather than guessed at here.
-                cell.phase = Phase::Dormant;
+                set_phase(&mut self.occupied, &mut cell, Phase::Inactive);
                 self.finish_requests(&id, &mut cell, Err(RequestError::AcquireFailed), effects);
             }
             Err(Failure::Definite) => {
-                cell.phase = Phase::Dormant;
+                set_phase(&mut self.occupied, &mut cell, Phase::Inactive);
                 self.finish_requests(&id, &mut cell, Err(RequestError::AcquireFailed), effects);
             }
         }
@@ -3165,16 +3059,18 @@ impl State {
         result: Result<RestoreOutcome, Failure>,
         effects: &mut Vec<Effect>,
     ) {
-        let Some(id) = self.find_cell(
-            |phase| matches!(phase, Phase::Restoring { op: current, .. } if *current == op),
+        let Some(id) = self.take_cell_op(
+            op,
+            |cell| matches!(cell.phase, Phase::Restoring { op: current, .. } if current == op),
         ) else {
             return;
         };
         let mut cell = self.cells.remove(&id).expect("cell found above");
-        let Phase::Restoring { spec, .. } = cell.phase else {
+        let Phase::Restoring { spec, .. } = &cell.phase else {
             unreachable!()
         };
         let epoch = spec.epoch;
+        let mut resume_failed = false;
         match result {
             Ok(outcome) => {
                 if outcome.restored {
@@ -3204,8 +3100,12 @@ impl State {
                         covered: alarm.covered,
                     });
                 }
-                let next = self.op();
-                cell.phase = Phase::Starting { op: next, epoch };
+                let next = self.cell_op(&id);
+                set_phase(
+                    &mut self.occupied,
+                    &mut cell,
+                    Phase::Starting { op: next, epoch },
+                );
                 effects.push(Effect::StartRuntime {
                     op: next,
                     cell: id.clone(),
@@ -3213,11 +3113,15 @@ impl State {
                 });
             }
             Err(_) => {
-                cell.phase = Phase::OwnedDormant { epoch };
+                set_phase(&mut self.occupied, &mut cell, Phase::Dormant { epoch });
                 self.finish_requests(&id, &mut cell, Err(RequestError::RestoreFailed), effects);
+                resume_failed = cell.resume_demand;
             }
         }
-        self.cells.insert(id, cell);
+        self.cells.insert(id.clone(), cell);
+        if resume_failed {
+            self.settle_local_resume(&id);
+        }
         self.pump_capacity(effects);
     }
 
@@ -3227,8 +3131,9 @@ impl State {
         result: Result<(), Failure>,
         effects: &mut Vec<Effect>,
     ) {
-        let Some(id) = self.find_cell(
-            |phase| matches!(phase, Phase::Starting { op: current, .. } if *current == op),
+        let Some(id) = self.take_cell_op(
+            op,
+            |cell| matches!(cell.phase, Phase::Starting { op: current, .. } if current == op),
         ) else {
             self.compensate_retired_runtime(op, result, effects);
             return;
@@ -3237,10 +3142,15 @@ impl State {
         let Phase::Starting { epoch, .. } = cell.phase else {
             unreachable!()
         };
+        let mut resume_failed = false;
         match result {
             Ok(()) => {
-                let next = self.op();
-                cell.phase = Phase::Publishing { op: next, epoch };
+                let next = self.cell_op(&id);
+                set_phase(
+                    &mut self.occupied,
+                    &mut cell,
+                    Phase::Publishing { op: next, epoch },
+                );
                 effects.push(Effect::Publish {
                     op: next,
                     cell: id.clone(),
@@ -3248,17 +3158,22 @@ impl State {
                 });
             }
             Err(_) => {
-                cell.phase = Phase::OwnedDormant { epoch };
+                set_phase(&mut self.occupied, &mut cell, Phase::Dormant { epoch });
                 self.finish_requests(&id, &mut cell, Err(RequestError::RuntimeFailed), effects);
+                resume_failed = cell.resume_demand;
             }
         }
-        self.cells.insert(id, cell);
+        self.cells.insert(id.clone(), cell);
+        if resume_failed {
+            self.settle_local_resume(&id);
+        }
         self.pump_capacity(effects);
     }
 
     fn published(&mut self, op: OpId, result: Result<(), Failure>, effects: &mut Vec<Effect>) {
-        let Some(id) = self.find_cell(
-            |phase| matches!(phase, Phase::Publishing { op: current, .. } if *current == op),
+        let Some(id) = self.take_cell_op(
+            op,
+            |cell| matches!(cell.phase, Phase::Publishing { op: current, .. } if current == op),
         ) else {
             self.compensate_retired_runtime(op, result, effects);
             return;
@@ -3267,18 +3182,23 @@ impl State {
         let Phase::Publishing { epoch, .. } = cell.phase else {
             unreachable!()
         };
+        let completing_resume = cell.resume_demand;
         match result {
             Ok(()) => {
-                cell.phase = Phase::Resident { epoch };
+                set_phase(&mut self.occupied, &mut cell, Phase::Resident { epoch });
                 self.finish_requests(&id, &mut cell, Ok(Route::Local), effects);
             }
             Err(_) => {
-                let next = self.op();
-                cell.phase = Phase::Cleaning {
-                    op: next,
-                    epoch,
-                    cause: StopCause::Cleanup,
-                };
+                let next = self.cell_op(&id);
+                set_phase(
+                    &mut self.occupied,
+                    &mut cell,
+                    Phase::Cleaning {
+                        op: next,
+                        epoch,
+                        cause: StopCause::Cleanup,
+                    },
+                );
                 effects.push(Effect::StopRuntime {
                     op: next,
                     cell: id.clone(),
@@ -3287,7 +3207,10 @@ impl State {
                 });
             }
         }
-        self.cells.insert(id, cell);
+        self.cells.insert(id.clone(), cell);
+        if completing_resume {
+            self.settle_local_resume(&id);
+        }
     }
 
     /// A release either published the cell as unowned or did not. Ownership
@@ -3295,12 +3218,7 @@ impl State {
     /// simply leaves the record naming this node -- correct, if less useful,
     /// and the next eviction gets another chance.
     fn owner_released(&mut self, op: OpId, result: Result<CasOutcome, Failure>) {
-        let Some(id) = self
-            .cells
-            .iter()
-            .find(|(_, cell)| cell.releasing == Some(op))
-            .map(|(id, _)| id.clone())
-        else {
+        let Some(id) = self.take_cell_op(op, |cell| cell.releasing == Some(op)) else {
             return;
         };
         let cell = self.cells.get_mut(&id).expect("cell found above");
@@ -3308,16 +3226,22 @@ impl State {
         // Only a cell still sitting where the eviction left it may be
         // forgotten. Anything else means it was wanted again while the write
         // was in flight, and that claim outranks a release decided earlier.
-        if matches!(result, Ok(CasOutcome::Applied))
-            && matches!(cell.phase, Phase::OwnedDormant { .. })
-        {
-            cell.phase = Phase::Dormant;
+        // On a draining node a rejection settles the cell too: the record no
+        // longer names this node at this epoch, so nothing here blocks a
+        // successor, and the pump must not re-read a record it can never
+        // blank. An indefinite failure stays `Dormant`, which is what makes
+        // the pump retry it while the drain window is open.
+        let settled = matches!(result, Ok(CasOutcome::Applied))
+            || (self.draining && matches!(result, Ok(CasOutcome::Rejected)));
+        if settled && matches!(cell.phase, Phase::Dormant { .. }) {
+            set_phase(&mut self.occupied, cell, Phase::Inactive);
         }
     }
 
     fn runtime_stopped(&mut self, op: OpId, effects: &mut Vec<Effect>) {
-        let Some(id) = self.find_cell(
-            |phase| matches!(phase, Phase::Cleaning { op: current, .. } if *current == op),
+        let Some(id) = self.take_cell_op(
+            op,
+            |cell| matches!(cell.phase, Phase::Cleaning { op: current, .. } if current == op),
         ) else {
             return;
         };
@@ -3327,18 +3251,37 @@ impl State {
         };
         match cause {
             StopCause::Cleanup => {
-                cell.phase = Phase::OwnedDormant { epoch };
+                set_phase(&mut self.occupied, &mut cell, Phase::Dormant { epoch });
                 self.finish_requests(&id, &mut cell, Err(RequestError::PublishFailed), effects);
             }
+            // `Inactive`, not `Dormant`: the next request re-reads the
+            // ownership record. A proof that could not be completed is exactly
+            // the moment to stop assuming this node still holds the cell, and
+            // the re-read costs one GET on a path that was already failing.
+            StopCause::Reset => {
+                set_phase(&mut self.occupied, &mut cell, Phase::Inactive);
+                if let Some(AlarmState::Firing { op, .. }) = cell.alarm {
+                    self.cell_ops.remove(&op);
+                }
+                cell.alarm = None;
+                cell.alarm_wake = false;
+                cell.websockets.clear();
+                self.finish_requests(
+                    &id,
+                    &mut cell,
+                    Err(RequestError::DurabilityUnproven),
+                    effects,
+                );
+            }
             StopCause::Evict { rebalance } if cell.requests.is_empty() => {
-                cell.phase = Phase::OwnedDormant { epoch };
-                self.hibernation_permits.remove(&id);
+                set_phase(&mut self.occupied, &mut cell, Phase::Dormant { epoch });
+                self.eviction_permits.remove(&id);
                 // The record still names this node, which is the whole cost of
                 // stopping here: every later request for the cell routes to a
                 // node that has already decided it has no room. Publishing it
                 // as unowned is what turns an eviction into shed load.
                 if rebalance {
-                    let op = self.op();
+                    let op = self.cell_op(&id);
                     cell.releasing = Some(op);
                     effects.push(Effect::ReleaseOwner {
                         op,
@@ -3350,7 +3293,7 @@ impl State {
             StopCause::Evict { .. } => {
                 // A request arrived mid-eviction, so the cell turns straight
                 // back around. The eviction is over either way.
-                self.hibernation_permits.remove(&id);
+                self.eviction_permits.remove(&id);
                 self.admit_or_queue_activation(
                     &id,
                     &mut cell,
@@ -3358,6 +3301,7 @@ impl State {
                         epoch,
                         fresh: false,
                         took_over: false,
+                        resume_local: false,
                     }),
                     effects,
                 );
@@ -3376,8 +3320,8 @@ impl State {
         effects: &mut Vec<Effect>,
     ) {
         let now = self.now_mono_ms;
-        let Some(id) = self.find_cell(|phase| {
-            matches!(phase, Phase::EnsuringDurability { op: current, .. } if *current == op)
+        let Some(id) = self.take_cell_op(op, |cell| {
+            matches!(cell.phase, Phase::EnsuringDurability { op: current, .. } if current == op)
         }) else {
             return;
         };
@@ -3387,14 +3331,21 @@ impl State {
         };
         match result {
             Ok(()) => {
+                // Minted inline: `cell` still borrows the map, and field
+                // accesses split where a method call cannot.
                 let stop = self.next_op;
                 self.next_op = self.next_op.checked_add(1).expect("operation id exhausted");
+                self.cell_ops.insert(stop, id.clone());
                 let rebalance = cell.evict_rebalance;
-                cell.phase = Phase::Cleaning {
-                    op: stop,
-                    epoch,
-                    cause: StopCause::Evict { rebalance },
-                };
+                set_phase(
+                    &mut self.occupied,
+                    cell,
+                    Phase::Cleaning {
+                        op: stop,
+                        epoch,
+                        cause: StopCause::Evict { rebalance },
+                    },
+                );
                 effects.push(Effect::StopRuntime {
                     op: stop,
                     cell: id,
@@ -3403,17 +3354,87 @@ impl State {
                 });
             }
             Err(_) => {
-                cell.phase = Phase::Resident { epoch };
-                cell.hibernation_refused_mono_ms = Some(now);
-                self.hibernation_permits.remove(&id);
+                set_phase(&mut self.occupied, cell, Phase::Resident { epoch });
+                cell.eviction_refused_mono_ms = Some(now);
+                self.eviction_permits.remove(&id);
             }
         }
     }
 
-    /// Evict on demand. Local, like an idle hibernation: the caller asked
+    /// Evict on demand. Local, like an idle eviction: the caller asked
     /// this node to drop the cell, not to give it away.
     fn evict(&mut self, id: &str, effects: &mut Vec<Effect>) {
         self.begin_eviction(id, false, effects);
+    }
+
+    /// Shutdown handoff: give every resident cell away by releasing its
+    /// owner record, so peers take over at once instead of waiting out the
+    /// node lease. `rebalance` is forced true, so this releases even when
+    /// `ownership_on_evict` keeps ownership on an ordinary evict.
+    ///
+    /// Only marks the node draining; `pump_release` does the work, at most
+    /// `max_releases` at a time. An unbounded walk here would start a
+    /// durability proof per resident cell at once -- a node holding
+    /// thousands turns its own shutdown into the restore storm the eviction
+    /// bound exists to prevent, and trips the `validate` ceiling besides.
+    fn release_all(&mut self, effects: &mut Vec<Effect>) {
+        self.draining = true;
+        self.pump_release(effects);
+    }
+
+    /// The drain pump, run after every event once draining: keep
+    /// `max_releases` handoffs in flight while any owned cell remains.
+    /// A cell that refuses eviction now -- active, or holding an uncovered
+    /// alarm -- is skipped and retried on a later pump, so an active cell
+    /// is handed off the moment its activity finishes. Releases in flight
+    /// count against the same ceiling as the proofs: the bound exists to
+    /// keep shutdown from flooding the store, and a release is one more
+    /// write in that flood.
+    fn pump_release(&mut self, effects: &mut Vec<Effect>) {
+        if !self.draining {
+            return;
+        }
+        let mut in_flight = self.eviction_permits.len() + self.releasing();
+        for id in self.residents() {
+            if in_flight >= self.config.max_releases {
+                return;
+            }
+            if self.begin_eviction(&id, true, effects) {
+                in_flight += 1;
+            }
+        }
+        // A cell evicted before the drain kept its record on this node --
+        // a sticky eviction, hibernation, or a release whose write failed
+        // -- so a later request could resume locally. On a leaving node
+        // that record only makes a successor wait out the node lease. The
+        // runtime is already stopped, so the drain releases the record
+        // directly.
+        let dormant: Vec<(CellId, Epoch)> = self
+            .cells
+            .iter()
+            .filter_map(|(id, cell)| match cell.phase {
+                Phase::Dormant { epoch }
+                    if cell.releasing.is_none() && cell.requests.is_empty() =>
+                {
+                    Some((id.clone(), epoch))
+                }
+                _ => None,
+            })
+            .collect();
+        for (id, epoch) in dormant {
+            if in_flight >= self.config.max_releases {
+                return;
+            }
+            let op = self.cell_op(&id);
+            let cell = self.cells.get_mut(&id).expect("dormant cell listed above");
+            cell.releasing = Some(op);
+            effects.push(Effect::ReleaseOwner {
+                op,
+                cell: id,
+                epoch,
+            });
+            in_flight += 1;
+        }
     }
 
     /// Does an eviction made for room hand the cell away?
@@ -3422,7 +3443,7 @@ impl State {
     }
 
     fn begin_eviction(&mut self, id: &str, rebalance: bool, effects: &mut Vec<Effect>) -> bool {
-        // An alarm about to fire is not worth a hibernation: the wake costs
+        // An alarm about to fire is not worth an eviction: the wake costs
         // more than the residency it would save, so the cell is held even
         // though its entry is perfectly durable. Coverage says the alarm can
         // survive the eviction; this says it is not worth surviving it.
@@ -3439,7 +3460,7 @@ impl State {
         // most of the node and pin it at its ceiling -- trading a real
         // admission failure for a saved activation. Under pressure the node
         // takes the wake.
-        if alarm_is_imminent && !self.shedding {
+        if alarm_is_imminent && !self.shedding && !self.draining {
             return false;
         }
         let alarm_is_safe = self.cells.get(id).is_some_and(|cell| {
@@ -3447,20 +3468,24 @@ impl State {
                 .as_ref()
                 .is_none_or(|alarm| matches!(alarm, AlarmState::Armed { covered: true, .. }))
         });
-        if self.is_active(id) || !alarm_is_safe {
+        if !self.is_hibernatable(id) || !alarm_is_safe {
             return false;
         }
         let Some(Phase::Resident { epoch }) = self.cells.get(id).map(|cell| &cell.phase) else {
             return false;
         };
         let epoch = *epoch;
-        let op = self.op();
+        let op = self.cell_op(id);
         let Some(cell) = self.cells.get_mut(id) else {
             return false;
         };
         cell.evict_rebalance = rebalance;
-        cell.phase = Phase::EnsuringDurability { op, epoch };
-        self.hibernation_permits.insert(id.to_string());
+        set_phase(
+            &mut self.occupied,
+            cell,
+            Phase::EnsuringDurability { op, epoch },
+        );
+        self.eviction_permits.insert(id.to_string());
         effects.push(Effect::EnsureDurable {
             op,
             cell: id.to_string(),
@@ -3483,8 +3508,8 @@ impl State {
         // those triggers into another victim. Spend the cut on commit, never
         // on nomination.
         if self.shedding
-            || self.capacity_waiters.len() <= self.hibernation_permits.len()
-            || self.hibernation_permits.len() >= self.config.max_hibernations
+            || self.capacity_waiters.len() <= self.eviction_permits.len()
+            || self.eviction_permits.len() >= self.config.max_evictions
         {
             return;
         }
@@ -3501,11 +3526,10 @@ impl State {
         self.cells
             .iter()
             .filter(|(id, cell)| {
-                matches!(cell.phase, Phase::Resident { .. })
+                self.is_hibernatable(id)
                     && cell.alarm.as_ref().is_none_or(|alarm| {
                         matches!(alarm, AlarmState::Armed { covered: true, .. })
                     })
-                    && !self.is_active(id)
             })
             // Cells that have never been refused first, then by how long ago
             // the refusal was, then least recently used, with the id as a
@@ -3514,7 +3538,7 @@ impl State {
             // just stops being the answer every time.
             .min_by_key(|(id, cell)| {
                 (
-                    cell.hibernation_refused_mono_ms,
+                    cell.eviction_refused_mono_ms,
                     cell.last_used_mono_ms,
                     (*id).clone(),
                 )
@@ -3542,7 +3566,7 @@ impl State {
             .get(&candidate)
             .is_some_and(|cell| now_mono_ms.saturating_sub(cell.last_used_mono_ms) >= idle_ms);
         if cold {
-            // Idle hibernation is a local residency decision, not a handoff.
+            // Idle eviction is a local residency decision, not a handoff.
             self.begin_eviction(&candidate, false, effects);
         }
     }
@@ -3555,14 +3579,9 @@ impl State {
     /// until every configured low watermark clears, so the node walks down to
     /// its target instead of oscillating around its ceiling.
     fn load_sampled(&mut self, load: pressure::Load, now_mono_ms: u64, effects: &mut Vec<Effect>) {
-        let state = self.config.pressure.state(load, self.shedding);
-        self.shedding = state.shedding;
-        self.shed_reason = self
-            .config
-            .pressure
-            .shedding_trigger(load, state.shedding)
-            .or(state.trigger);
-        if !state.shedding {
+        self.shedding = self.config.pressure.shedding(load, self.shedding);
+        self.shed_reason = self.shedding.then_some("rss");
+        if !self.shedding {
             // Relieved. Whatever was queued for capacity may proceed.
             self.shed_cut_rss = None;
             self.pump_capacity(effects);
@@ -3581,8 +3600,7 @@ impl State {
         // never be admitted. A
         // sample that moves either way re-arms the walk down.
         if let Some(cut_rss) = self.shed_cut_rss {
-            let cut_landed =
-                self.occupied() <= self.shed_floor && self.hibernation_permits.is_empty();
+            let cut_landed = self.occupied() <= self.shed_floor && self.eviction_permits.is_empty();
             let flat = load.rss_bytes.abs_diff(cut_rss) <= cut_rss / 20;
             if cut_landed && flat {
                 return;
@@ -3590,8 +3608,8 @@ impl State {
         }
         // How far this resource sample asks the node to come down: a proportion
         // of what was just measured, because the effect of an eviction on RSS
-        // or CPU is not visible until the next sample.
-        self.shed_floor = self.config.pressure.release_target(load.resident_cells);
+        // is not visible until the next sample.
+        self.shed_floor = pressure::PressureConfig::release_target(load.resident_cells);
         self.shed_cut_rss = Some(load.rss_bytes);
         self.shed_toward_floor(effects);
     }
@@ -3619,11 +3637,8 @@ impl State {
         // and the node settles below its floor by up to the whole bound --
         // the mistake celld's eviction budget documents: spend the cut on
         // commit, never on nomination.
-        while self.hibernation_permits.len() < self.config.max_hibernations
-            && self
-                .occupied()
-                .saturating_sub(self.hibernation_permits.len())
-                > self.shed_floor
+        while self.eviction_permits.len() < self.config.max_evictions
+            && self.occupied().saturating_sub(self.eviction_permits.len()) > self.shed_floor
         {
             let Some(victim) = self.shed_candidate() else {
                 return;
@@ -3646,7 +3661,7 @@ impl State {
             self.gate_pinned.insert(request);
             return;
         }
-        if let Some(id) = self.active_requests.remove(&request) {
+        if let Some(id) = self.deactivate_request(request) {
             let now = self.now_mono_ms;
             if let Some(cell) = self.cells.get_mut(&id) {
                 cell.last_used_mono_ms = now;
@@ -3707,9 +3722,11 @@ impl State {
         let Some(gate) = self.gated_writes.remove(&op) else {
             return;
         };
-        let result = match result {
-            Ok(durable) if durable >= gate.position => Ok(()),
-            _ => Err(RequestError::DurabilityUnproven),
+        let proven = matches!(result, Ok(durable) if durable >= gate.position);
+        let result = if proven {
+            Ok(())
+        } else {
+            Err(RequestError::DurabilityUnproven)
         };
         // Unpin before releasing: the cleanup this ends -- shedding, eviction --
         // is queued ahead of the response, so a caller that sees its write
@@ -3722,6 +3739,86 @@ impl State {
         effects.push(Effect::ReleaseResponse {
             request: gate.request,
             result,
+        });
+        if !proven {
+            let (id, epoch) = (gate.cell.clone(), gate.epoch);
+            self.reset_cell(&id, epoch, effects);
+        }
+    }
+
+    /// Discard a runtime whose durability could not be proved.
+    ///
+    /// The caller has been told its write failed. If the cell stays resident,
+    /// the very next read is served from the same unreplicated memory and
+    /// returns that write anyway -- the node disagreeing with what it just
+    /// told a client. Stopping with [`StopCause::Reset`] keeps no local
+    /// snapshot, so the next activation restores from the bucket.
+    ///
+    /// Note this is a stop, not a truncation. The restored database is not
+    /// invalidated by a failed proof; only this node's unreplicated additions
+    /// to it are in doubt, and re-reading durable state is how they are
+    /// discarded.
+    fn reset_cell(&mut self, id: &str, epoch: Epoch, effects: &mut Vec<Effect>) {
+        if !matches!(
+            self.cells.get(id).map(|cell| &cell.phase),
+            Some(Phase::Resident { epoch: current }) if *current == epoch
+        ) {
+            return;
+        }
+        // Every other write still on the gate for this cell loses its runtime
+        // here, so none of them may be acknowledged either.
+        let doomed: Vec<OpId> = self
+            .gated_writes
+            .iter()
+            .filter(|(_, gate)| gate.cell == id && gate.epoch == epoch)
+            .map(|(op, _)| *op)
+            .collect();
+        for op in doomed {
+            let Some(gate) = self.gated_writes.remove(&op) else {
+                continue;
+            };
+            self.gate_pinned.remove(&gate.request);
+            effects.push(Effect::ReleaseResponse {
+                request: gate.request,
+                result: Err(RequestError::DurabilityUnproven),
+            });
+        }
+        // Requests already running against this runtime lose it here, exactly
+        // as a fence does. Leaving them in `active_requests` would leave the
+        // core believing a stopped cell is still serving, which its own
+        // invariant catches.
+        let running: Vec<RequestId> = self
+            .active_requests
+            .iter()
+            .filter(|(_, cell)| cell.as_str() == id)
+            .map(|(request, _)| *request)
+            .collect();
+        for request in running {
+            self.deactivate_request(request);
+            self.gate_pinned.remove(&request);
+        }
+        let op = self.cell_op(id);
+        if let Some(cell) = self.cells.get_mut(id) {
+            // The phase being replaced may hold an op that will now never
+            // complete against it; its index entry must not outlive it.
+            if let Some(stale) = phase_op(&cell.phase) {
+                self.cell_ops.remove(&stale);
+            }
+            set_phase(
+                &mut self.occupied,
+                cell,
+                Phase::Cleaning {
+                    op,
+                    epoch,
+                    cause: StopCause::Reset,
+                },
+            );
+        }
+        effects.push(Effect::StopRuntime {
+            op,
+            cell: id.to_string(),
+            epoch,
+            cause: StopCause::Reset,
         });
     }
 
@@ -3819,7 +3916,7 @@ impl State {
                 ..
             } if current == node && *current_epoch == epoch
         ) {
-            cell.phase = Phase::Dormant;
+            set_phase(&mut self.occupied, cell, Phase::Inactive);
         }
     }
 
@@ -3832,6 +3929,7 @@ impl State {
         self.activation_permits.clear();
         self.capacity_waiters.clear();
         self.active_requests.clear();
+        self.active_cells.clear();
         // Any write still waiting on the output gate loses its cell here, so it
         // must fail rather than be acknowledged — the fence and the fail are
         // atomic. A late DurableReached for a drained op is ignored.
@@ -3868,7 +3966,17 @@ impl State {
                 });
             }
             self.finish_requests(&id, &mut cell, Err(RequestError::NodeFenced), effects);
-            cell.phase = Phase::Fenced;
+            // The phase and alarm die here without completing; their ops can
+            // never match a lookup again. The release op survives on purpose:
+            // `owner_released` still consumes it after a fence, as it did
+            // when resolution was a scan.
+            if let Some(stale) = phase_op(&cell.phase) {
+                self.cell_ops.remove(&stale);
+            }
+            if let Some(AlarmState::Firing { op, .. }) = cell.alarm {
+                self.cell_ops.remove(&op);
+            }
+            set_phase(&mut self.occupied, &mut cell, Phase::Fenced);
             cell.waiting_for = None;
             cell.waiting_activation = None;
             cell.alarm = None;
@@ -3876,12 +3984,6 @@ impl State {
             cell.websockets.clear();
             self.cells.insert(id, cell);
         }
-    }
-
-    fn find_cell(&self, predicate: impl Fn(&Phase) -> bool) -> Option<CellId> {
-        self.cells
-            .iter()
-            .find_map(|(id, cell)| predicate(&cell.phase).then(|| id.clone()))
     }
 
     fn compensate_retired_runtime(
@@ -3963,6 +4065,7 @@ pub fn on_event(state: &mut State, event: Event) -> Vec<Effect> {
             now_mono_ms,
             result,
         } => state.node_lease_cas_completed(op, now_mono_ms, result, &mut effects),
+        Event::LocalCellsRead { result } => state.local_cells_read(result, &mut effects),
         Event::TimerFired {
             timer,
             now_ms,
@@ -3982,6 +4085,7 @@ pub fn on_event(state: &mut State, event: Event) -> Vec<Effect> {
             ..
         } => state.request(request, cell, now_ms, true, &mut effects),
         Event::WorkerRequest { request } => state.worker_request(request, &mut effects),
+        Event::BeginPreserve => state.begin_preserve(&mut effects),
         Event::Cancel { request } => state.cancel(request),
         Event::ActivityFinished { request } => state.activity_finished(request, &mut effects),
         Event::Wrote { request, position } => state.wrote(request, position, &mut effects),
@@ -4037,8 +4141,10 @@ pub fn on_event(state: &mut State, event: Event) -> Vec<Effect> {
             state.invalidate_remote(&cell, &node, epoch)
         }
         Event::NodeFenced => state.fence_node(&mut effects),
+        Event::ReleaseAll => state.release_all(&mut effects),
     }
     state.pump_activations(&mut effects);
+    state.pump_release(&mut effects);
     state.update_node_lease_dependencies(state.now_mono_ms);
     if cfg!(debug_assertions) {
         state.validate().expect("state invariant");
@@ -4102,6 +4208,38 @@ fn phase_depends_on_node_lease(phase: &Phase) -> bool {
             | Phase::Cleaning { .. }
             | Phase::Resident { .. }
     )
+}
+
+/// The one gate every phase change passes through: it keeps `occupied`
+/// equal to the number of cells in a capacity-occupying phase, so nothing
+/// ever has to count them. `validate` asserts the equality by walking.
+fn set_phase(occupied: &mut usize, cell: &mut Cell, phase: Phase) {
+    match (
+        phase_occupies_capacity(&cell.phase),
+        phase_occupies_capacity(&phase),
+    ) {
+        (false, true) => *occupied += 1,
+        (true, false) => *occupied -= 1,
+        _ => {}
+    }
+    cell.phase = phase;
+}
+
+/// The in-flight operation a phase is waiting on, if it is waiting on one.
+fn phase_op(phase: &Phase) -> Option<OpId> {
+    match phase {
+        Phase::ReadingOwner { op }
+        | Phase::ReadingNodeLease { op, .. }
+        | Phase::ReadingCapacity { op, .. }
+        | Phase::Acquiring { op, .. }
+        | Phase::ReconcilingAcquire { op, .. }
+        | Phase::Restoring { op, .. }
+        | Phase::Starting { op, .. }
+        | Phase::Publishing { op, .. }
+        | Phase::EnsuringDurability { op, .. }
+        | Phase::Cleaning { op, .. } => Some(*op),
+        _ => None,
+    }
 }
 
 fn runtime_epoch(phase: &Phase) -> Option<Epoch> {
