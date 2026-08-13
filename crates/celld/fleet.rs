@@ -295,14 +295,13 @@ pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
             .filter(|value| !value.trim().is_empty())
     };
     if options.bucket.is_none() {
-        options.bucket =
-            env("CELLD_BUCKET").map(|value| value.trim_start_matches("s3://").to_string());
+        options.bucket = env("CELLD_BUCKET");
     }
-    if options.endpoint.is_none() {
-        options.endpoint = env("S3_ENDPOINT");
+    if let Some(bucket) = options.bucket.as_ref() {
+        options.endpoint = crate::bucket::endpoint_for_spec(bucket, options.endpoint.take())?;
     }
     if !options.dry_run && options.bucket.is_none() {
-        bail!("celld deploy requires --bucket s3://NAME or gs://NAME (or CELLD_BUCKET)");
+        bail!("celld deploy requires --bucket s3://NAME, gs://NAME, or az://CONTAINER (or CELLD_BUCKET)");
     }
     let built = deploy::build(&options)?;
     built.report();

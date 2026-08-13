@@ -55,20 +55,19 @@ pub struct Options {
 }
 
 pub fn print_help() {
-    println!(
-        "celld deploy — build a Worker with esbuild and write it to the fleet bucket\n\n\
-USAGE:\n  celld deploy [PROJECT] --bucket [s3://|gs://]NAME[/PREFIX] [OPTIONS]\n\n\
+    println!("{}", help_text());
+}
+
+fn help_text() -> &'static str {
+    "celld deploy — build a Worker with esbuild and write it to the fleet bucket\n\n\
+USAGE:\n  celld deploy [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]\n\n\
 PROJECT is a directory or a Wrangler config; it defaults to the working\n\
 directory, where celld looks for wrangler.jsonc or wrangler.json.\n\n\
-OPTIONS:\n  --config PATH          Same as passing PROJECT positionally\n  --bucket [s3://|gs://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLD_BUCKET.\n                         gs:// selects a Google Cloud Storage bucket; celld\n                         then rejects --endpoint and ignores --region\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --dry-run              Bundle and print the version without writing\n  -h, --help             Show this help\n\n\
-Credentials come from the standard AWS credential chain, or from Google\n\
-Application Default Credentials for a gs:// bucket.\n\n\
-Worker projects require `esbuild` on PATH; asset-only projects do not. Static\n\
-assets, service bindings, and string vars are supported. Routes are not; use\n\
-Wrangler for route configuration.\n\
+OPTIONS:\n  --config PATH          Same as passing PROJECT positionally\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLD_BUCKET.\n                         gs:// uses Google Cloud Storage and rejects an\n                         endpoint; az:// uses Azure Blob Storage. Both ignore\n                         --region\n  --endpoint URL         Selected-provider endpoint: S3 defaults to\n                         S3_ENDPOINT; Azure defaults to AZURE_STORAGE_ENDPOINT\n  --region REGION        S3 storage region; defaults to AWS_REGION\n  --dry-run              Bundle and print the version without writing\n  -h, --help             Show this help\n\n\
+Credentials: S3 uses the standard AWS chain; gs:// uses Google Application\n+Default Credentials. az:// requires AZURE_STORAGE_ACCOUNT_NAME and\n+CELLD_AZURE_AUTH=account-key with AZURE_STORAGE_ACCOUNT_KEY, or sas with\n+AZURE_STORAGE_SAS_KEY. AZURE_STORAGE_USE_EMULATOR=1 selects Azurite (using\n+AZURITE_BLOB_STORAGE_URL); it rejects --endpoint, AZURE_STORAGE_ENDPOINT, and\n+CELLD_AZURE_AUTH.\n\n\
+Worker projects require `esbuild` on PATH; asset-only projects do not. Static\n+assets, service bindings, and string vars are supported. Routes are not; use\n+Wrangler for route configuration.\n\
 Nodes load a deployment at startup, so an existing node keeps serving the old\n\
 version until it restarts."
-    );
 }
 
 pub fn options_from_arguments(
@@ -93,7 +92,7 @@ pub fn options_from_arguments(
             }
             "--bucket" => {
                 let value = arguments.next().context("--bucket requires a value")?;
-                options.bucket = Some(value.trim_start_matches("s3://").to_string());
+                options.bucket = Some(value);
             }
             "--endpoint" => {
                 options.endpoint = Some(arguments.next().context("--endpoint requires a value")?);
@@ -109,6 +108,34 @@ pub fn options_from_arguments(
         }
     }
     Ok(Some(options))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn explicit_bucket_schemes_are_preserved_for_shared_parsing() {
+        for bucket in [
+            "s3://fleet/deployments",
+            "gs://fleet/deployments",
+            "az://fleet/deployments",
+        ] {
+            let options = super::options_from_arguments(["--bucket".to_string(), bucket.into()])
+                .expect("valid deploy options")
+                .expect("not help");
+            assert_eq!(options.bucket.as_deref(), Some(bucket));
+        }
+    }
+
+    #[test]
+    fn help_describes_each_supported_bucket_provider() {
+        let help = super::help_text();
+        assert!(help.contains("[s3://|gs://|az://]NAME[/PREFIX]"));
+        assert!(help.contains("S3_ENDPOINT; Azure defaults to AZURE_STORAGE_ENDPOINT"));
+        assert!(help.contains("AZURE_STORAGE_ACCOUNT_NAME"));
+        assert!(help.contains("CELLD_AZURE_AUTH=account-key"));
+        assert!(help.contains("AZURE_STORAGE_USE_EMULATOR=1"));
+        assert!(help.contains("AZURITE_BLOB_STORAGE_URL"));
+    }
 }
 
 /// What a config resolves to once the allowlist has been applied.

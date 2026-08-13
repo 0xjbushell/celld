@@ -118,14 +118,12 @@ type CellHandle = Arc<Cell>;
 pub struct LtxRepl {
     /// Local root: cell dbs live at `watch/<cell>/ltx/e<epoch>/db.sqlite`.
     watch: PathBuf,
-    bucket: String,
     /// The bucket spec's key prefix: empty, or slash-terminated.
     prefix: String,
-    endpoint: Option<String>,
-    region: String,
-    credentials: Option<StorageCredentials>,
     /// One connection pool for the whole node, shared by every cell client.
     store: Arc<dyn ObjectStore>,
+    /// Provider-specific metadata and bucket settings shared by each cell.
+    config: ObjectStoreConfig,
     cells: Arc<Mutex<HashMap<(String, u64), CellHandle>>>,
     /// Woken when a cell's `committed` advances, so the background loop syncs
     /// without polling; a slow tick backstops any missed notification.
@@ -148,12 +146,9 @@ impl LtxRepl {
         tokio::spawn(sync_loop(cells.clone(), dirty.clone(), slots));
         Self {
             watch: watch.to_path_buf(),
-            bucket: "test".into(),
             prefix: String::new(),
-            endpoint: None,
-            region: "auto".into(),
-            credentials: None,
             store,
+            config: ObjectStoreConfig::default(),
             cells,
             dirty,
             restore_slots: Arc::new(Semaphore::new(RESTORE_DOWNLOAD_CONCURRENCY)),
@@ -181,12 +176,9 @@ impl LtxRepl {
         let queue = start_compaction_loop(config);
         Self {
             watch: watch.to_path_buf(),
-            bucket: "test".into(),
             prefix: String::new(),
-            endpoint: None,
-            region: "auto".into(),
-            credentials: None,
             store,
+            config: ObjectStoreConfig::default(),
             cells,
             dirty,
             restore_slots: Arc::new(Semaphore::new(RESTORE_DOWNLOAD_CONCURRENCY)),
@@ -207,13 +199,28 @@ impl LtxRepl {
         let compaction = compaction_config_from_env()?;
         // Everything downstream of the store is backend-agnostic already,
         // so the dialect decides construction and nothing else.
-        let store = match backend {
-            crate::bucket::StorageBackend::Gcs => crate::bucket::gcs_replica_store(&bucket)?,
+        let config = match backend {
             crate::bucket::StorageBackend::S3 => {
                 node_config(&bucket, endpoint.as_deref(), &region, credentials.as_ref())
-                    .build_store()
-                    .map_err(|error| anyhow!("build shared object store: {error}"))?
             }
+            crate::bucket::StorageBackend::Gcs => ObjectStoreConfig {
+                bucket: bucket.clone(),
+                ..Default::default()
+            },
+            crate::bucket::StorageBackend::Azure => ObjectStoreConfig {
+                bucket: bucket.clone(),
+                timestamp_metadata_key: "litestream_timestamp".to_string(),
+                ..Default::default()
+            },
+        };
+        let store = match backend {
+            crate::bucket::StorageBackend::Gcs => crate::bucket::gcs_replica_store(&bucket)?,
+            crate::bucket::StorageBackend::Azure => {
+                crate::bucket::azure_replica_store(&bucket, endpoint.as_deref())?
+            }
+            crate::bucket::StorageBackend::S3 => config
+                .build_store()
+                .map_err(|error| anyhow!("build shared object store: {error}"))?,
         };
         let cells: Arc<Mutex<HashMap<(String, u64), CellHandle>>> = Arc::default();
         let dirty = Arc::new(Notify::new());
@@ -224,12 +231,9 @@ impl LtxRepl {
         let compaction_queue = compaction.map(start_compaction_loop);
         Ok(Self {
             watch: watch.to_path_buf(),
-            bucket,
             prefix,
-            endpoint,
-            region,
-            credentials,
             store,
+            config,
             cells,
             dirty,
             restore_slots: Arc::new(Semaphore::new(RESTORE_DOWNLOAD_CONCURRENCY)),
@@ -250,12 +254,7 @@ impl LtxRepl {
     /// prefix. `cells/<cell>/ltx/e<epoch>` matches [`Self::db_path`]'s remote
     /// twin so the same coordinates address local and replica state.
     fn client_for(&self, cell: &str, epoch: u64) -> ObjectStoreClient {
-        let mut config = node_config(
-            &self.bucket,
-            self.endpoint.as_deref(),
-            &self.region,
-            self.credentials.as_ref(),
-        );
+        let mut config = self.config.clone();
         config.path = format!("{}cells/{cell}/ltx/e{epoch}", self.prefix);
         ObjectStoreClient::with_store(config, self.store.clone())
     }

@@ -27,6 +27,7 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::aws::S3ConditionalPut;
+use object_store::azure::MicrosoftAzureBuilder;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::path::Path;
 use object_store::Attribute;
@@ -47,6 +48,7 @@ use std::time::Duration;
 
 /// Explicit credentials for a managed installation; everything else comes
 /// from the standard `AWS_*` environment.
+#[derive(Clone)]
 pub struct StaticCredentials {
     pub access_key_id: String,
     pub secret_access_key: String,
@@ -61,6 +63,7 @@ pub struct StaticCredentials {
 pub(crate) enum StorageBackend {
     S3,
     Gcs,
+    Azure,
 }
 
 impl StorageBackend {
@@ -68,6 +71,7 @@ impl StorageBackend {
         match self {
             StorageBackend::S3 => "s3",
             StorageBackend::Gcs => "gs",
+            StorageBackend::Azure => "az",
         }
     }
 
@@ -77,7 +81,7 @@ impl StorageBackend {
     /// conditional write would send as a real precondition.
     fn token(self, e_tag: Option<String>, version: Option<String>) -> anyhow::Result<String> {
         let (token, header) = match self {
-            StorageBackend::S3 => (e_tag, "ETag"),
+            StorageBackend::S3 | StorageBackend::Azure => (e_tag, "ETag"),
             StorageBackend::Gcs => (version, "x-goog-generation"),
         };
         match token {
@@ -91,7 +95,7 @@ impl StorageBackend {
     /// The precondition a conditional update sends for a held token.
     fn update(self, token: &str) -> UpdateVersion {
         match self {
-            StorageBackend::S3 => UpdateVersion {
+            StorageBackend::S3 | StorageBackend::Azure => UpdateVersion {
                 e_tag: Some(token.to_string()),
                 version: None,
             },
@@ -123,7 +127,7 @@ pub struct Bucket {
     pub prefix: String,
 }
 
-/// Split a `[s3://|gs://]NAME[/PREFIX]` bucket spec into the backend, the
+/// Split a `[s3://|gs://|az://]NAME[/PREFIX]` bucket spec into the backend, the
 /// bucket name and a normalized key prefix: empty, or slash-terminated. A
 /// spec without a scheme stays S3-compatible, and a spec without a PREFIX
 /// keeps every key at the bucket root, so a fleet provisioned before
@@ -131,7 +135,10 @@ pub struct Bucket {
 fn split_spec(spec: &str) -> (StorageBackend, &str, String) {
     let (backend, spec) = match spec.strip_prefix("gs://") {
         Some(rest) => (StorageBackend::Gcs, rest),
-        None => (StorageBackend::S3, spec.trim_start_matches("s3://")),
+        None => match spec.strip_prefix("az://") {
+            Some(rest) => (StorageBackend::Azure, rest),
+            None => (StorageBackend::S3, spec.trim_start_matches("s3://")),
+        },
     };
     let (name, prefix) = spec.split_once('/').unwrap_or((spec, ""));
     let parts = prefix.split('/').filter(|part| !part.is_empty());
@@ -142,8 +149,166 @@ fn split_spec(spec: &str) -> (StorageBackend, &str, String) {
     )
 }
 
+fn nonempty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn parse_sas_authorization(sas: &str) -> anyhow::Result<Vec<(String, String)>> {
+    let sas = sas.strip_prefix('?').unwrap_or(sas);
+    if sas.is_empty() {
+        anyhow::bail!("AZURE_STORAGE_SAS_KEY must contain query pairs");
+    }
+    sas.split('&')
+        .map(|pair| {
+            let (key, value) = pair
+                .split_once('=')
+                .ok_or_else(|| anyhow!("invalid SAS query pair: {pair:?}"))?;
+            if key.is_empty() {
+                anyhow::bail!("invalid SAS query pair with an empty key");
+            }
+            Ok((decode_sas_component(key)?, decode_sas_component(value)?))
+        })
+        .collect()
+}
+
+fn decode_sas_component(component: &str) -> anyhow::Result<String> {
+    let bytes = component.as_bytes();
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte == b'%'
+            && (index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit())
+        {
+            anyhow::bail!("invalid percent encoding in SAS query pair");
+        }
+    }
+    percent_encoding::percent_decode_str(component)
+        .decode_utf8()
+        .map(Cow::into_owned)
+        .map_err(|error| anyhow!("invalid UTF-8 in SAS query pair: {error}"))
+}
+
+#[derive(Debug)]
+enum AzureAuth {
+    Emulator,
+    AccountKey(String),
+    Sas(String),
+}
+
+#[derive(Debug)]
+struct AzureConfig {
+    account: Option<String>,
+    endpoint: Option<String>,
+    auth: AzureAuth,
+}
+
+/// Resolve Azure's selected configuration without allowing environment values
+/// from another provider or authorization mode to become implicit fallbacks.
+fn resolve_azure_config(
+    explicit_endpoint: Option<&str>,
+    get: impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<AzureConfig> {
+    let nonempty = |name| get(name).filter(|value| !value.trim().is_empty());
+    if nonempty("S3_ENDPOINT").is_some() {
+        anyhow::bail!(
+            "an az:// bucket cannot use S3_ENDPOINT; unset S3_ENDPOINT and use AZURE_STORAGE_ENDPOINT"
+        );
+    }
+
+    let emulator = match get("AZURE_STORAGE_USE_EMULATOR") {
+        Some(value) if value == "1" => true,
+        Some(value) if value == "0" || value.trim().is_empty() => false,
+        Some(_) => anyhow::bail!("AZURE_STORAGE_USE_EMULATOR accepts only 0 or 1"),
+        None => false,
+    };
+    let configured_endpoint = nonempty("AZURE_STORAGE_ENDPOINT");
+    if emulator {
+        if explicit_endpoint.is_some() || configured_endpoint.is_some() {
+            anyhow::bail!(
+                "Azurite ignores --endpoint and AZURE_STORAGE_ENDPOINT; use AZURITE_BLOB_STORAGE_URL"
+            );
+        }
+        if nonempty("CELLD_AZURE_AUTH").is_some() {
+            anyhow::bail!("CELLD_AZURE_AUTH must be unset when AZURE_STORAGE_USE_EMULATOR=1");
+        }
+        return Ok(AzureConfig {
+            account: nonempty("AZURE_STORAGE_ACCOUNT_NAME"),
+            endpoint: None,
+            auth: AzureAuth::Emulator,
+        });
+    }
+
+    let account = nonempty("AZURE_STORAGE_ACCOUNT_NAME")
+        .ok_or_else(|| anyhow!("AZURE_STORAGE_ACCOUNT_NAME is required for an az:// bucket"))?;
+    let auth = nonempty("CELLD_AZURE_AUTH")
+        .ok_or_else(|| anyhow!("CELLD_AZURE_AUTH is required for an az:// bucket"))?;
+    let auth = match auth.as_str() {
+        "account-key" => AzureAuth::AccountKey(nonempty("AZURE_STORAGE_ACCOUNT_KEY").ok_or_else(
+            || anyhow!("AZURE_STORAGE_ACCOUNT_KEY is required when CELLD_AZURE_AUTH=account-key"),
+        )?),
+        "sas" => AzureAuth::Sas(nonempty("AZURE_STORAGE_SAS_KEY").ok_or_else(|| {
+            anyhow!("AZURE_STORAGE_SAS_KEY is required when CELLD_AZURE_AUTH=sas")
+        })?),
+        "managed-identity" | "workload-identity" | "client-secret" | "developer-tools" => {
+            anyhow::bail!(
+                "CELLD_AZURE_AUTH={auth} is not supported in this build; use account-key or sas"
+            )
+        }
+        _ => anyhow::bail!(
+            "CELLD_AZURE_AUTH must be account-key or sas (identity modes are not supported in this build)"
+        ),
+    };
+    Ok(AzureConfig {
+        account: Some(account),
+        endpoint: explicit_endpoint
+            .map(ToOwned::to_owned)
+            .or(configured_endpoint),
+        auth,
+    })
+}
+
+/// Resolve the provider-owned endpoint environment after the shared parser has
+/// selected a backend. An explicit CLI endpoint wins only for that provider.
+pub fn endpoint_for_spec(spec: &str, explicit: Option<String>) -> anyhow::Result<Option<String>> {
+    match split_spec(spec).0 {
+        StorageBackend::S3 => Ok(explicit.or_else(|| nonempty_env("S3_ENDPOINT"))),
+        StorageBackend::Gcs => Ok(explicit.or_else(|| nonempty_env("S3_ENDPOINT"))),
+        StorageBackend::Azure => {
+            if nonempty_env("S3_ENDPOINT").is_some() {
+                anyhow::bail!(
+                    "an az:// bucket cannot use S3_ENDPOINT; unset S3_ENDPOINT and use AZURE_STORAGE_ENDPOINT"
+                );
+            }
+            Ok(explicit.or_else(|| nonempty_env("AZURE_STORAGE_ENDPOINT")))
+        }
+    }
+}
+
+/// Normalize an explicit control-plane bucket after the shared parser has
+/// selected its provider. The managed service owns a whole S3 bucket; it
+/// cannot issue credentials for another provider or for a key prefix.
+pub fn control_plane_bucket(spec: &str) -> anyhow::Result<String> {
+    let (backend, name, prefix) = split_spec(spec);
+    if backend != StorageBackend::S3 {
+        anyhow::bail!(
+            "--control-plane storage is S3-compatible; {}:// storage is unsupported. Run without --control-plane.",
+            backend.scheme()
+        );
+    }
+    if !prefix.is_empty() {
+        anyhow::bail!("--control-plane does not accept a --bucket prefix");
+    }
+    Ok(name.to_string())
+}
+
+pub fn scheme_for_spec(spec: &str) -> &'static str {
+    split_spec(spec).0.scheme()
+}
+
 impl Bucket {
-    /// `bucket` is `[s3://|gs://]NAME[/PREFIX]`. With a PREFIX every key
+    /// `bucket` is `[s3://|gs://|az://]NAME[/PREFIX]`. With a PREFIX every key
     /// this client reads or writes lives under `PREFIX/`, so several
     /// fleets can share one bucket without colliding.
     ///
@@ -275,6 +440,19 @@ impl Bucket {
                     Arc::new(cas_builder.build().context("build gcs cas client")?),
                 )
             }
+            StorageBackend::Azure => {
+                if credentials.is_some() {
+                    anyhow::bail!(
+                        "an az:// bucket cannot use S3 static credentials; configure CELLD_AZURE_AUTH"
+                    );
+                }
+                let builder = Self::azure_builder(bucket, endpoint, retry, options)?;
+                let cas_builder = builder.clone().with_retry(cas_retry);
+                (
+                    Arc::new(builder.build().context("build azure client")?),
+                    Arc::new(cas_builder.build().context("build azure cas client")?),
+                )
+            }
         };
         Ok(Bucket {
             store,
@@ -283,6 +461,45 @@ impl Bucket {
             name: bucket.to_string(),
             prefix,
         })
+    }
+
+    fn azure_builder(
+        container: &str,
+        endpoint: Option<&str>,
+        retry: RetryConfig,
+        options: ClientOptions,
+    ) -> anyhow::Result<MicrosoftAzureBuilder> {
+        let config = resolve_azure_config(endpoint, |name| std::env::var(name).ok())?;
+        match config.auth {
+            AzureAuth::Emulator => {
+                let mut builder = MicrosoftAzureBuilder::new()
+                    .with_container_name(container)
+                    .with_use_emulator(true)
+                    .with_retry(retry)
+                    .with_client_options(options);
+                if let Some(account) = config.account {
+                    builder = builder.with_account(account);
+                }
+                Ok(builder)
+            }
+            auth => {
+                let mut builder = MicrosoftAzureBuilder::new()
+                    .with_account(config.account.expect("production Azure account"))
+                    .with_container_name(container)
+                    .with_retry(retry)
+                    .with_client_options(options);
+                if let Some(endpoint) = config.endpoint {
+                    builder = builder.with_endpoint(endpoint).with_allow_http(true);
+                }
+                match auth {
+                    AzureAuth::AccountKey(key) => Ok(builder.with_access_key(key)),
+                    AzureAuth::Sas(sas) => {
+                        Ok(builder.with_sas_authorization(parse_sas_authorization(&sas)?))
+                    }
+                    AzureAuth::Emulator => unreachable!("emulator matched above"),
+                }
+            }
+        }
     }
 
     /// The bucket's URL scheme, `s3` or `gs`, for operator-facing
@@ -551,6 +768,24 @@ pub(crate) fn gcs_replica_store(bucket: &str) -> anyhow::Result<Arc<dyn ObjectSt
     gcs_replica_store_with_builder(GoogleCloudStorageBuilder::from_env(), bucket)
 }
 
+/// The replica-lane store for an `az://` fleet bucket. It is deliberately
+/// separate from the control-plane store so ordinary LTX puts retain retries.
+pub(crate) fn azure_replica_store(
+    bucket: &str,
+    endpoint: Option<&str>,
+) -> anyhow::Result<Arc<dyn ObjectStore>> {
+    Ok(Arc::new(
+        Bucket::azure_builder(
+            bucket,
+            endpoint,
+            RetryConfig::default(),
+            ClientOptions::new().with_allow_http(true),
+        )?
+        .build()
+        .context("build azure replica store")?,
+    ))
+}
+
 /// The body of [`gcs_replica_store`], taking the base builder for the same
 /// reason [`Bucket::open_with_gcs_builder`] does.
 fn gcs_replica_store_with_builder(
@@ -586,7 +821,7 @@ pub fn is_unauthorized(error: &anyhow::Error) -> bool {
 mod live_cas {
     use super::{Bucket, StaticCredentials};
 
-    // Live CAS contract against a real bucket (R2 or GCS). Gated on
+    // Live CAS contract against a real bucket (R2, GCS, or Azure). Gated on
     // CELLD_CAS_LIVE=1 so it never runs in CI; a mock cannot answer whether
     // object_store maps the provider's precondition failures to Ok(None)
     // (the fencing contract) rather than Err. Run:
@@ -594,6 +829,11 @@ mod live_cas {
     //     cargo test -p celld put_cas_contract -- --nocapture
     // or against GCS (Application Default Credentials, no endpoint):
     //   CELLD_CAS_LIVE=1 CELLD_CAS_BUCKET=gs://<b> \
+    //     cargo test -p celld put_cas_contract -- --nocapture
+    // or Azure (account-key/SAS, or Azurite):
+    //   CELLD_CAS_LIVE=1 CELLD_CAS_BUCKET=az://<container> \
+    //     CELLD_AZURE_AUTH=account-key AZURE_STORAGE_ACCOUNT_NAME=... \
+    //     AZURE_STORAGE_ACCOUNT_KEY=... \
     //     cargo test -p celld put_cas_contract -- --nocapture
     #[tokio::test]
     async fn put_cas_contract_against_real_bucket() {
@@ -603,46 +843,61 @@ mod live_cas {
         let name = std::env::var("CELLD_CAS_BUCKET").expect("CELLD_CAS_BUCKET");
         let endpoint = std::env::var("CELLD_CAS_ENDPOINT").ok();
         let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "auto".into());
-        let creds = std::env::var("AWS_ACCESS_KEY_ID")
-            .ok()
-            .map(|access_key_id| StaticCredentials {
-                access_key_id,
-                secret_access_key: std::env::var("AWS_SECRET_ACCESS_KEY")
-                    .expect("AWS_SECRET_ACCESS_KEY"),
-                session_token: std::env::var("AWS_SESSION_TOKEN").ok(),
-            });
-        let bucket = Bucket::open(&name, endpoint.as_deref(), &region, creds, Some("cas-test"))
-            .expect("open bucket");
+        let creds = (!name.starts_with("gs://") && !name.starts_with("az://"))
+            .then(|| {
+                std::env::var("AWS_ACCESS_KEY_ID")
+                    .ok()
+                    .map(|access_key_id| StaticCredentials {
+                        access_key_id,
+                        secret_access_key: std::env::var("AWS_SECRET_ACCESS_KEY")
+                            .expect("AWS_SECRET_ACCESS_KEY"),
+                        session_token: std::env::var("AWS_SESSION_TOKEN").ok(),
+                    })
+            })
+            .flatten();
+        let bucket = Bucket::open(
+            &name,
+            endpoint.as_deref(),
+            &region,
+            creds.clone(),
+            Some("cas-test-a"),
+        )
+        .expect("open first bucket client");
+        let contender = Bucket::open(
+            &name,
+            endpoint.as_deref(),
+            &region,
+            creds,
+            Some("cas-test-b"),
+        )
+        .expect("open independently constructed contender client");
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let key = format!("cas-probe/{nanos}");
 
-        // 1. Create on an absent key applies.
-        let e1 = bucket
-            .put_cas(&key, b"v1".to_vec(), None)
-            .await
-            .expect("create must not error")
-            .expect("fresh create must apply (Ok(Some))");
-        // 2. Create over an existing key is cleanly rejected.
-        assert!(
-            bucket
-                .put_cas(&key, b"v1b".to_vec(), None)
-                .await
-                .expect("create-again must not error")
-                .is_none(),
-            "create over an existing key must be Ok(None)"
+        // Independently constructed clients race creation of the same absent key.
+        let (first, second) = tokio::join!(
+            bucket.put_cas(&key, b"v1".to_vec(), None),
+            contender.put_cas(&key, b"v1b".to_vec(), None),
         );
-        // 3. Update with the current etag applies.
-        bucket
+        let e1 = match (first, second) {
+            (Ok(Some(token)), Ok(None)) | (Ok(None), Ok(Some(token))) => token,
+            outcomes => panic!(
+                "concurrent creates must yield exactly one Ok(Some(token)) and one Ok(None), got {outcomes:?}"
+            ),
+        };
+        // Update with the winning token applies.
+        let e2 = bucket
             .put_cas(&key, b"v3".to_vec(), Some(&e1))
             .await
             .expect("update must not error")
             .expect("update with current etag must apply (Ok(Some))");
-        // 4. Update with the now-stale etag is cleanly rejected — the fencing case.
+        assert_ne!(e2, e1, "a current update must return a new CAS token");
+        // Update with the now-stale winning token is cleanly rejected — the fencing case.
         assert!(
-            bucket
+            contender
                 .put_cas(&key, b"v4".to_vec(), Some(&e1))
                 .await
                 .expect("stale update must not error")
@@ -650,11 +905,284 @@ mod live_cas {
             "update with a stale etag must be Ok(None) — the fencing contract"
         );
         bucket.delete(&key).await.expect("cleanup delete");
-        eprintln!("CAS verified on {name}: create / reject-create / update / reject-stale");
+        eprintln!("CAS verified on {name}: concurrent clients create / update / reject-stale");
+    }
+
+    #[tokio::test]
+    async fn azure_prefixes_are_isolated_against_real_container() {
+        if std::env::var("CELLD_CAS_LIVE").as_deref() != Ok("1") {
+            return;
+        }
+        let configured = std::env::var("CELLD_CAS_BUCKET").expect("CELLD_CAS_BUCKET");
+        let Some(container) = configured.strip_prefix("az://") else {
+            return;
+        };
+        let container = container.split('/').next().expect("Azure container");
+        let endpoint = std::env::var("CELLD_CAS_ENDPOINT").ok();
+        let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "auto".into());
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let first_spec = format!("az://{container}/celld-azure-prefix-a/{nanos}");
+        let second_spec = format!("az://{container}/celld-azure-prefix-b/{nanos}");
+        let first = Bucket::open(
+            &first_spec,
+            endpoint.as_deref(),
+            &region,
+            None,
+            Some("azure-prefix-a"),
+        )
+        .expect("open first Azure prefix");
+        let second = Bucket::open(
+            &second_spec,
+            endpoint.as_deref(),
+            &region,
+            None,
+            Some("azure-prefix-b"),
+        )
+        .expect("open second Azure prefix");
+        first
+            .put("only-first", b"first".to_vec())
+            .await
+            .expect("write first");
+        second
+            .put("only-second", b"second".to_vec())
+            .await
+            .expect("write second");
+
+        assert_eq!(
+            first
+                .list("")
+                .await
+                .expect("list first prefix")
+                .into_iter()
+                .map(|meta| meta.location.to_string())
+                .collect::<Vec<_>>(),
+            vec!["only-first"]
+        );
+        assert_eq!(
+            second
+                .list("")
+                .await
+                .expect("list second prefix")
+                .into_iter()
+                .map(|meta| meta.location.to_string())
+                .collect::<Vec<_>>(),
+            vec!["only-second"]
+        );
+        assert!(first
+            .get("only-second")
+            .await
+            .expect("read first prefix")
+            .is_none());
+        first
+            .delete("only-second")
+            .await
+            .expect("delete absent key in first prefix");
+        assert!(
+            second
+                .get("only-second")
+                .await
+                .expect("read second prefix")
+                .is_some(),
+            "one prefix must not mutate the other's object"
+        );
+
+        first
+            .delete("only-first")
+            .await
+            .expect("cleanup first prefix");
+        second
+            .delete("only-second")
+            .await
+            .expect("cleanup second prefix");
+        eprintln!("Azure prefix isolation verified on {container} with scoped cleanup");
     }
 }
 
 #[cfg(all(test, celld_internal_tests))]
 mod conformance_bucket_tests {
     include!(env!("CELLD_CONFORMANCE_BUCKET_TESTS"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        control_plane_bucket, parse_sas_authorization, resolve_azure_config, split_spec, AzureAuth,
+        StorageBackend,
+    };
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn azure_spec_selects_azure_and_normalizes_prefix() {
+        let (backend, container, prefix) = split_spec("az://fleet/a//nested/");
+
+        assert_eq!(backend, StorageBackend::Azure);
+        assert_eq!(container, "fleet");
+        assert_eq!(prefix, "a/nested/");
+    }
+
+    #[test]
+    fn bucket_schemes_remain_parseable() {
+        assert_eq!(super::scheme_for_spec("gs://fleet"), "gs");
+        assert_eq!(super::scheme_for_spec("az://container"), "az");
+    }
+
+    #[test]
+    fn control_plane_bucket_normalizes_only_unprefixed_s3_specs() {
+        assert_eq!(control_plane_bucket("fleet").unwrap(), "fleet");
+        assert_eq!(control_plane_bucket("s3://fleet").unwrap(), "fleet");
+        assert!(control_plane_bucket("s3://fleet/prefix").is_err());
+        assert!(control_plane_bucket("gs://fleet").is_err());
+        assert!(control_plane_bucket("az://container").is_err());
+    }
+
+    #[test]
+    fn sas_authorization_decodes_pairs_after_splitting_raw_query() {
+        assert_eq!(
+            parse_sas_authorization("?sv=2024-11-04&sig=one%26two%3Dthree").unwrap(),
+            vec![
+                ("sv".to_string(), "2024-11-04".to_string()),
+                ("sig".to_string(), "one&two=three".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn sas_authorization_rejects_malformed_pairs() {
+        assert!(parse_sas_authorization("sv=2024-11-04&sig").is_err());
+        assert!(parse_sas_authorization("sv=%ZZ").is_err());
+    }
+
+    #[test]
+    fn azure_etag_tokens_and_updates_fail_closed() {
+        assert_eq!(
+            StorageBackend::Azure
+                .token(Some("\"etag\"".into()), None)
+                .expect("Azure ETag is a CAS token"),
+            "\"etag\""
+        );
+        assert!(StorageBackend::Azure.token(None, None).is_err());
+        assert!(StorageBackend::Azure
+            .token(Some(String::new()), None)
+            .is_err());
+        assert!(StorageBackend::Azure
+            .token(None, Some("version".into()))
+            .is_err());
+
+        let update = StorageBackend::Azure.update("\"etag\"");
+        assert_eq!(update.e_tag.as_deref(), Some("\"etag\""));
+        assert_eq!(update.version, None);
+    }
+
+    #[test]
+    fn azure_configuration_resolves_selected_mode_without_environment_races() {
+        let resolve = |explicit: Option<&str>, values: &[(&str, &str)]| {
+            let values = values
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect::<BTreeMap<_, _>>();
+            resolve_azure_config(explicit, |name| values.get(name).cloned())
+        };
+
+        let config = resolve(
+            Some("http://cli.example"),
+            &[
+                ("AZURE_STORAGE_ACCOUNT_NAME", "account"),
+                ("AZURE_STORAGE_ENDPOINT", "http://environment.example"),
+                ("CELLD_AZURE_AUTH", "account-key"),
+                ("AZURE_STORAGE_ACCOUNT_KEY", "key"),
+            ],
+        )
+        .expect("explicit endpoint and account key configuration");
+        assert_eq!(config.endpoint.as_deref(), Some("http://cli.example"));
+        assert_eq!(config.account.as_deref(), Some("account"));
+        assert!(matches!(config.auth, AzureAuth::AccountKey(ref key) if key == "key"));
+
+        let err = resolve(
+            None,
+            &[
+                ("S3_ENDPOINT", "http://s3.example"),
+                ("AZURE_STORAGE_ACCOUNT_NAME", "account"),
+                ("CELLD_AZURE_AUTH", "account-key"),
+                ("AZURE_STORAGE_ACCOUNT_KEY", "key"),
+            ],
+        )
+        .expect_err("S3 endpoint must not leak into Azure");
+        assert!(err.to_string().contains("S3_ENDPOINT"));
+
+        let err = resolve(
+            Some("http://cli.example"),
+            &[("AZURE_STORAGE_USE_EMULATOR", "1")],
+        )
+        .expect_err("Azurite ignores CLI endpoints");
+        assert!(err.to_string().contains("Azurite ignores"));
+        let err = resolve(
+            None,
+            &[
+                ("AZURE_STORAGE_USE_EMULATOR", "1"),
+                ("CELLD_AZURE_AUTH", "sas"),
+            ],
+        )
+        .expect_err("Azurite must not select production auth");
+        assert!(err.to_string().contains("must be unset"));
+        let err = resolve(None, &[("AZURE_STORAGE_USE_EMULATOR", "yes")])
+            .expect_err("emulator flag must be binary");
+        assert!(err.to_string().contains("accepts only 0 or 1"));
+
+        let err =
+            resolve(None, &[("CELLD_AZURE_AUTH", "account-key")]).expect_err("account is required");
+        assert!(err.to_string().contains("AZURE_STORAGE_ACCOUNT_NAME"));
+        let err = resolve(
+            None,
+            &[
+                ("AZURE_STORAGE_ACCOUNT_NAME", "account"),
+                ("AZURE_STORAGE_ACCOUNT_KEY", "key"),
+            ],
+        )
+        .expect_err("auth mode is required");
+        assert!(err.to_string().contains("CELLD_AZURE_AUTH"));
+        let err = resolve(
+            None,
+            &[
+                ("AZURE_STORAGE_ACCOUNT_NAME", "account"),
+                ("CELLD_AZURE_AUTH", "account-key"),
+                ("AZURE_STORAGE_SAS_KEY", "unselected"),
+            ],
+        )
+        .expect_err("SAS must not satisfy account-key mode");
+        assert!(err.to_string().contains("AZURE_STORAGE_ACCOUNT_KEY"));
+        let err = resolve(
+            None,
+            &[
+                ("AZURE_STORAGE_ACCOUNT_NAME", "account"),
+                ("CELLD_AZURE_AUTH", "sas"),
+                ("AZURE_STORAGE_ACCOUNT_KEY", "unselected"),
+            ],
+        )
+        .expect_err("account key must not satisfy SAS mode");
+        assert!(err.to_string().contains("AZURE_STORAGE_SAS_KEY"));
+        let err = resolve(
+            None,
+            &[
+                ("AZURE_STORAGE_ACCOUNT_NAME", "account"),
+                ("CELLD_AZURE_AUTH", "managed-identity"),
+            ],
+        )
+        .expect_err("identity is explicitly deferred");
+        assert!(err.to_string().contains("not supported in this build"));
+
+        let err = resolve(
+            None,
+            &[
+                ("AZURE_STORAGE_ACCOUNT_NAME", "account"),
+                ("CELLD_AZURE_AUTH", "unknown-mode"),
+            ],
+        )
+        .expect_err("unknown authentication mode fails before I/O");
+        assert!(err
+            .to_string()
+            .contains("CELLD_AZURE_AUTH must be account-key or sas"));
+    }
 }

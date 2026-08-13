@@ -3940,6 +3940,15 @@ fn serve_http_connection(
 mod cli;
 use cli::{action_from_process, print_help, worker_loader_binding, Action};
 
+fn preflight_control_plane_bucket(settings: &mut cli::Settings) -> anyhow::Result<()> {
+    if settings.control_plane {
+        if let Some(bucket) = settings.bucket.as_deref() {
+            settings.bucket = Some(celld::bucket::control_plane_bucket(bucket)?);
+        }
+    }
+    Ok(())
+}
+
 /// An activation effect that has not answered by now is not going to help the
 /// request that is waiting on it. celld had no such bound and parked requests
 /// past ninety seconds.
@@ -4032,6 +4041,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             mut settings,
             peers,
         } => {
+            preflight_control_plane_bucket(&mut settings)?;
             let ingress = celld::startup::bind_ingress_listener(&settings.listen).await?;
             let internal =
                 celld::startup::bind_internal_listener(&celld::startup::InternalListenerSettings {
@@ -4086,7 +4096,10 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             )?;
             return fleet::diagnose(&client, peers, settings.unsafe_public_advertise).await;
         }
-        Action::Run(settings) => settings,
+        Action::Run(mut settings) => {
+            preflight_control_plane_bucket(&mut settings)?;
+            settings
+        }
     };
     celld::startup::raise_file_limit();
     let max_resident = celld::env_vars::optional("CELLD_MAX_RESIDENT_CELLS")?
@@ -4111,24 +4124,6 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     let internal_listener = internal.listener;
     let mut adapter_credential_version = None;
     let managed_storage = if settings.control_plane {
-        // The control plane issues and validates S3-compatible storage
-        // only; celld's GCS client authenticates with OAuth, which the
-        // control plane's S3-shaped credentials cannot provide.
-        if settings
-            .bucket
-            .as_deref()
-            .is_some_and(|b| b.starts_with("gs://"))
-        {
-            anyhow::bail!(
-                "--control-plane storage is S3-compatible; a gs:// bucket runs without it"
-            );
-        }
-        // The control plane issues one bucket per fleet and its enrollment
-        // API rejects a bucket name holding a slash, so a prefix has neither
-        // a purpose nor a path through. Say so instead of failing enrollment.
-        if settings.bucket.as_deref().is_some_and(|b| b.contains('/')) {
-            anyhow::bail!("--control-plane does not accept a --bucket prefix");
-        }
         let requested_byo =
             settings
                 .bucket
