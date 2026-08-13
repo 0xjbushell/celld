@@ -1101,5 +1101,6 @@ fn node_config(
         session_token,
         skip_verify: false,
         part_size: 0,
+        timestamp_metadata_key: "litestream-timestamp".to_string(),
     }
 }
