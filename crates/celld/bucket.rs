@@ -54,6 +54,22 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+fn ordinary_retry_config() -> RetryConfig {
+    RetryConfig {
+        max_retries: 2,
+        retry_timeout: Duration::from_secs(30),
+        ..RetryConfig::default()
+    }
+}
+
+fn cas_retry_config() -> RetryConfig {
+    RetryConfig {
+        max_retries: 0,
+        retry_timeout: Duration::from_secs(30),
+        ..RetryConfig::default()
+    }
+}
+
 /// Explicit credentials for a managed installation; everything else comes
 /// from the standard `AWS_*` environment.
 #[derive(Clone)]
@@ -112,6 +128,34 @@ impl StorageBackend {
                 version: Some(token.to_string()),
             },
         }
+    }
+
+    fn is_clean_cas_rejection(self, error: &Error, create: bool) -> bool {
+        if self != StorageBackend::Azure {
+            return matches!(
+                error,
+                Error::Precondition { .. } | Error::AlreadyExists { .. }
+            );
+        }
+        let source = match error {
+            Error::Precondition { source, .. } | Error::AlreadyExists { source, .. } => source,
+            _ => return false,
+        };
+        // object_store 0.11 classifies Azure errors by status and boxes its
+        // private retry error. The 4xx XML body, including Code, survives in
+        // that source's Display text; if it ever does not, fail ambiguous.
+        let text = source.to_string();
+        let Some(start) = text.find("<Code>") else {
+            return false;
+        };
+        let code = &text[start + "<Code>".len()..];
+        let Some(end) = code.find("</Code>") else {
+            return false;
+        };
+        matches!(
+            (create, &code[..end]),
+            (true, "BlobAlreadyExists" | "ConditionNotMet") | (false, "ConditionNotMet")
+        )
     }
 }
 
@@ -501,16 +545,8 @@ impl Bucket {
                     .context("app user agent")?,
             );
         }
-        let retry = RetryConfig {
-            max_retries: 2,
-            retry_timeout: Duration::from_secs(30),
-            ..RetryConfig::default()
-        };
-        let cas_retry = RetryConfig {
-            max_retries: 0,
-            retry_timeout: Duration::from_secs(30),
-            ..RetryConfig::default()
-        };
+        let retry = ordinary_retry_config();
+        let cas_retry = cas_retry_config();
         let (store, cas_store): (Arc<dyn ObjectStore>, Arc<dyn ObjectStore>) = match backend {
             StorageBackend::S3 => {
                 let mut builder = AmazonS3Builder::from_env()
@@ -822,7 +858,7 @@ impl Bucket {
                     })?;
                 Ok(Some(token))
             }
-            Err(Error::Precondition { .. } | Error::AlreadyExists { .. }) => Ok(None),
+            Err(error) if self.backend.is_clean_cas_rejection(&error, token.is_none()) => Ok(None),
             Err(error) => Err(anyhow!(error).context(format!(
                 "conditional write {}://{}/{key} may have committed",
                 self.scheme(),
@@ -1159,16 +1195,229 @@ mod conformance_bucket_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        control_plane_bucket, managed_identity_options, parse_sas_authorization,
-        resolve_azure_config, split_spec, AzureAuth, AzureConfig, AzureIdentityFactory,
-        AzureIdentityMode, Bucket, StorageBackend,
+        cas_retry_config, control_plane_bucket, managed_identity_options, ordinary_retry_config,
+        parse_sas_authorization, resolve_azure_config, split_spec, AzureAuth, AzureConfig,
+        AzureIdentityFactory, AzureIdentityMode, Bucket, StorageBackend,
     };
     use async_trait::async_trait;
     use azure_core::credentials::{AccessToken, TokenCredential, TokenRequestOptions};
     use azure_core::error::ErrorKind;
     use azure_identity::UserAssignedId;
+    use futures_util::stream::BoxStream;
+    use object_store::azure::MicrosoftAzureBuilder;
+    use object_store::memory::InMemory;
+    use object_store::path::Path;
+    use object_store::{
+        Error, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        PutMultipartOpts, PutOptions, PutPayload, PutResult,
+    };
     use std::collections::BTreeMap;
+    use std::fmt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Copy, Debug)]
+    enum InjectedPutFailure {
+        Generic,
+    }
+
+    #[derive(Debug)]
+    struct CountingPutStore {
+        inner: InMemory,
+        calls: AtomicUsize,
+        failure: Option<InjectedPutFailure>,
+    }
+
+    impl CountingPutStore {
+        fn new() -> Self {
+            Self {
+                inner: InMemory::new(),
+                calls: AtomicUsize::new(0),
+                failure: None,
+            }
+        }
+
+        fn failing(failure: InjectedPutFailure) -> Self {
+            Self {
+                failure: Some(failure),
+                ..Self::new()
+            }
+        }
+
+        async fn seed(&self, key: &str, body: &'static [u8]) -> PutResult {
+            self.inner
+                .put(&Path::from(key), body.into())
+                .await
+                .expect("seed object")
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl fmt::Display for CountingPutStore {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "CountingPutStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for CountingPutStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.failure {
+                Some(InjectedPutFailure::Generic) => Err(Error::Generic {
+                    store: "injected",
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "lost response",
+                    )),
+                }),
+                None => self.inner.put_opts(location, payload, opts).await,
+            }
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOpts,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn delete(&self, location: &Path) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    fn bucket_with_cas_store(backend: StorageBackend, cas_store: Arc<dyn ObjectStore>) -> Bucket {
+        Bucket {
+            store: Arc::new(InMemory::new()),
+            cas_store,
+            backend,
+            name: "container".into(),
+            prefix: String::new(),
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct AzureRequest {
+        path: String,
+        if_match: Option<String>,
+        if_none_match: Option<String>,
+    }
+
+    async fn azure_error_bucket() -> (
+        Bucket,
+        Arc<Mutex<Vec<AzureRequest>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local Azure endpoint");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local address"));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        let app = axum::Router::new().fallback(axum::routing::any(
+            move |request: axum::http::Request<axum::body::Body>| {
+                let recorded = recorded.clone();
+                async move {
+                    let header = |name| {
+                        request
+                            .headers()
+                            .get(name)
+                            .and_then(|value| value.to_str().ok())
+                            .map(ToOwned::to_owned)
+                    };
+                    let path = request.uri().path().to_string();
+                    recorded.lock().expect("request log").push(AzureRequest {
+                        path: path.clone(),
+                        if_match: header(axum::http::header::IF_MATCH),
+                        if_none_match: header(axum::http::header::IF_NONE_MATCH),
+                    });
+                    let (status, code) = match path.as_str() {
+                        "/container/clean-create" => {
+                            (axum::http::StatusCode::CONFLICT, "BlobAlreadyExists")
+                        }
+                        "/container/clean-update" => (
+                            axum::http::StatusCode::PRECONDITION_FAILED,
+                            "ConditionNotMet",
+                        ),
+                        "/container/ambiguous-conflict" => {
+                            (axum::http::StatusCode::CONFLICT, "ContainerBeingDeleted")
+                        }
+                        "/container/ambiguous-precondition" => (
+                            axum::http::StatusCode::PRECONDITION_FAILED,
+                            "LeaseIdMissing",
+                        ),
+                        path => panic!("unexpected Azure test path: {path}"),
+                    };
+                    (
+                        status,
+                        [(axum::http::header::CONTENT_TYPE, "application/xml")],
+                        format!(
+                            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+                             <Error><Code>{code}</Code><Message>injected</Message></Error>"
+                        ),
+                    )
+                }
+            },
+        ));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve local Azure endpoint");
+        });
+        let cas_store: Arc<dyn ObjectStore> = Arc::new(
+            MicrosoftAzureBuilder::new()
+                .with_account("account")
+                .with_container_name("container")
+                .with_endpoint(endpoint)
+                .with_allow_http(true)
+                .with_skip_signature(true)
+                .with_retry(cas_retry_config())
+                .build()
+                .expect("Azure CAS store"),
+        );
+        (
+            bucket_with_cas_store(StorageBackend::Azure, cas_store),
+            requests,
+            server,
+        )
+    }
 
     #[test]
     fn azure_spec_selects_azure_and_normalizes_prefix() {
@@ -1230,6 +1479,224 @@ mod tests {
         let update = StorageBackend::Azure.update("\"etag\"");
         assert_eq!(update.e_tag.as_deref(), Some("\"etag\""));
         assert_eq!(update.version, None);
+    }
+
+    #[tokio::test]
+    async fn put_cas_maps_already_exists_to_one_clean_rejection() {
+        let store = Arc::new(CountingPutStore::new());
+        store.seed("lease", b"current").await;
+        let bucket = bucket_with_cas_store(StorageBackend::S3, store.clone());
+
+        let result = bucket
+            .put_cas("lease", b"contender".to_vec(), None)
+            .await
+            .expect("an existing object is a clean CAS rejection");
+
+        assert_eq!(result, None);
+        assert_eq!(store.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn put_cas_maps_precondition_to_one_clean_rejection() {
+        let store = Arc::new(CountingPutStore::new());
+        let stale = store
+            .seed("lease", b"first")
+            .await
+            .e_tag
+            .expect("in-memory store ETag");
+        store.seed("lease", b"current").await;
+        let bucket = bucket_with_cas_store(StorageBackend::S3, store.clone());
+
+        let result = bucket
+            .put_cas("lease", b"contender".to_vec(), Some(&stale))
+            .await
+            .expect("a stale ETag is a clean CAS rejection");
+
+        assert_eq!(result, None);
+        assert_eq!(store.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn put_cas_surfaces_ambiguous_failure_after_one_attempt() {
+        let store = Arc::new(CountingPutStore::failing(InjectedPutFailure::Generic));
+        let bucket = bucket_with_cas_store(StorageBackend::Azure, store.clone());
+
+        let error = bucket
+            .put_cas("lease", b"candidate".to_vec(), None)
+            .await
+            .expect_err("a lost response is not a clean rejection");
+
+        assert!(error.to_string().contains("may have committed"));
+        assert_eq!(store.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn azure_cas_condition_service_codes_are_clean_one_request_rejections() {
+        let (bucket, requests, server) = azure_error_bucket().await;
+
+        assert_eq!(
+            bucket
+                .put_cas("clean-create", b"candidate".to_vec(), None)
+                .await
+                .expect("BlobAlreadyExists is a clean create rejection"),
+            None
+        );
+        assert_eq!(
+            bucket
+                .put_cas("clean-update", b"candidate".to_vec(), Some("\"etag\""))
+                .await
+                .expect("ConditionNotMet is a clean update rejection"),
+            None
+        );
+
+        assert_eq!(
+            *requests.lock().expect("request log"),
+            vec![
+                AzureRequest {
+                    path: "/container/clean-create".into(),
+                    if_match: None,
+                    if_none_match: Some("*".into()),
+                },
+                AzureRequest {
+                    path: "/container/clean-update".into(),
+                    if_match: Some("\"etag\"".into()),
+                    if_none_match: None,
+                },
+            ]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn azure_noncondition_409_and_412_remain_ambiguous_after_one_request() {
+        let (bucket, requests, server) = azure_error_bucket().await;
+
+        for (key, token) in [
+            ("ambiguous-conflict", None),
+            ("ambiguous-precondition", Some("\"etag\"")),
+        ] {
+            let error = bucket
+                .put_cas(key, b"candidate".to_vec(), token)
+                .await
+                .expect_err("noncondition Azure service error is ambiguous");
+            assert!(error.to_string().contains("may have committed"));
+        }
+
+        assert_eq!(
+            *requests.lock().expect("request log"),
+            vec![
+                AzureRequest {
+                    path: "/container/ambiguous-conflict".into(),
+                    if_match: None,
+                    if_none_match: Some("*".into()),
+                },
+                AzureRequest {
+                    path: "/container/ambiguous-precondition".into(),
+                    if_match: Some("\"etag\"".into()),
+                    if_none_match: None,
+                },
+            ]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn azure_cas_attempts_once_on_429_and_5xx_while_ordinary_put_uses_retry_budget() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local Azure endpoint");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local address"));
+        let requests = Arc::new(Mutex::new(Vec::<(String, Option<String>)>::new()));
+        let recorded = requests.clone();
+        let app = axum::Router::new().fallback(axum::routing::any(
+            move |request: axum::http::Request<axum::body::Body>| {
+                let recorded = recorded.clone();
+                async move {
+                    let condition = request
+                        .headers()
+                        .get(axum::http::header::IF_NONE_MATCH)
+                        .and_then(|value| value.to_str().ok())
+                        .map(ToOwned::to_owned);
+                    let path = request.uri().path().to_string();
+                    recorded
+                        .lock()
+                        .expect("request log")
+                        .push((path.clone(), condition));
+                    if path.ends_with("/cas-throttled") {
+                        axum::http::StatusCode::TOO_MANY_REQUESTS
+                    } else {
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    }
+                }
+            },
+        ));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve local Azure endpoint");
+        });
+
+        let builder = MicrosoftAzureBuilder::new()
+            .with_account("account")
+            .with_container_name("container")
+            .with_endpoint(endpoint)
+            .with_allow_http(true)
+            .with_skip_signature(true);
+        let store: Arc<dyn ObjectStore> = Arc::new(
+            builder
+                .clone()
+                .with_retry(ordinary_retry_config())
+                .build()
+                .expect("ordinary Azure store"),
+        );
+        let cas_store: Arc<dyn ObjectStore> = Arc::new(
+            builder
+                .with_retry(cas_retry_config())
+                .build()
+                .expect("Azure CAS store"),
+        );
+        let bucket = Bucket {
+            store,
+            cas_store,
+            backend: StorageBackend::Azure,
+            name: "container".into(),
+            prefix: String::new(),
+        };
+
+        for key in ["cas-throttled", "cas-unavailable"] {
+            let error = bucket
+                .put_cas(key, b"candidate".to_vec(), None)
+                .await
+                .expect_err("Azure CAS service failure is ambiguous");
+            assert!(error.to_string().contains("may have committed"));
+        }
+        bucket
+            .put("ordinary", b"value".to_vec())
+            .await
+            .expect_err("ordinary Azure PUT exhausts its retry budget");
+
+        let requests = requests.lock().expect("request log");
+        let paths = requests
+            .iter()
+            .map(|(path, _)| path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec![
+                "/container/cas-throttled",
+                "/container/cas-unavailable",
+                "/container/ordinary",
+                "/container/ordinary",
+                "/container/ordinary",
+            ]
+        );
+        assert_eq!(requests[0].1.as_deref(), Some("*"));
+        assert_eq!(requests[1].1.as_deref(), Some("*"));
+        assert!(requests[2..]
+            .iter()
+            .all(|(_, condition)| condition.is_none()));
+        drop(requests);
+        server.abort();
     }
 
     #[test]

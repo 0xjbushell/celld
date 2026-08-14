@@ -2,8 +2,8 @@
 
 celld is a stateful distributed system. It runs server-side JavaScript on
 your machines. It keeps all shared data in an S3-compatible, Google Cloud
-Storage, or Azure Blob Storage bucket that you own. The JavaScript API is the same API
-that Cloudflare Workers and Durable Objects supply.
+Storage, or Azure Blob Storage bucket that you own. The JavaScript API is the
+same API that Cloudflare Workers and Durable Objects supply.
 
 In Cloudflare terms, a cell is a Durable Object: a small server with a
 name and a private SQLite database. You make one cell for each user, each
@@ -128,8 +128,10 @@ default scope permits only storage reads. Create the instance with the
 the access.
 
 For Azure Blob Storage, create a standard general-purpose v2 storage account
-and a container, then select exactly one authentication mode. Every Entra
-identity needs a container-scoped data-plane role such as **Storage Blob Data
+and a container. `AZURE_STORAGE_ACCOUNT_NAME` names the account;
+`CELLD_BUCKET=az://CONTAINER` names the container, and an optional
+`/PREFIX` scopes every fleet object below that prefix. Every Entra identity
+needs a container-scoped data-plane role such as **Storage Blob Data
 Contributor**; management-plane roles do not authorize Blob data.
 
 ```sh
@@ -139,17 +141,38 @@ export CELLD_AZURE_AUTH=managed-identity
 # Set AZURE_CLIENT_ID only for a user-assigned identity. Unset selects system-assigned.
 ```
 
-`CELLD_AZURE_AUTH=workload-identity` requires `AZURE_TENANT_ID`,
-`AZURE_CLIENT_ID`, and `AZURE_FEDERATED_TOKEN_FILE`; celld constructs the
-official SDK workload credential, which rereads the projected token file as
-the SDK refreshes it. `client-secret` requires `AZURE_TENANT_ID`,
-`AZURE_CLIENT_ID`, and `AZURE_CLIENT_SECRET`. `account-key` requires
-`AZURE_STORAGE_ACCOUNT_KEY`, and `sas` requires `AZURE_STORAGE_SAS_KEY`.
-`developer-tools` is an explicit developer-only opt-in and tries Azure CLI
-before Azure Developer CLI; it is never a production fallback. Object-ID and
-resource-ID managed-identity selectors are unsupported. For local
-compatibility testing only, `AZURE_STORAGE_USE_EMULATOR=1` selects Azurite and
-requires `CELLD_AZURE_AUTH` to be unset.
+Set `CELLD_AZURE_AUTH` to exactly one of these six modes:
+
+- `account-key`: `AZURE_STORAGE_ACCOUNT_KEY`.
+- `sas`: `AZURE_STORAGE_SAS_KEY`.
+- `managed-identity`: no additional variable for the system-assigned
+  identity, or `AZURE_CLIENT_ID` for a user-assigned identity.
+- `workload-identity`: `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, and
+  `AZURE_FEDERATED_TOKEN_FILE`. The official SDK credential rereads the
+  projected token file when it refreshes.
+- `client-secret`: `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, and
+  `AZURE_CLIENT_SECRET`.
+- `developer-tools`: explicit developer-only opt-in. It tries Azure CLI before
+  Azure Developer CLI and is never a production fallback.
+
+The five production modes require `AZURE_STORAGE_ACCOUNT_NAME`.
+`developer-tools` also requires the account name, but remains developer-only.
+Object-ID and resource-ID managed-identity selectors are unsupported.
+
+For a nonstandard Azure Blob account endpoint, set
+`AZURE_STORAGE_ENDPOINT` or pass `--endpoint`; an explicit CLI endpoint wins.
+Do not set `S3_ENDPOINT` for an `az://` bucket. For local compatibility
+testing only, set `AZURE_STORAGE_USE_EMULATOR=1` to select Azurite, leave
+`CELLD_AZURE_AUTH` unset, and optionally set `AZURITE_BLOB_STORAGE_URL` and
+`AZURE_STORAGE_ACCOUNT_NAME`.
+
+Conditional Azure writes make exactly one HTTP attempt.
+`BlobAlreadyExists` for create and `ConditionNotMet` for a failed condition
+are clean rejections. Other 409/412 service errors remain ambiguous, say the
+write may have committed, and cause celld to reconcile by reading state.
+Ordinary bucket operations use at most two retries (three HTTP attempts total
+for a retry-eligible failure). A 401/403 identifies authentication or
+data-plane authorization, not transient storage availability.
 
 The bucket credentials give full control of the fleet. Keep them safe. The
 bucket contains the deployments, the SQLite replicas, the ownership

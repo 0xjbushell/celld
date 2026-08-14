@@ -98,6 +98,27 @@ object generation. celld does not send the S3 request dialect to
 Cloud Storage, because Cloud Storage does not apply `If-Match` to a
 PUT.
 
+An `az://` bucket selects Azure Blob Storage. celld uses
+`If-None-Match: *` for a conditional create and `If-Match` with the
+Blob ETag for a conditional overwrite. Azure's `BlobAlreadyExists`
+create error and `ConditionNotMet` condition error are clean rejections:
+the write did not acquire ownership. Status alone is not enough because
+Azure also uses 409/412 for unrelated service failures such as
+`ContainerBeingDeleted`.
+
+Conditional writes make one HTTP attempt. Automatic retries are
+disabled because a response can be lost after Azure commits the write;
+retrying against the first attempt's now-stale ETag could turn that
+ambiguous success into a misleading clean rejection. Any conditional
+write failure other than those condition service codes therefore reports
+that it **may have committed**. The ownership caller reconciles by reading
+the record again instead of treating the error as a lost comparison.
+
+Ordinary bucket operations keep a maximum of two retries, so a
+retry-eligible service or transport failure causes at most three HTTP
+attempts. LTX replication has its own retry configuration; the
+conditional-write rule does not change it.
+
 Some S3-compatible stores do not qualify. MinIO (the community
 edition), Backblaze B2, Hetzner Object Storage, and DigitalOcean
 Spaces do not implement the required conditional writes. celld is not

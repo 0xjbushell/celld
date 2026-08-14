@@ -79,6 +79,19 @@ A person who holds the bucket credentials controls the fleet. Give each
 credential access to one fleet bucket only, and replace a credential after a
 suspected disclosure.
 
+For Azure, assign a Blob **data-plane** role such as Storage Blob Data
+Contributor at the container scope. A subscription or storage-account
+management role does not authorize Blob reads and writes. Treat 401 and 403
+responses as authentication or authorization failures: check the selected
+credential mode, token audience, role assignment, and scope. They are not the
+same as transient availability failures such as throttling, 5xx responses, or
+transport timeouts.
+
+When the storage account uses a private endpoint, the node must resolve the
+account hostname to the private address and reach it over the private network.
+celld does not create private endpoints, private DNS zones, firewall rules, or
+routes.
+
 ## Keep one writer for each cell
 
 Each cell is a SQLite database with one writer. One node owns a cell at a time,
