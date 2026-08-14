@@ -20,6 +20,9 @@ check-cfg = ["cfg(celld_internal_tests)", "cfg(celld_proxy_internals)"]
 [dependencies]
 aes.workspace = true
 aes-gcm.workspace = true
+async-trait.workspace = true
+azure_core.workspace = true
+azure_identity = { workspace = true, features = ["tokio"] }
 cbc.workspace = true
 ctr.workspace = true
 anyhow.workspace = true
@@ -27,7 +30,7 @@ axum.workspace = true
 base64.workspace = true
 bytes.workspace = true
 celld-logic.workspace = true
-celld-ltx = { workspace = true, features = ["s3"] }
+celld-ltx = { workspace = true, features = ["s3", "azure"] }
 encoding_rs.workspace = true
 ed25519-dalek.workspace = true
 fastwebsockets.workspace = true
@@ -39,7 +42,7 @@ http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 md-5.workspace = true
-object_store = { workspace = true, features = ["aws", "gcp"] }
+object_store = { workspace = true, features = ["aws", "gcp", "azure"] }
 parquet.workspace = true
 percent-encoding.workspace = true
 p256.workspace = true

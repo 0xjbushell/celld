@@ -89,11 +89,9 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
     let mut peers = Vec::new();
     let mut settings = Settings {
         control_plane,
-        bucket: fixture_bucket
-            .or_else(|| celld_bucket.clone())
-            .map(|value| value.trim_start_matches("s3://").to_string()),
+        bucket: fixture_bucket.or_else(|| celld_bucket.clone()),
         load_deployment: celld_bucket.is_some(),
-        endpoint: env("S3_ENDPOINT"),
+        endpoint: None,
         region: env("AWS_REGION")
             .or_else(|| env("AWS_DEFAULT_REGION"))
             .unwrap_or_else(|| "us-east-1".to_string()),
@@ -118,7 +116,7 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
                 let bucket = args
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("--bucket requires a value"))?;
-                settings.bucket = Some(bucket.trim_start_matches("s3://").to_string());
+                settings.bucket = Some(bucket);
                 settings.load_deployment = true;
             }
             "--endpoint" => {
@@ -191,6 +189,11 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
              CELLD_INTERNAL_ADDR; the default internal listener uses a random loopback port"
         );
     }
+    if let Some(bucket) = settings.bucket.as_ref() {
+        settings.endpoint = celld::bucket::endpoint_for_spec(bucket, settings.endpoint.take())?;
+    } else {
+        settings.endpoint = env("S3_ENDPOINT");
+    }
     Ok(if diagnose {
         Action::Diagnose { settings, peers }
     } else {
@@ -203,22 +206,25 @@ pub(crate) fn print_help() {
         r#"celld — self-hosted, distributed Durable Objects
 
 USAGE:
-  celld --bucket [s3://|gs://]NAME[/PREFIX] [OPTIONS]
-  celld deploy [PROJECT] --bucket [s3://|gs://]NAME[/PREFIX] [OPTIONS]
-  celld diagnose --bucket [s3://|gs://]NAME[/PREFIX] [OPTIONS] [--peer NODE_ID]...
+  celld --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
+  celld deploy [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
+  celld diagnose --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS] [--peer NODE_ID]...
 
 Production install: celld --bucket s3://NAME [OPTIONS]
                     celld --bucket gs://NAME [OPTIONS]
+                    celld --bucket az://CONTAINER [OPTIONS]
 
 OPTIONS:
-  --bucket [s3://|gs://]NAME[/PREFIX]
+  --bucket [s3://|gs://|az://]NAME[/PREFIX]
                          Fleet bucket; s3:// (or no scheme) uses the standard
                          AWS credential chain, gs:// selects Google Cloud
-                         Storage via Application Default Credentials (celld
-                         then rejects --endpoint and ignores --region). A
+                         Storage via Application Default Credentials. az://
+                         selects Azure Blob Storage; select one explicit Azure
+                         authentication mode with the variables below. GCS rejects
+                         --endpoint and both providers ignore --region. A
                          PREFIX puts every object under it, so several fleets
                          can share one bucket
-  --endpoint URL         Optional S3-compatible endpoint
+  --endpoint URL         Optional selected-provider endpoint
   --region REGION        Storage region (default: AWS_REGION or us-east-1)
   --listen IP:PORT       Public Worker listener (default: 127.0.0.1:8080;
                          a non-loopback address requires --internal-listen)
@@ -244,6 +250,24 @@ ENVIRONMENT:
   AWS_REGION, AWS_DEFAULT_REGION  Storage region (default: us-east-1)
   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN
                                   Explicit credentials in the standard AWS chain
+  AZURE_STORAGE_ACCOUNT_NAME       Azure storage account for an az:// bucket
+  CELLD_AZURE_AUTH                 Azure mode: account-key, sas, managed-identity,
+                                  workload-identity, client-secret, or developer-tools
+  AZURE_STORAGE_ACCOUNT_KEY        Required for CELLD_AZURE_AUTH=account-key
+  AZURE_STORAGE_SAS_KEY            Required for CELLD_AZURE_AUTH=sas
+  AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_FEDERATED_TOKEN_FILE
+                                  Required for CELLD_AZURE_AUTH=workload-identity
+  AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET
+                                  Required for CELLD_AZURE_AUTH=client-secret
+  AZURE_CLIENT_ID                  Optional user-assigned identity for
+                                  CELLD_AZURE_AUTH=managed-identity; unset uses system-assigned
+                                  identity. Object-ID and resource-ID selectors are unsupported.
+  CELLD_AZURE_AUTH=developer-tools Explicit developer-only opt-in; tries Azure CLI, then Azure Developer CLI
+  AZURE_STORAGE_ENDPOINT           Azure endpoint; same as --endpoint
+  AZURE_STORAGE_USE_EMULATOR       `1` selects Azurite (no CELLD_AZURE_AUTH)
+  AZURITE_BLOB_STORAGE_URL         Azurite blob endpoint (default 127.0.0.1:10000)
+  Azure Entra identities need a container-scoped Blob data-plane role such as
+  Storage Blob Data Contributor; management-plane roles do not authorize Blob data.
   CELLD_ADDR                      Public Worker listener; same as --listen
   CELLD_INTERNAL_ADDR             Peer and operator listener; same as --internal-listen
   CELLD_ADVERTISE                 Peer-reachable address; same as --advertise

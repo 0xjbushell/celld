@@ -59,6 +59,15 @@ we also test the checkers: we run deliberately broken variants of the
 protocol against the properties, and the properties must find the damage.
 A suite that stays green against a broken protocol is a broken suite.
 
+The Azure adapter also has deterministic failure tests below the live-service
+boundary. Injected counting stores prove the provider-neutral precondition
+contract. A local counting HTTP endpoint exercises `MicrosoftAzureBuilder`
+directly: Azure `BlobAlreadyExists`/`ConditionNotMet` XML responses are clean
+rejections, unrelated 409/412 service codes remain ambiguous, CAS requests
+make one attempt under 429/5xx responses, and ordinary requests stay within
+their configured two-retry budget. These tests qualify celld's retry and
+ambiguity policy without pretending to inject faults into Azure itself.
+
 ## Live fleets: what simulation cannot see
 
 Simulation cannot see the real S3 tail latency, the real kernel and
@@ -100,6 +109,11 @@ when the host returns, it joins again with no duplicate residency. Across
 every run of every scenario, no acknowledged write was lost and no
 committed state was damaged; the verification sweeps show zero body
 faults, zero status faults, and zero lost messages.
+
+Provider qualification remains live-only: the gated CAS contract test checks
+that a real S3, GCS, or Azure service maps concurrent create, current update,
+and stale update to the required outcomes. Real Azure service fault injection
+is not part of the in-repository suite.
 
 ## A few numbers we trust
 

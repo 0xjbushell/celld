@@ -21,24 +21,22 @@
 //! var) is a faithful port of `NewReplicaClientFromURL`
 //! (s3/replica_client.go:133-314) so a `s3://…` URL configures the same way.
 //!
-//! This whole module is gated behind `#[cfg(feature = "s3")]` because it needs
-//! `object_store`'s AWS backend.
-
-#![cfg(feature = "s3")]
-
 use std::sync::Arc;
 
 use chrono::{DateTime, SecondsFormat};
 use futures_util::stream::{StreamExt, TryStreamExt};
+#[cfg(feature = "s3")]
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as ObjPath;
+#[cfg(feature = "s3")]
+use object_store::ClientOptions;
 use object_store::{
-    Attribute, AttributeValue, Attributes, ClientOptions, ObjectStore, PutMultipartOpts,
-    PutOptions, PutPayload,
+    Attribute, AttributeValue, Attributes, ObjectStore, PutMultipartOpts, PutOptions, PutPayload,
 };
 
 use crate::error::{Error, Result};
 use crate::ltx::{self, FileInfo};
+#[cfg(feature = "s3")]
 use crate::replica_url::{
     self, bool_query_value, ensure_endpoint_scheme, region_from_s3_arn, ParsedReplicaUrl,
 };
@@ -67,7 +65,7 @@ pub const MULTIPART_THRESHOLD: usize = 5 * 1024 * 1024;
 /// Maps to the public fields of Go's `ReplicaClient` struct
 /// (s3/replica_client.go:78-116). Zero/`None` values mean "use the backend
 /// default".
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ObjectStoreConfig {
     /// Bucket name (required).
     pub bucket: String,
@@ -90,6 +88,26 @@ pub struct ObjectStoreConfig {
     pub skip_verify: bool,
     /// Multipart part size in bytes; 0 = default (5 MiB).
     pub part_size: u64,
+    /// Object metadata key for the LTX header timestamp.
+    pub timestamp_metadata_key: String,
+}
+
+impl Default for ObjectStoreConfig {
+    fn default() -> Self {
+        Self {
+            bucket: String::new(),
+            path: String::new(),
+            region: String::new(),
+            endpoint: String::new(),
+            access_key_id: String::new(),
+            secret_access_key: String::new(),
+            session_token: String::new(),
+            force_path_style: false,
+            skip_verify: false,
+            part_size: 0,
+            timestamp_metadata_key: METADATA_KEY_TIMESTAMP.into(),
+        }
+    }
 }
 
 impl ObjectStoreConfig {
@@ -99,6 +117,7 @@ impl ObjectStoreConfig {
     /// `AWS_*`/`LITESTREAM_*` env credentials, the `LITESTREAM_S3_ENDPOINT` env
     /// fallback, and the provider-specific path-style defaults for
     /// MinIO/Backblaze/Filebase/Supabase.
+    #[cfg(feature = "s3")]
     pub fn from_url(parsed: &ParsedReplicaUrl) -> Result<Self> {
         let host = &parsed.host;
         let query = &parsed.query;
@@ -209,6 +228,7 @@ impl ObjectStoreConfig {
             force_path_style,
             skip_verify,
             part_size,
+            ..Default::default()
         })
     }
 
@@ -216,6 +236,7 @@ impl ObjectStoreConfig {
     /// can build one store for a bucket and share it across many
     /// [`ObjectStoreClient::with_store`] clients that differ only by key prefix
     /// — one connection pool for every cell on a node.
+    #[cfg(feature = "s3")]
     pub fn build_store(&self) -> Result<Arc<dyn ObjectStore>> {
         if self.bucket.is_empty() {
             return Err(Error::Other("s3: bucket name is required".into()));
@@ -280,6 +301,7 @@ impl ObjectStoreConfig {
 
 /// Returns `Some(value)` for a non-empty env var, else `None`. Mirrors Go's
 /// `if v := os.Getenv(k); v != ""` pattern (s3/replica_client.go:211-224).
+#[cfg(feature = "s3")]
 fn nonempty_env(key: &str) -> Option<String> {
     match std::env::var(key) {
         Ok(v) if !v.is_empty() => Some(v),
@@ -473,9 +495,20 @@ impl ObjectStoreClient {
 
     /// Get-or-build the inner store, once.
     async fn store(&self) -> Result<&Arc<dyn ObjectStore>> {
-        self.store
-            .get_or_try_init(|| async { self.config.build_store() })
-            .await
+        #[cfg(not(feature = "s3"))]
+        {
+            self.store.get().ok_or_else(|| {
+                Error::Other(
+                    "replica: an injected object store is required without the s3 feature".into(),
+                )
+            })
+        }
+        #[cfg(feature = "s3")]
+        {
+            self.store
+                .get_or_try_init(|| async { self.config.build_store() })
+                .await
+        }
     }
 
     /// Build the S3 key for an LTX file: `{path}/{level:04x}/{min}-{max}.ltx`.
@@ -591,6 +624,11 @@ impl ReplicaClient for ObjectStoreClient {
         max_txid: TXID,
         data: &[u8],
     ) -> Result<FileInfo> {
+        if self.config.timestamp_metadata_key.is_empty() {
+            return Err(Error::Other(
+                "replica: timestamp metadata key must not be empty".into(),
+            ));
+        }
         let store = self.store().await?;
 
         // Preserve the LTX header timestamp in the standard Litestream object
@@ -601,7 +639,7 @@ impl ReplicaClient for ObjectStoreClient {
             + std::time::Duration::from_millis(header.timestamp.max(0) as u64);
         let mut attributes = Attributes::new();
         attributes.insert(
-            Attribute::Metadata(METADATA_KEY_TIMESTAMP.into()),
+            Attribute::Metadata(self.config.timestamp_metadata_key.clone().into()),
             AttributeValue::from(format_rfc3339_nano(header.timestamp)?),
         );
         let key = ObjPath::from(self.ltx_key(level, min_txid, max_txid));
@@ -742,8 +780,171 @@ fn format_rfc3339_nano(unix_millis: i64) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt;
+    use std::sync::Mutex;
+
     use super::*;
+    #[cfg(feature = "s3")]
     use crate::replica_url::parse_replica_url_with_query;
+    use async_trait::async_trait;
+    use futures_util::stream::BoxStream;
+
+    const TEST_LTX_KEY: &str = "replica/0000/0000000000000001-0000000000000001.ltx";
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum StoreOperation {
+        PutOpts,
+        PutMultipartOpts,
+        GetOpts,
+        Delete,
+        List,
+        ListWithDelimiter,
+        Copy,
+        CopyIfNotExists,
+    }
+
+    #[derive(Debug)]
+    struct RecordingStore {
+        inner: object_store::memory::InMemory,
+        operations: Mutex<Vec<StoreOperation>>,
+    }
+
+    impl RecordingStore {
+        fn new() -> Self {
+            Self {
+                inner: object_store::memory::InMemory::new(),
+                operations: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn operations(&self) -> Vec<StoreOperation> {
+            self.operations.lock().unwrap().clone()
+        }
+
+        fn record(&self, operation: StoreOperation) {
+            self.operations.lock().unwrap().push(operation);
+        }
+    }
+
+    impl fmt::Display for RecordingStore {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "RecordingStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for RecordingStore {
+        async fn put_opts(
+            &self,
+            location: &ObjPath,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.record(StoreOperation::PutOpts);
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjPath,
+            opts: PutMultipartOpts,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.record(StoreOperation::PutMultipartOpts);
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjPath,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.record(StoreOperation::GetOpts);
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn delete(&self, location: &ObjPath) -> object_store::Result<()> {
+            self.record(StoreOperation::Delete);
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> BoxStream<'_, object_store::Result<object_store::ObjectMeta>> {
+            self.record(StoreOperation::List);
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.record(StoreOperation::ListWithDelimiter);
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &ObjPath, to: &ObjPath) -> object_store::Result<()> {
+            self.record(StoreOperation::Copy);
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(
+            &self,
+            from: &ObjPath,
+            to: &ObjPath,
+        ) -> object_store::Result<()> {
+            self.record(StoreOperation::CopyIfNotExists);
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    fn test_ltx_data(timestamp: i64) -> Vec<u8> {
+        ltx::Header {
+            version: ltx::VERSION,
+            flags: ltx::HEADER_FLAG_NO_CHECKSUM,
+            page_size: 512,
+            commit: 1,
+            min_txid: TXID(1),
+            max_txid: TXID(1),
+            timestamp,
+            pre_apply_checksum: 0,
+            wal_offset: 0,
+            wal_size: 0,
+            wal_salt1: 0,
+            wal_salt2: 0,
+            node_id: 0,
+        }
+        .marshal()
+        .to_vec()
+    }
+
+    fn test_client(store: Arc<dyn ObjectStore>, timestamp_metadata_key: &str) -> ObjectStoreClient {
+        ObjectStoreClient::with_store(
+            ObjectStoreConfig {
+                bucket: "bucket".into(),
+                path: "replica".into(),
+                timestamp_metadata_key: timestamp_metadata_key.into(),
+                ..Default::default()
+            },
+            store,
+        )
+    }
+
+    async fn get_metadata(
+        store: &object_store::memory::InMemory,
+        key: &ObjPath,
+    ) -> object_store::GetResult {
+        store
+            .get_opts(
+                key,
+                object_store::GetOptions {
+                    head: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("read object metadata")
+    }
 
     #[test]
     fn timestamp_metadata_matches_go_rfc3339_nano() {
@@ -762,54 +963,106 @@ mod tests {
         assert!(format_rfc3339_nano(i64::MAX).is_err());
     }
 
+    #[test]
+    fn default_timestamp_metadata_key_is_litestream_compatible() {
+        assert_eq!(
+            ObjectStoreConfig::default().timestamp_metadata_key,
+            METADATA_KEY_TIMESTAMP
+        );
+    }
+
     #[tokio::test]
     async fn write_preserves_the_litestream_timestamp_metadata() {
         let store = Arc::new(object_store::memory::InMemory::new());
-        let client = ObjectStoreClient::with_store(
-            ObjectStoreConfig {
-                bucket: "bucket".into(),
-                path: "replica".into(),
-                ..Default::default()
-            },
-            store.clone(),
-        );
-        let data = ltx::Header {
-            version: ltx::VERSION,
-            flags: ltx::HEADER_FLAG_NO_CHECKSUM,
-            page_size: 512,
-            commit: 1,
-            min_txid: TXID(1),
-            max_txid: TXID(1),
-            timestamp: 1_609_459_200_123,
-            pre_apply_checksum: 0,
-            wal_offset: 0,
-            wal_size: 0,
-            wal_salt1: 0,
-            wal_salt2: 0,
-            node_id: 0,
-        }
-        .marshal();
+        let client = test_client(store.clone(), METADATA_KEY_TIMESTAMP);
+        let data = test_ltx_data(1_609_459_200_123);
 
         client
             .write_ltx_file(0, TXID(1), TXID(1), &data)
             .await
             .expect("write LTX object");
 
-        let result = store
-            .get_opts(
-                &ObjPath::from("replica/0000/0000000000000001-0000000000000001.ltx"),
-                object_store::GetOptions {
-                    head: true,
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("read object metadata");
+        let result = get_metadata(&store, &ObjPath::from(TEST_LTX_KEY)).await;
         let value = result
             .attributes
             .get(&Attribute::Metadata(METADATA_KEY_TIMESTAMP.into()))
             .expect("litestream timestamp metadata");
         assert_eq!(value.as_ref(), "2021-01-01T00:00:00.123Z");
+    }
+
+    #[tokio::test]
+    async fn write_uses_configured_timestamp_metadata_key_for_single_put() {
+        let store = Arc::new(RecordingStore::new());
+        let client = test_client(store.clone(), "litestream_timestamp");
+        let data = test_ltx_data(1_609_459_200_123);
+        let key = ObjPath::from(TEST_LTX_KEY);
+
+        client
+            .write_ltx_file(0, TXID(1), TXID(1), &data)
+            .await
+            .expect("write LTX object");
+
+        assert_eq!(store.operations(), vec![StoreOperation::PutOpts]);
+        let result = store.inner.get(&key).await.expect("read object");
+        assert_eq!(result.bytes().await.expect("read bytes").to_vec(), data);
+        let metadata = get_metadata(&store.inner, &key).await;
+        assert!(metadata
+            .attributes
+            .get(&Attribute::Metadata("litestream_timestamp".into()))
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn write_uses_configured_timestamp_metadata_key_for_multipart_put() {
+        let store = Arc::new(RecordingStore::new());
+        let client = test_client(store.clone(), "litestream_timestamp");
+        let mut data = test_ltx_data(1_609_459_200_123);
+        data.resize(MULTIPART_THRESHOLD, 0);
+        let key = ObjPath::from(TEST_LTX_KEY);
+
+        client
+            .write_ltx_file(0, TXID(1), TXID(1), &data)
+            .await
+            .expect("write LTX object");
+
+        assert_eq!(store.operations(), vec![StoreOperation::PutMultipartOpts]);
+        assert_eq!(
+            store
+                .inner
+                .get(&key)
+                .await
+                .expect("read object")
+                .bytes()
+                .await
+                .expect("read bytes")
+                .to_vec(),
+            data
+        );
+        let metadata = get_metadata(&store.inner, &key).await;
+        assert!(metadata
+            .attributes
+            .get(&Attribute::Metadata("litestream_timestamp".into()))
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn write_rejects_an_empty_timestamp_metadata_key_before_store_initialization() {
+        let store = Arc::new(RecordingStore::new());
+        let client = ObjectStoreClient::with_store(
+            ObjectStoreConfig {
+                timestamp_metadata_key: String::new(),
+                ..Default::default()
+            },
+            store.clone(),
+        );
+        let data = test_ltx_data(0);
+
+        let err = client
+            .write_ltx_file(0, TXID(1), TXID(1), &data)
+            .await
+            .expect_err("empty timestamp metadata key must be rejected");
+        assert!(err.to_string().contains("timestamp metadata key"));
+        assert!(store.operations().is_empty(), "storage must not be used");
     }
 
     // ── ParseHost (port of TestParseHost, s3/replica_client_test.go:1071) ──────
@@ -871,6 +1124,7 @@ mod tests {
         assert!(!force);
     }
 
+    #[cfg(feature = "s3")]
     fn cfg_from_url(url: &str) -> ObjectStoreConfig {
         let parsed = parse_replica_url_with_query(url).unwrap();
         ObjectStoreConfig::from_url(&parsed).unwrap()
@@ -878,6 +1132,7 @@ mod tests {
 
     // ── URL query param aliases (port of
     //    TestNewReplicaClientFromURL_QueryParamAliases, test:1940) ───────────────
+    #[cfg(feature = "s3")]
     #[test]
     fn query_param_aliases() {
         let c = cfg_from_url("s3://mybucket/path?forcePathStyle=true");
@@ -913,6 +1168,7 @@ mod tests {
     //    test:2023). These mutate a process-global env var, so they run
     //    sequentially under one #[test] with save/restore to avoid cross-test
     //    interference. ───────────────────────────────────────────────────────────
+    #[cfg(feature = "s3")]
     #[test]
     fn endpoint_env_var() {
         let saved = std::env::var("LITESTREAM_S3_ENDPOINT").ok();

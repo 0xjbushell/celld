@@ -4,10 +4,15 @@ The boundaries of the current alpha:
 
 - A fleet runs one application deployment. There is no multi-tenant
   scheduler, no account service, or managed ingress.
-- celld requires an S3-compatible bucket or a Google Cloud Storage
-  bucket, also on a laptop. There is no local filesystem mode, so local
-  development needs a real bucket or a local store that provides
-  conditional writes (see [ownership and fencing](fencing.md)).
+- celld requires an S3-compatible, Google Cloud Storage, or Azure Blob
+  Storage bucket, also on a laptop. There is no shared local-filesystem mode,
+  so local development needs a real bucket or an emulator that provides the
+  required conditional writes (see [ownership and fencing](fencing.md)).
+- Each node still needs local block storage for its active SQLite databases,
+  WAL, and replication work directory. Azure Blob Storage is the shared
+  authority and durable replica, not the node filesystem. Azure Files,
+  BlobFuse, and other network filesystems are not supported replacements for
+  this local block storage.
 - The peer HTTP protocol does not terminate TLS. Run the fleet on a
   private network or an encrypted overlay, and terminate public TLS in an
   ingress proxy.
@@ -20,6 +25,11 @@ The boundaries of the current alpha:
   A `gs://` bucket authenticates with Google Application Default
   Credentials or with a service account key from the `GOOGLE_*`
   environment; S3 static credentials do not apply to it.
+- An `az://` bucket supports native Azure Blob endpoints and Azurite. Other
+  Azure-compatible or unqualified custom endpoints are not qualified.
+  OneLake/Fabric endpoints and BlobFuse are out of scope. The managed
+  control-plane storage path remains S3-only; Azure managed control-plane
+  provisioning is deferred.
 - The [Cloudflare compatibility](cloudflare-compat.md) page shows what
   celld runs of the Workers platform: the available APIs, the deploy
   contract, and what is out of scope (KV, R2, `wrangler.toml`, routes).

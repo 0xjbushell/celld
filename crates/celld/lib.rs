@@ -8,6 +8,7 @@
 
 pub mod assets;
 pub mod asyncrt;
+pub mod azure_identity;
 pub mod bucket;
 pub mod control_plane;
 pub mod dead_node_gc;

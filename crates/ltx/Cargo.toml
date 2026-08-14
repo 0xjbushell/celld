@@ -40,3 +40,4 @@ tokio = { workspace = true, features = ["full", "test-util"] }
 tempfile.workspace = true
 proptest.workspace = true
 hex.workspace = true
+percent-encoding.workspace = true
