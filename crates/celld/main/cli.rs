@@ -219,8 +219,8 @@ OPTIONS:
                          Fleet bucket; s3:// (or no scheme) uses the standard
                          AWS credential chain, gs:// selects Google Cloud
                          Storage via Application Default Credentials. az://
-                         selects Azure Blob Storage; configure account-key or
-                         SAS with the Azure variables below. GCS rejects
+                         selects Azure Blob Storage; select one explicit Azure
+                         authentication mode with the variables below. GCS rejects
                          --endpoint and both providers ignore --region. A
                          PREFIX puts every object under it, so several fleets
                          can share one bucket
@@ -251,12 +251,23 @@ ENVIRONMENT:
   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN
                                   Explicit credentials in the standard AWS chain
   AZURE_STORAGE_ACCOUNT_NAME       Azure storage account for an az:// bucket
-  CELLD_AZURE_AUTH                 Azure mode: account-key or sas
+  CELLD_AZURE_AUTH                 Azure mode: account-key, sas, managed-identity,
+                                  workload-identity, client-secret, or developer-tools
   AZURE_STORAGE_ACCOUNT_KEY        Required for CELLD_AZURE_AUTH=account-key
   AZURE_STORAGE_SAS_KEY            Required for CELLD_AZURE_AUTH=sas
+  AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_FEDERATED_TOKEN_FILE
+                                  Required for CELLD_AZURE_AUTH=workload-identity
+  AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET
+                                  Required for CELLD_AZURE_AUTH=client-secret
+  AZURE_CLIENT_ID                  Optional user-assigned identity for
+                                  CELLD_AZURE_AUTH=managed-identity; unset uses system-assigned
+                                  identity. Object-ID and resource-ID selectors are unsupported.
+  CELLD_AZURE_AUTH=developer-tools Explicit developer-only opt-in; tries Azure CLI, then Azure Developer CLI
   AZURE_STORAGE_ENDPOINT           Azure endpoint; same as --endpoint
   AZURE_STORAGE_USE_EMULATOR       `1` selects Azurite (no CELLD_AZURE_AUTH)
   AZURITE_BLOB_STORAGE_URL         Azurite blob endpoint (default 127.0.0.1:10000)
+  Azure Entra identities need a container-scoped Blob data-plane role such as
+  Storage Blob Data Contributor; management-plane roles do not authorize Blob data.
   CELLD_ADDR                      Public Worker listener; same as --listen
   CELLD_INTERNAL_ADDR             Peer and operator listener; same as --internal-listen
   CELLD_ADVERTISE                 Peer-reachable address; same as --advertise

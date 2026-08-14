@@ -1,8 +1,8 @@
 # celld documentation
 
 celld is a stateful distributed system. It runs server-side JavaScript on
-your machines. It keeps all shared data in an S3-compatible or Google
-Cloud Storage bucket that you own. The JavaScript API is the same API
+your machines. It keeps all shared data in an S3-compatible, Google Cloud
+Storage, or Azure Blob Storage bucket that you own. The JavaScript API is the same API
 that Cloudflare Workers and Durable Objects supply.
 
 In Cloudflare terms, a cell is a Durable Object: a small server with a
@@ -126,6 +126,30 @@ account. The access scopes of the instance cap this credential, and the
 default scope permits only storage reads. Create the instance with the
 `cloud-platform` scope, so the IAM role of the service account controls
 the access.
+
+For Azure Blob Storage, create a standard general-purpose v2 storage account
+and a container, then select exactly one authentication mode. Every Entra
+identity needs a container-scoped data-plane role such as **Storage Blob Data
+Contributor**; management-plane roles do not authorize Blob data.
+
+```sh
+export CELLD_BUCKET=az://YOUR-CONTAINER/PREFIX
+export AZURE_STORAGE_ACCOUNT_NAME=YOUR-ACCOUNT
+export CELLD_AZURE_AUTH=managed-identity
+# Set AZURE_CLIENT_ID only for a user-assigned identity. Unset selects system-assigned.
+```
+
+`CELLD_AZURE_AUTH=workload-identity` requires `AZURE_TENANT_ID`,
+`AZURE_CLIENT_ID`, and `AZURE_FEDERATED_TOKEN_FILE`; celld constructs the
+official SDK workload credential, which rereads the projected token file as
+the SDK refreshes it. `client-secret` requires `AZURE_TENANT_ID`,
+`AZURE_CLIENT_ID`, and `AZURE_CLIENT_SECRET`. `account-key` requires
+`AZURE_STORAGE_ACCOUNT_KEY`, and `sas` requires `AZURE_STORAGE_SAS_KEY`.
+`developer-tools` is an explicit developer-only opt-in and tries Azure CLI
+before Azure Developer CLI; it is never a production fallback. Object-ID and
+resource-ID managed-identity selectors are unsupported. For local
+compatibility testing only, `AZURE_STORAGE_USE_EMULATOR=1` selects Azurite and
+requires `CELLD_AZURE_AUTH` to be unset.
 
 The bucket credentials give full control of the fleet. Keep them safe. The
 bucket contains the deployments, the SQLite replicas, the ownership
@@ -294,6 +318,12 @@ For the full list, run `celld -h`. This table shows the primary settings:
 | `AWS_REGION`, `AWS_DEFAULT_REGION` | The storage region |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` | Explicit AWS credentials. The standard AWS credential chain is also available |
 | `GOOGLE_APPLICATION_CREDENTIALS`, `GOOGLE_SERVICE_ACCOUNT_KEY` | Google credentials for a `gs://` bucket. Application Default Credentials are also available |
+| `AZURE_STORAGE_ACCOUNT_NAME` | Azure storage account for an `az://` bucket |
+| `CELLD_AZURE_AUTH` | Exactly one Azure mode: `account-key`, `sas`, `managed-identity`, `workload-identity`, `client-secret`, or explicit `developer-tools` |
+| `AZURE_STORAGE_ACCOUNT_KEY`, `AZURE_STORAGE_SAS_KEY` | Required by the corresponding Azure account-key or SAS mode |
+| `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_FEDERATED_TOKEN_FILE` | Required by Azure workload identity; client ID is optional only for managed identity |
+| `AZURE_CLIENT_SECRET` | Required with tenant and client ID by Azure client-secret mode |
+| `AZURE_STORAGE_ENDPOINT`, `AZURE_STORAGE_USE_EMULATOR`, `AZURITE_BLOB_STORAGE_URL` | Azure endpoint, emulator selector, and Azurite blob endpoint |
 | `CELLD_ADDR` | The public Worker listener. The same as `--listen` |
 | `CELLD_INTERNAL_ADDR` | The peer and operator listener. The same as `--internal-listen` |
 | `CELLD_ADVERTISE` | The internal address that peers can reach. The same as `--advertise` |

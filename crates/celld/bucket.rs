@@ -21,13 +21,20 @@
 //! In the same spirit a response that carries no CAS token is an error,
 //! never an empty token a later conditional write would trust.
 
+use crate::azure_identity::AzureTokenCredentialProvider;
 use anyhow::anyhow;
 use anyhow::Context;
+use azure_core::credentials::{Secret, TokenCredential};
+use azure_identity::{
+    ClientSecretCredential, DeveloperToolsCredential, ManagedIdentityCredential,
+    ManagedIdentityCredentialOptions, UserAssignedId, WorkloadIdentityCredential,
+    WorkloadIdentityCredentialOptions,
+};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::aws::S3ConditionalPut;
-use object_store::azure::MicrosoftAzureBuilder;
+use object_store::azure::{AzureCredentialProvider, MicrosoftAzureBuilder};
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::path::Path;
 use object_store::Attribute;
@@ -43,6 +50,7 @@ use object_store::PutPayload;
 use object_store::RetryConfig;
 use object_store::UpdateVersion;
 use std::borrow::Cow;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -190,18 +198,107 @@ fn decode_sas_component(component: &str) -> anyhow::Result<String> {
         .map_err(|error| anyhow!("invalid UTF-8 in SAS query pair: {error}"))
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AzureIdentityMode {
+    ManagedIdentity {
+        client_id: Option<String>,
+    },
+    WorkloadIdentity {
+        tenant_id: String,
+        client_id: String,
+        federated_token_file: String,
+    },
+    ClientSecret {
+        tenant_id: String,
+        client_id: String,
+        client_secret: String,
+    },
+    DeveloperTools,
+}
+
+#[derive(Clone, Debug)]
 enum AzureAuth {
     Emulator,
     AccountKey(String),
     Sas(String),
+    Identity(AzureIdentityMode),
 }
+
+const WORKLOAD_IDENTITY_REQUIREMENTS: &str =
+    "AZURE_TENANT_ID, AZURE_CLIENT_ID, and AZURE_FEDERATED_TOKEN_FILE";
+const CLIENT_SECRET_REQUIREMENTS: &str =
+    "AZURE_TENANT_ID, AZURE_CLIENT_ID, and AZURE_CLIENT_SECRET";
 
 #[derive(Debug)]
 struct AzureConfig {
     account: Option<String>,
     endpoint: Option<String>,
     auth: AzureAuth,
+}
+
+trait AzureIdentityFactory {
+    fn create(&self, mode: &AzureIdentityMode) -> anyhow::Result<Arc<dyn TokenCredential>>;
+}
+
+#[derive(Debug)]
+struct OfficialAzureIdentityFactory;
+
+fn managed_identity_options(client_id: Option<String>) -> ManagedIdentityCredentialOptions {
+    ManagedIdentityCredentialOptions {
+        user_assigned_id: client_id.map(UserAssignedId::ClientId),
+        ..Default::default()
+    }
+}
+
+impl AzureIdentityFactory for OfficialAzureIdentityFactory {
+    fn create(&self, mode: &AzureIdentityMode) -> anyhow::Result<Arc<dyn TokenCredential>> {
+        let credential: Arc<dyn TokenCredential> = match mode {
+            AzureIdentityMode::ManagedIdentity { client_id } => {
+                ManagedIdentityCredential::new(Some(managed_identity_options(client_id.clone())))
+                    .context("construct managed identity credential")?
+            }
+            AzureIdentityMode::WorkloadIdentity {
+                tenant_id,
+                client_id,
+                federated_token_file,
+            } => {
+                let options = WorkloadIdentityCredentialOptions {
+                    tenant_id: Some(tenant_id.clone()),
+                    client_id: Some(client_id.clone()),
+                    token_file_path: Some(PathBuf::from(federated_token_file)),
+                    ..Default::default()
+                };
+                WorkloadIdentityCredential::new(Some(options))
+                    .context("construct workload identity credential")?
+            }
+            AzureIdentityMode::ClientSecret {
+                tenant_id,
+                client_id,
+                client_secret,
+            } => ClientSecretCredential::new(
+                tenant_id,
+                client_id.clone(),
+                Secret::new(client_secret.clone()),
+                None,
+            )
+            .context("construct client secret credential")?,
+            AzureIdentityMode::DeveloperTools => DeveloperToolsCredential::new(None)
+                .context("construct developer-tools credential")?,
+        };
+        Ok(credential)
+    }
+}
+
+fn credentials_for_auth(
+    auth: &AzureAuth,
+    factory: &dyn AzureIdentityFactory,
+) -> anyhow::Result<Option<AzureCredentialProvider>> {
+    let AzureAuth::Identity(mode) = auth else {
+        return Ok(None);
+    };
+    Ok(Some(AzureTokenCredentialProvider::new(
+        factory.create(mode)?,
+    )))
 }
 
 /// Resolve Azure's selected configuration without allowing environment values
@@ -251,13 +348,46 @@ fn resolve_azure_config(
         "sas" => AzureAuth::Sas(nonempty("AZURE_STORAGE_SAS_KEY").ok_or_else(|| {
             anyhow!("AZURE_STORAGE_SAS_KEY is required when CELLD_AZURE_AUTH=sas")
         })?),
-        "managed-identity" | "workload-identity" | "client-secret" | "developer-tools" => {
-            anyhow::bail!(
-                "CELLD_AZURE_AUTH={auth} is not supported in this build; use account-key or sas"
-            )
-        }
+        "managed-identity" => AzureAuth::Identity(AzureIdentityMode::ManagedIdentity {
+            client_id: nonempty("AZURE_CLIENT_ID"),
+        }),
+        "workload-identity" => AzureAuth::Identity(AzureIdentityMode::WorkloadIdentity {
+            tenant_id: nonempty("AZURE_TENANT_ID").ok_or_else(|| {
+                anyhow!(
+                    "{WORKLOAD_IDENTITY_REQUIREMENTS} are required when CELLD_AZURE_AUTH=workload-identity"
+                )
+            })?,
+            client_id: nonempty("AZURE_CLIENT_ID").ok_or_else(|| {
+                anyhow!(
+                    "{WORKLOAD_IDENTITY_REQUIREMENTS} are required when CELLD_AZURE_AUTH=workload-identity"
+                )
+            })?,
+            federated_token_file: nonempty("AZURE_FEDERATED_TOKEN_FILE").ok_or_else(|| {
+                anyhow!(
+                    "{WORKLOAD_IDENTITY_REQUIREMENTS} are required when CELLD_AZURE_AUTH=workload-identity"
+                )
+            })?,
+        }),
+        "client-secret" => AzureAuth::Identity(AzureIdentityMode::ClientSecret {
+            tenant_id: nonempty("AZURE_TENANT_ID").ok_or_else(|| {
+                anyhow!(
+                    "{CLIENT_SECRET_REQUIREMENTS} are required when CELLD_AZURE_AUTH=client-secret"
+                )
+            })?,
+            client_id: nonempty("AZURE_CLIENT_ID").ok_or_else(|| {
+                anyhow!(
+                    "{CLIENT_SECRET_REQUIREMENTS} are required when CELLD_AZURE_AUTH=client-secret"
+                )
+            })?,
+            client_secret: nonempty("AZURE_CLIENT_SECRET").ok_or_else(|| {
+                anyhow!(
+                    "{CLIENT_SECRET_REQUIREMENTS} are required when CELLD_AZURE_AUTH=client-secret"
+                )
+            })?,
+        }),
+        "developer-tools" => AzureAuth::Identity(AzureIdentityMode::DeveloperTools),
         _ => anyhow::bail!(
-            "CELLD_AZURE_AUTH must be account-key or sas (identity modes are not supported in this build)"
+            "CELLD_AZURE_AUTH must be account-key, sas, managed-identity, workload-identity, client-secret, or developer-tools"
         ),
     };
     Ok(AzureConfig {
@@ -470,6 +600,22 @@ impl Bucket {
         options: ClientOptions,
     ) -> anyhow::Result<MicrosoftAzureBuilder> {
         let config = resolve_azure_config(endpoint, |name| std::env::var(name).ok())?;
+        Self::azure_builder_with_config(
+            container,
+            config,
+            retry,
+            options,
+            &OfficialAzureIdentityFactory,
+        )
+    }
+
+    fn azure_builder_with_config(
+        container: &str,
+        config: AzureConfig,
+        retry: RetryConfig,
+        options: ClientOptions,
+        identity_factory: &dyn AzureIdentityFactory,
+    ) -> anyhow::Result<MicrosoftAzureBuilder> {
         match config.auth {
             AzureAuth::Emulator => {
                 let mut builder = MicrosoftAzureBuilder::new()
@@ -496,6 +642,10 @@ impl Bucket {
                     AzureAuth::Sas(sas) => {
                         Ok(builder.with_sas_authorization(parse_sas_authorization(&sas)?))
                     }
+                    AzureAuth::Identity(identity) => Ok(builder.with_credentials(
+                        credentials_for_auth(&AzureAuth::Identity(identity), identity_factory)?
+                            .expect("identity auth creates an Azure credential provider"),
+                    )),
                     AzureAuth::Emulator => unreachable!("emulator matched above"),
                 }
             }
@@ -1009,10 +1159,16 @@ mod conformance_bucket_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        control_plane_bucket, parse_sas_authorization, resolve_azure_config, split_spec, AzureAuth,
-        StorageBackend,
+        control_plane_bucket, managed_identity_options, parse_sas_authorization,
+        resolve_azure_config, split_spec, AzureAuth, AzureConfig, AzureIdentityFactory,
+        AzureIdentityMode, Bucket, StorageBackend,
     };
+    use async_trait::async_trait;
+    use azure_core::credentials::{AccessToken, TokenCredential, TokenRequestOptions};
+    use azure_core::error::ErrorKind;
+    use azure_identity::UserAssignedId;
     use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn azure_spec_selects_azure_and_normalizes_prefix() {
@@ -1163,15 +1319,121 @@ mod tests {
         )
         .expect_err("account key must not satisfy SAS mode");
         assert!(err.to_string().contains("AZURE_STORAGE_SAS_KEY"));
-        let err = resolve(
+        let config = resolve(
             None,
             &[
                 ("AZURE_STORAGE_ACCOUNT_NAME", "account"),
                 ("CELLD_AZURE_AUTH", "managed-identity"),
             ],
         )
-        .expect_err("identity is explicitly deferred");
-        assert!(err.to_string().contains("not supported in this build"));
+        .expect("system-assigned identity is selected");
+        assert!(matches!(
+            config.auth,
+            AzureAuth::Identity(AzureIdentityMode::ManagedIdentity { client_id: None })
+        ));
+        let config = resolve(
+            None,
+            &[
+                ("AZURE_STORAGE_ACCOUNT_NAME", "account"),
+                ("CELLD_AZURE_AUTH", "managed-identity"),
+                ("AZURE_CLIENT_ID", "user-assigned-client-id"),
+            ],
+        )
+        .expect("user-assigned identity is selected");
+        assert!(matches!(
+            config.auth,
+            AzureAuth::Identity(AzureIdentityMode::ManagedIdentity {
+                client_id: Some(ref client_id)
+            }) if client_id == "user-assigned-client-id"
+        ));
+
+        for (mode, requirements, required_variables) in [
+            (
+                "workload-identity",
+                super::WORKLOAD_IDENTITY_REQUIREMENTS,
+                &[
+                    "AZURE_TENANT_ID",
+                    "AZURE_CLIENT_ID",
+                    "AZURE_FEDERATED_TOKEN_FILE",
+                ][..],
+            ),
+            (
+                "client-secret",
+                super::CLIENT_SECRET_REQUIREMENTS,
+                &["AZURE_TENANT_ID", "AZURE_CLIENT_ID", "AZURE_CLIENT_SECRET"][..],
+            ),
+        ] {
+            for omitted in required_variables {
+                let mut values = vec![
+                    ("AZURE_STORAGE_ACCOUNT_NAME", "account"),
+                    ("CELLD_AZURE_AUTH", mode),
+                    ("AZURE_TENANT_ID", "tenant"),
+                    ("AZURE_CLIENT_ID", "client"),
+                    ("AZURE_FEDERATED_TOKEN_FILE", "/var/run/token"),
+                    ("AZURE_CLIENT_SECRET", "secret"),
+                    ("AZURE_STORAGE_ACCOUNT_KEY", "unselected-account-key"),
+                    ("AZURE_STORAGE_SAS_KEY", "sv=1&sig=unselected"),
+                ];
+                values.retain(|(name, _)| name != omitted);
+                let err = resolve(None, &values)
+                    .expect_err("an incomplete selected identity mode must not fall back");
+                assert_eq!(
+                    err.to_string(),
+                    format!("{requirements} are required when CELLD_AZURE_AUTH={mode}"),
+                    "{mode} must name its exact required set when {omitted} is absent"
+                );
+            }
+        }
+        let workload = resolve(
+            None,
+            &[
+                ("AZURE_STORAGE_ACCOUNT_NAME", "account"),
+                ("CELLD_AZURE_AUTH", "workload-identity"),
+                ("AZURE_TENANT_ID", "tenant"),
+                ("AZURE_CLIENT_ID", "client"),
+                ("AZURE_FEDERATED_TOKEN_FILE", "/var/run/token"),
+            ],
+        )
+        .expect("complete workload identity configuration");
+        assert!(matches!(
+            workload.auth,
+            AzureAuth::Identity(AzureIdentityMode::WorkloadIdentity {
+                ref tenant_id,
+                ref client_id,
+                ref federated_token_file,
+            }) if tenant_id == "tenant" && client_id == "client" && federated_token_file == "/var/run/token"
+        ));
+        let client_secret = resolve(
+            None,
+            &[
+                ("AZURE_STORAGE_ACCOUNT_NAME", "account"),
+                ("CELLD_AZURE_AUTH", "client-secret"),
+                ("AZURE_TENANT_ID", "tenant"),
+                ("AZURE_CLIENT_ID", "client"),
+                ("AZURE_CLIENT_SECRET", "secret"),
+            ],
+        )
+        .expect("complete client secret configuration");
+        assert!(matches!(
+            client_secret.auth,
+            AzureAuth::Identity(AzureIdentityMode::ClientSecret {
+                ref tenant_id,
+                ref client_id,
+                ref client_secret,
+            }) if tenant_id == "tenant" && client_id == "client" && client_secret == "secret"
+        ));
+        assert!(matches!(
+            resolve(
+                None,
+                &[
+                    ("AZURE_STORAGE_ACCOUNT_NAME", "account"),
+                    ("CELLD_AZURE_AUTH", "developer-tools"),
+                ],
+            )
+            .expect("developer tools is explicit")
+            .auth,
+            AzureAuth::Identity(AzureIdentityMode::DeveloperTools)
+        ));
 
         let err = resolve(
             None,
@@ -1183,6 +1445,114 @@ mod tests {
         .expect_err("unknown authentication mode fails before I/O");
         assert!(err
             .to_string()
-            .contains("CELLD_AZURE_AUTH must be account-key or sas"));
+            .contains("CELLD_AZURE_AUTH must be account-key, sas, managed-identity, workload-identity, client-secret, or developer-tools"));
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingIdentityFactory {
+        calls: Mutex<Vec<AzureIdentityMode>>,
+    }
+
+    impl AzureIdentityFactory for RecordingIdentityFactory {
+        fn create(&self, mode: &AzureIdentityMode) -> anyhow::Result<Arc<dyn TokenCredential>> {
+            self.calls.lock().expect("calls lock").push(mode.clone());
+            anyhow::bail!("identity factory should only be needed for Entra modes")
+        }
+    }
+
+    #[test]
+    fn account_key_and_sas_builders_never_construct_an_entra_credential() {
+        let factory = RecordingIdentityFactory::default();
+
+        Bucket::azure_builder_with_config(
+            "container",
+            AzureConfig {
+                account: Some("account".into()),
+                endpoint: None,
+                auth: AzureAuth::AccountKey("key".into()),
+            },
+            object_store::RetryConfig::default(),
+            object_store::ClientOptions::new(),
+            &factory,
+        )
+        .expect("account-key builder");
+        Bucket::azure_builder_with_config(
+            "container",
+            AzureConfig {
+                account: Some("account".into()),
+                endpoint: None,
+                auth: AzureAuth::Sas("sv=1&sig=signature".into()),
+            },
+            object_store::RetryConfig::default(),
+            object_store::ClientOptions::new(),
+            &factory,
+        )
+        .expect("SAS builder");
+        assert!(factory.calls.lock().expect("calls lock").is_empty());
+    }
+
+    #[test]
+    fn managed_identity_options_map_client_ids_without_selecting_a_default() {
+        assert!(managed_identity_options(None).user_assigned_id.is_none());
+        assert!(matches!(
+            managed_identity_options(Some("user-assigned-client-id".into())).user_assigned_id,
+            Some(UserAssignedId::ClientId(ref client_id))
+                if client_id == "user-assigned-client-id"
+        ));
+    }
+
+    #[derive(Debug)]
+    struct FakeTokenCredential;
+
+    #[async_trait]
+    impl TokenCredential for FakeTokenCredential {
+        async fn get_token(
+            &self,
+            _: &[&str],
+            _: Option<TokenRequestOptions<'_>>,
+        ) -> azure_core::Result<AccessToken> {
+            Err(azure_core::Error::with_message(
+                ErrorKind::Credential,
+                "token was not expected during construction".to_string(),
+            ))
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct WorkingIdentityFactory;
+
+    impl AzureIdentityFactory for WorkingIdentityFactory {
+        fn create(&self, _: &AzureIdentityMode) -> anyhow::Result<Arc<dyn TokenCredential>> {
+            Ok(Arc::new(FakeTokenCredential))
+        }
+    }
+
+    #[test]
+    fn ordinary_and_cas_builders_share_one_adapter_but_separate_construction_does_not() {
+        let auth = AzureAuth::Identity(AzureIdentityMode::DeveloperTools);
+        let factory = WorkingIdentityFactory;
+        let make_builder = || {
+            Bucket::azure_builder_with_config(
+                "container",
+                AzureConfig {
+                    account: Some("account".into()),
+                    endpoint: None,
+                    auth: auth.clone(),
+                },
+                object_store::RetryConfig::default(),
+                object_store::ClientOptions::new(),
+                &factory,
+            )
+            .expect("Azure builder")
+        };
+
+        let builder = make_builder();
+        let ordinary = builder.clone().build().expect("ordinary store");
+        let cas = builder.build().expect("CAS store");
+        assert!(Arc::ptr_eq(ordinary.credentials(), cas.credentials()));
+
+        let first = make_builder().build().expect("first independent store");
+        let second = make_builder().build().expect("second independent store");
+        assert!(!Arc::ptr_eq(first.credentials(), second.credentials()));
     }
 }
