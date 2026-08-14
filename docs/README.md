@@ -61,6 +61,7 @@ A cell fits a workload that divides into named, stateful units:
 ## Contents
 
 - [What do you build with cells](#what-do-you-build-with-cells)
+- [Architecture walkthrough](celld-architecture-walkthrough.html)
 - [Install](#install)
 - [Configure object storage](#configure-object-storage)
 - [Deploy an application](#deploy-an-application)

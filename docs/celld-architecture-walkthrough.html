@@ -1,0 +1,525 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>celld Architecture: Write, Fence, Recover</title>
+<style>
+  :root {
+    --font-body: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --font-mono: ui-monospace, "Cascadia Code", "SF Mono", Consolas, monospace;
+    --bg: #f3f5f2;
+    --surface: #fffefa;
+    --surface-2: #e9eee8;
+    --border: #cbd5ce;
+    --border-strong: #89978e;
+    --text: #17211b;
+    --text-dim: #5b6b61;
+    --green: #16794d;
+    --green-dim: #dcefe5;
+    --blue: #246aa5;
+    --blue-dim: #dfeaf5;
+    --amber: #a55b09;
+    --amber-dim: #f7e8ce;
+    --red: #b63b3b;
+    --red-dim: #f6dddd;
+    --purple: #6e54a3;
+    --purple-dim: #e9e2f4;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #101512;
+      --surface: #18201b;
+      --surface-2: #202b24;
+      --border: #34463b;
+      --border-strong: #708579;
+      --text: #edf4ef;
+      --text-dim: #a8b9ae;
+      --green: #5bd69a;
+      --green-dim: #183d2d;
+      --blue: #70b7ed;
+      --blue-dim: #18364d;
+      --amber: #efb65c;
+      --amber-dim: #483317;
+      --red: #ef8585;
+      --red-dim: #4a2424;
+      --purple: #b7a0e8;
+      --purple-dim: #352b4b;
+    }
+  }
+
+  * { box-sizing: border-box; }
+
+  html { background: var(--bg); }
+
+  body {
+    margin: 0;
+    color: var(--text);
+    background:
+      linear-gradient(90deg, var(--border) 1px, transparent 1px),
+      linear-gradient(var(--border) 1px, transparent 1px),
+      var(--bg);
+    background-size: 28px 28px;
+    font-family: var(--font-body);
+    line-height: 1.55;
+    overflow-wrap: break-word;
+  }
+
+  main {
+    width: min(1180px, calc(100% - 32px));
+    margin: 0 auto;
+    padding: 42px 0 56px;
+  }
+
+  main > *, .card-grid > *, .invariants > *, .legend > * { min-width: 0; }
+
+  header {
+    padding: 28px;
+    border: 1px solid var(--border);
+    border-top: 5px solid var(--green);
+    border-radius: 14px;
+    background: color-mix(in srgb, var(--surface) 93%, var(--green) 7%);
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.08);
+    animation: rise 0.45s ease-out both;
+  }
+
+  .eyebrow {
+    margin: 0 0 8px;
+    color: var(--green);
+    font: 700 11px/1 var(--font-mono);
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+  }
+
+  h1 {
+    margin: 0;
+    font-size: clamp(28px, 5vw, 48px);
+    line-height: 1.05;
+    letter-spacing: -0.035em;
+  }
+
+  .subtitle {
+    max-width: 850px;
+    margin: 15px 0 0;
+    color: var(--text-dim);
+    font-size: 16px;
+  }
+
+  code {
+    padding: 1px 5px;
+    border-radius: 4px;
+    color: var(--green);
+    background: var(--green-dim);
+    font-family: var(--font-mono);
+    font-size: 0.88em;
+  }
+
+  section { margin-top: 24px; }
+
+  .section-title {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    margin: 0 0 12px;
+  }
+
+  .section-title span {
+    color: var(--text-dim);
+    font: 700 11px/1 var(--font-mono);
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+  }
+
+  h2 {
+    margin: 0;
+    font-size: 22px;
+    letter-spacing: -0.02em;
+  }
+
+  .card-grid {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 12px;
+  }
+
+  .card {
+    position: relative;
+    padding: 17px;
+    border: 1px solid var(--border);
+    border-radius: 11px;
+    background: var(--surface);
+    animation: rise 0.45s ease-out both;
+    animation-delay: calc(var(--i, 0) * 65ms);
+  }
+
+  .card::before {
+    content: "";
+    position: absolute;
+    inset: 0 auto 0 0;
+    width: 4px;
+    border-radius: 11px 0 0 11px;
+    background: var(--accent);
+  }
+
+  .card b {
+    display: block;
+    margin-bottom: 5px;
+    color: var(--accent);
+    font: 700 12px/1.2 var(--font-mono);
+  }
+
+  .card p {
+    margin: 0;
+    color: var(--text-dim);
+    font-size: 13px;
+  }
+
+  .diagram-shell {
+    position: relative;
+    padding: 18px;
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    background: var(--surface);
+    box-shadow: 0 10px 28px rgba(0, 0, 0, 0.07);
+    animation: rise 0.45s ease-out both;
+  }
+
+  .diagram-note {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    margin: 0 0 14px;
+    color: var(--text-dim);
+    font-size: 13px;
+  }
+
+  .diagram-note > * { min-width: 0; }
+
+  .sequence {
+    width: 100%;
+    height: auto;
+    display: block;
+    border-radius: 10px;
+    background: color-mix(in srgb, var(--surface) 88%, var(--surface-2) 12%);
+  }
+
+  .phase-label {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+  }
+
+  .actor-label {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 700;
+  }
+
+  .message-label {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+  }
+
+  .small-label {
+    font-family: var(--font-mono);
+    font-size: 9.5px;
+  }
+
+  .legend {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 9px;
+    margin-top: 13px;
+  }
+
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 9px 11px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text-dim);
+    background: var(--surface-2);
+    font-size: 12px;
+  }
+
+  .swatch {
+    flex: 0 0 12px;
+    width: 12px;
+    height: 12px;
+    border-radius: 3px;
+    background: var(--swatch);
+  }
+
+  .invariants {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 12px;
+  }
+
+  .invariant {
+    padding: 17px;
+    border: 1px solid var(--border);
+    border-radius: 11px;
+    background: var(--surface);
+  }
+
+  .invariant strong {
+    display: block;
+    margin-bottom: 5px;
+    font-size: 14px;
+  }
+
+  .invariant p {
+    margin: 0;
+    color: var(--text-dim);
+    font-size: 13px;
+  }
+
+  .source {
+    margin-top: 20px;
+    padding: 15px 17px;
+    border: 1px dashed var(--border-strong);
+    border-radius: 10px;
+    color: var(--text-dim);
+    background: var(--surface-2);
+    font-size: 12px;
+  }
+
+  .source b { color: var(--text); }
+
+  @keyframes rise {
+    from { opacity: 0; transform: translateY(10px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+
+  @media (max-width: 900px) {
+    .card-grid { grid-template-columns: repeat(2, 1fr); }
+    .legend { grid-template-columns: repeat(2, 1fr); }
+    .invariants { grid-template-columns: 1fr; }
+  }
+
+  @media (max-width: 580px) {
+    main { width: min(100% - 20px, 1180px); padding-top: 14px; }
+    header { padding: 21px; }
+    .card-grid, .legend { grid-template-columns: 1fr; }
+    .diagram-shell { padding: 10px; }
+    .diagram-note { display: block; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <p class="eyebrow">celld architecture walkthrough</p>
+    <h1>One logical object, one current writer</h1>
+    <p class="subtitle">
+      Follow a Durable Object write from JavaScript to SQLite and shared storage,
+      then see how celld prevents a failed or partitioned node from corrupting the
+      object's next owner.
+    </p>
+  </header>
+
+  <section aria-labelledby="mental-model">
+    <div class="section-title">
+      <span>01</span>
+      <h2 id="mental-model">The five things to keep separate</h2>
+    </div>
+    <div class="card-grid">
+      <article class="card" style="--i: 0; --accent: var(--purple)">
+        <b>IDENTITY</b>
+        <p><code>class:id</code> names the logical object. It survives every process and activation.</p>
+      </article>
+      <article class="card" style="--i: 1; --accent: var(--blue)">
+        <b>RESIDENCY</b>
+        <p>A V8 realm is the object's temporary workspace. It is a cache, not durable storage.</p>
+      </article>
+      <article class="card" style="--i: 2; --accent: var(--green)">
+        <b>STATE</b>
+        <p>A private SQLite database stores the object's durable application data and alarms.</p>
+      </article>
+      <article class="card" style="--i: 3; --accent: var(--amber)">
+        <b>AUTHORITY</b>
+        <p>A bucket record names the current owner and its monotonically increasing epoch.</p>
+      </article>
+      <article class="card" style="--i: 4; --accent: var(--red)">
+        <b>RECOVERY</b>
+        <p>LTX ships SQLite WAL changes into an epoch-specific history in shared storage.</p>
+      </article>
+    </div>
+  </section>
+
+  <section aria-labelledby="write-takeover">
+    <div class="section-title">
+      <span>02</span>
+      <h2 id="write-takeover">Write, acknowledge, fail, recover</h2>
+    </div>
+    <div class="diagram-shell">
+      <div class="diagram-note">
+        <span>Solid arrows are calls or durable writes. Dashed arrows are responses or stale activity.</span>
+        <span>Time flows downward.</span>
+      </div>
+
+      <svg class="sequence" viewBox="0 0 1120 930" role="img" aria-labelledby="svg-title svg-desc" xmlns="http://www.w3.org/2000/svg">
+        <title id="svg-title">celld write acknowledgement and node takeover sequence</title>
+        <desc id="svg-desc">A client request reaches a celld node, activates a cell, commits to SQLite, uploads LTX, verifies ownership, and is acknowledged. After lease expiry, another node takes ownership at a higher epoch, seals the old history, and restores it while stale writes are excluded.</desc>
+        <defs>
+          <marker id="arrow" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto">
+            <path d="M0,0 L9,3.5 L0,7 Z" fill="context-stroke"/>
+          </marker>
+          <marker id="bar" markerWidth="6" markerHeight="12" refX="3" refY="6" orient="auto">
+            <path d="M3,0 L3,12" stroke="context-stroke" stroke-width="2"/>
+          </marker>
+        </defs>
+
+        <rect x="18" y="88" width="1084" height="477" rx="12" fill="var(--blue-dim)" opacity="0.30"/>
+        <rect x="18" y="584" width="1084" height="325" rx="12" fill="var(--red-dim)" opacity="0.25"/>
+        <text x="38" y="116" fill="var(--blue)" class="phase-label">PHASE A — OWNER EPOCH N SERVES AND ACKNOWLEDGES A WRITE</text>
+        <text x="38" y="612" fill="var(--red)" class="phase-label">PHASE B — LEASE LOSS, TAKEOVER, AND FENCED RECOVERY</text>
+
+        <g fill="var(--surface)" stroke-width="1.5">
+          <rect x="24" y="25" width="108" height="46" rx="8" stroke="var(--purple)"/>
+          <rect x="164" y="25" width="122" height="46" rx="8" stroke="var(--blue)"/>
+          <rect x="318" y="25" width="122" height="46" rx="8" stroke="var(--amber)"/>
+          <rect x="472" y="25" width="122" height="46" rx="8" stroke="var(--green)"/>
+          <rect x="626" y="25" width="122" height="46" rx="8" stroke="var(--green)"/>
+          <rect x="780" y="25" width="122" height="46" rx="8" stroke="var(--red)"/>
+          <rect x="934" y="25" width="150" height="46" rx="8" stroke="var(--amber)"/>
+        </g>
+
+        <g fill="var(--text)" text-anchor="middle" class="actor-label">
+          <text x="78" y="53">Client</text>
+          <text x="225" y="46"><tspan x="225">celld node A</tspan><tspan x="225" dy="15">logic actor</tspan></text>
+          <text x="379" y="46"><tspan x="379">Ownership +</tspan><tspan x="379" dy="15">lease bucket</tspan></text>
+          <text x="533" y="46"><tspan x="533">Cell V8</tspan><tspan x="533" dy="15">realm</tspan></text>
+          <text x="687" y="46"><tspan x="687">SQLite</tspan><tspan x="687" dy="15">WAL</tspan></text>
+          <text x="841" y="46"><tspan x="841">LTX</tspan><tspan x="841" dy="15">bucket</tspan></text>
+          <text x="1009" y="46"><tspan x="1009">Replacement</tspan><tspan x="1009" dy="15">node B</tspan></text>
+        </g>
+
+        <g stroke="var(--border-strong)" stroke-width="1" stroke-dasharray="5 5">
+          <line x1="78" y1="71" x2="78" y2="890"/>
+          <line x1="225" y1="71" x2="225" y2="890"/>
+          <line x1="379" y1="71" x2="379" y2="890"/>
+          <line x1="533" y1="71" x2="533" y2="890"/>
+          <line x1="687" y1="71" x2="687" y2="890"/>
+          <line x1="841" y1="71" x2="841" y2="890"/>
+          <line x1="1009" y1="71" x2="1009" y2="890"/>
+        </g>
+
+        <g fill="none" stroke-width="1.8" marker-end="url(#arrow)">
+          <line x1="78" y1="152" x2="225" y2="152" stroke="var(--purple)"/>
+          <line x1="225" y1="202" x2="379" y2="202" stroke="var(--amber)"/>
+          <line x1="379" y1="252" x2="225" y2="252" stroke="var(--amber)" stroke-dasharray="7 5"/>
+          <line x1="225" y1="302" x2="533" y2="302" stroke="var(--blue)"/>
+          <line x1="533" y1="352" x2="687" y2="352" stroke="var(--green)"/>
+          <line x1="687" y1="402" x2="841" y2="402" stroke="var(--red)"/>
+          <line x1="841" y1="452" x2="225" y2="452" stroke="var(--red)" stroke-dasharray="7 5"/>
+          <line x1="225" y1="502" x2="379" y2="502" stroke="var(--amber)"/>
+          <line x1="225" y1="548" x2="78" y2="548" stroke="var(--green)" stroke-dasharray="7 5"/>
+
+          <line x1="225" y1="650" x2="379" y2="650" stroke="var(--red)"/>
+          <line x1="1009" y1="700" x2="379" y2="700" stroke="var(--amber)"/>
+          <line x1="379" y1="750" x2="1009" y2="750" stroke="var(--amber)" stroke-dasharray="7 5"/>
+          <line x1="1009" y1="800" x2="841" y2="800" stroke="var(--red)"/>
+          <line x1="841" y1="850" x2="1009" y2="850" stroke="var(--green)" stroke-dasharray="7 5"/>
+        </g>
+
+        <g fill="var(--text)" text-anchor="middle" class="message-label">
+          <text x="151" y="142">request for cell <tspan fill="var(--purple)">class:id</tspan></text>
+          <text x="302" y="192">read owner; CAS claim</text>
+          <text x="302" y="242">owner = node A, epoch N</text>
+          <text x="379" y="292">lazy activation + CellJob::Fetch</text>
+          <text x="610" y="342">transaction commit</text>
+          <text x="764" y="392">upload WAL changes under eN</text>
+          <text x="533" y="442">durability ticket covered</text>
+          <text x="302" y="492">reread owner: still A / epoch N?</text>
+          <text x="151" y="538">acknowledge only after both proofs</text>
+
+          <text x="302" y="640">lease renewal is late or fails</text>
+          <text x="694" y="690">CAS takeover at epoch N + 1</text>
+          <text x="694" y="740">node B is authoritative</text>
+          <text x="925" y="790">seal old epoch N at max visible TXID</text>
+          <text x="925" y="840">restore only through the seal</text>
+        </g>
+
+        <g>
+          <rect x="218" y="132" width="14" height="426" rx="4" fill="var(--blue-dim)" stroke="var(--blue)"/>
+          <rect x="526" y="287" width="14" height="108" rx="4" fill="var(--purple-dim)" stroke="var(--purple)"/>
+          <rect x="680" y="337" width="14" height="80" rx="4" fill="var(--green-dim)" stroke="var(--green)"/>
+          <rect x="1002" y="680" width="14" height="190" rx="4" fill="var(--amber-dim)" stroke="var(--amber)"/>
+        </g>
+
+        <g>
+          <path d="M225 665 C380 675, 620 645, 838 682" fill="none" stroke="var(--red)" stroke-width="1.8" stroke-dasharray="7 5" marker-end="url(#bar)"/>
+          <text x="548" y="666" text-anchor="middle" fill="var(--red)" class="message-label">self-fence: node A must stop serving</text>
+        </g>
+
+        <g>
+          <path d="M225 876 C430 912, 665 884, 835 876" fill="none" stroke="var(--red)" stroke-width="1.8" stroke-dasharray="7 5" marker-end="url(#bar)"/>
+          <text x="530" y="902" text-anchor="middle" fill="var(--red)" class="message-label">late node A upload can reach obsolete eN, but cannot be acknowledged or restored past the seal</text>
+        </g>
+
+        <g>
+          <rect x="42" y="469" width="140" height="56" rx="9" fill="var(--green-dim)" stroke="var(--green)"/>
+          <text x="112" y="490" text-anchor="middle" fill="var(--green)" class="small-label">ACK CONDITION</text>
+          <text x="112" y="508" text-anchor="middle" fill="var(--text)" class="small-label">durable + still owner</text>
+
+          <rect x="901" y="859" width="184" height="42" rx="9" fill="var(--green-dim)" stroke="var(--green)"/>
+          <text x="993" y="885" text-anchor="middle" fill="var(--green)" class="small-label">node B reconstructs SQLite</text>
+        </g>
+      </svg>
+
+      <div class="legend" aria-label="Diagram legend">
+        <div class="legend-item"><span class="swatch" style="--swatch: var(--purple)"></span>Object identity and JavaScript request</div>
+        <div class="legend-item"><span class="swatch" style="--swatch: var(--amber)"></span>Ownership, lease, and epoch authority</div>
+        <div class="legend-item"><span class="swatch" style="--swatch: var(--green)"></span>SQLite state and successful recovery</div>
+        <div class="legend-item"><span class="swatch" style="--swatch: var(--red)"></span>Replication, failure, and fencing</div>
+      </div>
+    </div>
+  </section>
+
+  <section aria-labelledby="invariants">
+    <div class="section-title">
+      <span>03</span>
+      <h2 id="invariants">What the diagram is proving</h2>
+    </div>
+    <div class="invariants">
+      <article class="invariant">
+        <strong>Residency is not authority.</strong>
+        <p>A node may still have the V8 realm and SQLite files, but it must stop serving after losing its lease or ownership epoch.</p>
+      </article>
+      <article class="invariant">
+        <strong>Local commit is not acknowledgement.</strong>
+        <p>The response waits for LTX durability and a fresh ownership check. That is how celld targets RPO=0 for acknowledged writes.</p>
+      </article>
+      <article class="invariant">
+        <strong>An epoch is a data fence.</strong>
+        <p>Every owner writes a separate LTX lineage. A seal fixes the recoverable end of an old epoch so late stale writes cannot reappear.</p>
+      </article>
+    </div>
+  </section>
+
+  <p class="source">
+    <b>Source anchors:</b>
+    <code>crates/celld/runtime.rs:787-918</code>,
+    <code>crates/celld/storage.rs:250-326</code>,
+    <code>crates/celld/ltx_repl.rs:290-606</code>,
+    <code>crates/celld/ownership_store.rs:263-330</code>,
+    <code>crates/logic/routing.rs:1-60</code>, and
+    <code>docs/fencing.md:10-72</code>.
+  </p>
+</main>
+</body>
+</html>
